@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         The Really Upgrade Tree of Life Helper
 // @namespace    local.incremental.userscripts
-// @version      0.4.1
+// @version      0.5.0
 // @description  Conservative automation helper for The Really Upgrade Tree of Life.
 // @match        https://the-really-upgrade-tree-of-life.g8hh.com.cn/*
 // @grant        GM_getValue
@@ -17,8 +17,10 @@
   const STYLE_ID = "trutol-helper-style";
   const LOG_PREFIX = "[TRUTOL Helper]";
   const RESET_HINT_CLASS = "trutol-inline-reset-hint";
+  const LEAF_HINT_CLASS = "trutol-inline-leaf-hint";
   const decimalNumberSource = "(?:\\d+(?:[\\d,]*\\d)?(?:\\.\\d+)?|\\.\\d+)";
-  const displayedNumberTokenSource = `[+\\-]?(?:${decimalNumberSource}[eE][+\\-]?[\\d,.]+|${decimalNumberSource}\\s*[A-Za-z-]+|${decimalNumberSource}|∞)`;
+  const oneWeekSeconds = 7 * 24 * 60 * 60;
+  const oneWeekLog10 = Math.log10(oneWeekSeconds);
 
   const defaultConfig = {
     enabled: true,
@@ -324,6 +326,55 @@
     };
   }
 
+  function splitLeadingAmount(value) {
+    const text = normalizeText(value)
+      .replace(/^×/, "")
+      .replace(/^\+/, "");
+
+    if (!text) {
+      return null;
+    }
+
+    const infinityMatch = text.match(/^(∞|inf(?:inity)?)\s*(.*)$/i);
+
+    if (infinityMatch) {
+      return {
+        amountText: infinityMatch[1],
+        amount: parseDisplayedNumber(infinityMatch[1]),
+        tail: normalizeText(infinityMatch[2]),
+      };
+    }
+
+    const scientificMatch = text.match(new RegExp(`^([+\\-]?${decimalNumberSource}[eE][+\\-]?[\\d,.]+)\\s*(.*)$`, "i"));
+
+    if (scientificMatch) {
+      return {
+        amountText: scientificMatch[1],
+        amount: parseDisplayedNumber(scientificMatch[1]),
+        tail: normalizeText(scientificMatch[2]),
+      };
+    }
+
+    const numberMatch = text.match(new RegExp(`^([+\\-]?${decimalNumberSource})\\s*([A-Za-z-]+)?\\s*(.*)$`));
+
+    if (!numberMatch) {
+      return null;
+    }
+
+    const suffix = numberMatch[2] || "";
+    const suffixIsKnown = suffixes.has(suffix);
+    const amountText = suffixIsKnown ? `${numberMatch[1]}${suffix}` : numberMatch[1];
+    const tail = suffixIsKnown
+      ? numberMatch[3]
+      : `${suffix} ${numberMatch[3]}`;
+
+    return {
+      amountText,
+      amount: parseDisplayedNumber(amountText),
+      tail: normalizeText(tail),
+    };
+  }
+
   function formatRatio(log10Ratio) {
     if (log10Ratio === Number.POSITIVE_INFINITY) {
       return "∞";
@@ -364,6 +415,57 @@
     return `${mantissa.toFixed(2).replace(/\.?0+$/, "")}e${exponent}`;
   }
 
+  function subtractLog10(minuendLog10, subtrahendLog10) {
+    if (subtrahendLog10 === Number.NEGATIVE_INFINITY) {
+      return minuendLog10;
+    }
+
+    if (minuendLog10 <= subtrahendLog10) {
+      return Number.NEGATIVE_INFINITY;
+    }
+
+    const gap = subtrahendLog10 - minuendLog10;
+
+    if (gap < -15) {
+      return minuendLog10;
+    }
+
+    return minuendLog10 + Math.log10(1 - (10 ** gap));
+  }
+
+  function formatDuration(log10Seconds) {
+    if (log10Seconds > oneWeekLog10) {
+      return "大于一周";
+    }
+
+    if (!Number.isFinite(log10Seconds) || log10Seconds < 0) {
+      return "不到 1 秒";
+    }
+
+    const seconds = 10 ** log10Seconds;
+    const roundedSeconds = Math.ceil(seconds);
+
+    if (roundedSeconds < 60) {
+      return `${roundedSeconds} 秒`;
+    }
+
+    if (roundedSeconds < 3600) {
+      const minutes = Math.floor(roundedSeconds / 60);
+      const restSeconds = roundedSeconds % 60;
+      return restSeconds > 0 ? `${minutes} 分 ${restSeconds} 秒` : `${minutes} 分`;
+    }
+
+    if (roundedSeconds < 86400) {
+      const hours = Math.floor(roundedSeconds / 3600);
+      const minutes = Math.ceil((roundedSeconds % 3600) / 60);
+      return minutes > 0 ? `${hours} 小时 ${minutes} 分` : `${hours} 小时`;
+    }
+
+    const days = Math.floor(roundedSeconds / 86400);
+    const hours = Math.ceil((roundedSeconds % 86400) / 3600);
+    return hours > 0 ? `${days} 天 ${hours} 小时` : `${days} 天`;
+  }
+
   function normalizeResourceName(name) {
     const text = normalizeText(name).toLowerCase();
 
@@ -395,7 +497,7 @@
 
     for (const element of document.querySelectorAll(".currency-frame")) {
       const text = normalizeText(element.textContent);
-      const match = text.match(/^([^:：]+)[:：]\s*([^(]+)/);
+      const match = text.match(/^([^:：]+)[:：]\s*([^()]+)(?:\(([^)]*)\))?/);
 
       if (!match) {
         continue;
@@ -403,12 +505,15 @@
 
       const resource = normalizeResourceName(match[1]);
       const amount = parseDisplayedNumber(match[2]);
+      const rate = parseProductionRate(match[3]);
 
       if (amount) {
         resources.set(resource.key, {
           label: resource.label,
           amount,
           display: normalizeText(match[2]),
+          element,
+          rate,
         });
       }
     }
@@ -416,27 +521,204 @@
     return resources;
   }
 
-  function parseResetGain(button) {
-    const text = normalizeText(button.textContent);
-    const match = text.match(new RegExp(`(?:获得|gain)\\s+(${displayedNumberTokenSource})\\s*([^，。,.]+)`, "i"));
+  function getLeafLayerFrame() {
+    const leafButton = getVisibleUpgradeButtons()
+      .find((button) => hasClassStartingWith(button, "upgrade-L"));
+
+    return leafButton?.closest(".layer-frame") || null;
+  }
+
+  function readVisibleLeafLayerResource() {
+    const frame = getLeafLayerFrame();
+    const element = frame?.querySelector(".layer-content");
+
+    if (!element || !isVisible(element)) {
+      return null;
+    }
+
+    const text = normalizeText(element.textContent);
+    const match = text.match(/^你有\s+(.+?)\s*(?:\(([^)]*)\))?\s*(树叶|leaf|leaves)[.。]?/i);
 
     if (!match) {
       return null;
     }
 
     const amount = parseDisplayedNumber(match[1]);
-    const resource = normalizeResourceName(match[2]);
+    const rate = parseProductionRate(match[2]);
 
     if (!amount) {
       return null;
     }
 
     return {
+      label: "树叶",
       amount,
-      amountText: normalizeText(match[1]),
+      display: normalizeText(match[1]),
+      element,
+      rate,
+    };
+  }
+
+  function parseProductionRate(value) {
+    if (!value) {
+      return null;
+    }
+
+    const text = normalizeText(value);
+    const isPerSecond = /\/\s*秒|\/\s*(s|sec|second)s?\b|每秒|per\s*(sec|second)/i.test(text);
+
+    if (!isPerSecond) {
+      return null;
+    }
+
+    const parsed = splitLeadingAmount(text);
+
+    if (!parsed || !parsed.amount) {
+      return null;
+    }
+
+    return {
+      amount: parsed.amount,
+      display: parsed.amountText,
+    };
+  }
+
+  function parseResetGain(button) {
+    const text = normalizeText(button.textContent);
+    const match = text.match(/(?:获得|gain)\s+(.+)/i);
+
+    if (!match) {
+      return null;
+    }
+
+    const parsed = splitLeadingAmount(match[1]);
+
+    if (!parsed || !parsed.amount) {
+      return null;
+    }
+
+    const resourceName = normalizeText(parsed.tail).replace(/[，。,.].*$/, "");
+    const resource = normalizeResourceName(resourceName);
+
+    return {
+      amount: parsed.amount,
+      amountText: parsed.amountText,
       resourceKey: resource.key,
       resourceLabel: resource.label,
     };
+  }
+
+  function parseButtonCost(button) {
+    const text = normalizeText(button.textContent);
+    const match = text.match(/(?:成本|cost)[:：]?\s*(.+)$/i);
+
+    if (!match) {
+      return null;
+    }
+
+    const parsed = splitLeadingAmount(match[1]);
+
+    if (!parsed || !parsed.amount) {
+      return null;
+    }
+
+    const resourceName = normalizeText(parsed.tail).replace(/[，。,.].*$/, "");
+    const resource = normalizeResourceName(resourceName);
+
+    return {
+      amount: parsed.amount,
+      amountText: parsed.amountText,
+      resourceKey: resource.key,
+      resourceLabel: resource.label,
+    };
+  }
+
+  function getVisibleCostTargets(resourceKey) {
+    return getVisibleUpgradeButtons()
+      .filter((button) => !button.classList.contains("o-primary-btn--bought"))
+      .filter((button) => !isRiskyButton(button))
+      .map((button) => {
+        const cost = parseButtonCost(button);
+        return cost ? { button, cost } : null;
+      })
+      .filter((target) => target && target.cost.resourceKey === resourceKey)
+      .sort((left, right) => left.cost.amount.log10 - right.cost.amount.log10);
+  }
+
+  function getLeafTimeHint() {
+    const leaves = readVisibleLeafLayerResource();
+
+    if (!leaves || !leaves.element || !leaves.rate || leaves.rate.amount.zero) {
+      return null;
+    }
+
+    const targets = getVisibleCostTargets("leaves");
+
+    if (targets.length === 0) {
+      return null;
+    }
+
+    const nextTarget = targets.find((target) => target.cost.amount.log10 > leaves.amount.log10)
+      || targets[0];
+
+    let hint;
+
+    if (nextTarget.cost.amount.log10 <= leaves.amount.log10) {
+      hint = "下个树叶购买：现在可购买";
+    } else {
+      const missingLog10 = subtractLog10(nextTarget.cost.amount.log10, leaves.amount.log10);
+      const secondsLog10 = missingLog10 - leaves.rate.amount.log10;
+      hint = `下个树叶购买还需 ${formatDuration(secondsLog10)}`;
+    }
+
+    return {
+      element: leaves.element,
+      current: leaves.display,
+      rate: leaves.rate.display,
+      targetCost: nextTarget.cost.amountText,
+      targetText: normalizeText(nextTarget.button.textContent),
+      hint,
+    };
+  }
+
+  function updateInlineLeafHint() {
+    const hint = getLeafTimeHint();
+    const activeHints = new Set();
+
+    if (hint) {
+      let hintNode = Array.from(hint.element.children)
+        .find((child) => child.classList.contains(LEAF_HINT_CLASS));
+
+      if (!hintNode) {
+        hintNode = document.querySelector(`.${LEAF_HINT_CLASS}`);
+      }
+
+      if (!hintNode) {
+        hintNode = document.createElement("div");
+        hintNode.className = LEAF_HINT_CLASS;
+      }
+
+      if (hintNode.parentElement !== hint.element) {
+        hint.element.appendChild(hintNode);
+      }
+
+      hint.element.style.position = "relative";
+      hintNode.textContent = hint.hint;
+      activeHints.add(hintNode);
+    }
+
+    for (const node of document.querySelectorAll(`.${LEAF_HINT_CLASS}`)) {
+      if (!activeHints.has(node)) {
+        node.remove();
+      }
+    }
+
+    if (!hint) {
+      return null;
+    }
+
+    const { element, ...serializableHint } = hint;
+    return serializableHint;
   }
 
   function getResetRatioHints() {
@@ -505,6 +787,7 @@
     const visibleCompost = getVisibleCompostButtons();
     const buyableCompost = getBuyableCompostButtons();
     const resetHints = getResetRatioHints();
+    const leafTimeHint = getLeafTimeHint();
 
     return {
       upgrades: {
@@ -516,6 +799,9 @@
         buyable: buyableCompost.map(describeButton),
       },
       resetHints: resetHints.map(({ button, ...hint }) => hint),
+      leafTimeHint: leafTimeHint
+        ? (({ element, ...hint }) => hint)(leafTimeHint)
+        : null,
     };
   }
 
@@ -612,6 +898,7 @@
     }
 
     const scanResult = scan();
+    updateInlineLeafHint();
     updateInlineResetHints();
 
     if (config.logScans) {
@@ -801,22 +1088,37 @@
       }
       #${PANEL_ID} .trutol-reset {
         margin-top: 8px;
-        color: #fbbf24;
+        color: #86efac;
         font-size: 11px;
         line-height: 1.35;
       }
-      .${RESET_HINT_CLASS} {
+      .${RESET_HINT_CLASS},
+      .${LEAF_HINT_CLASS} {
         width: fit-content;
         max-width: min(360px, 90vw);
-        margin: 4px auto 10px;
-        padding: 4px 8px;
+        padding: 2px 7px;
         border-radius: 6px;
-        color: #fbbf24;
-        background: rgba(251, 191, 36, 0.1);
-        border: 1px solid rgba(251, 191, 36, 0.22);
-        font-size: 12px;
-        line-height: 1.35;
+        color: #14532d;
+        background: rgba(187, 247, 208, 0.52);
+        border: 1px solid rgba(34, 197, 94, 0.28);
+        font-size: 11px;
+        line-height: 1.2;
         pointer-events: none;
+      }
+      .${RESET_HINT_CLASS} {
+        margin: 3px auto 8px;
+      }
+      .${LEAF_HINT_CLASS} {
+        position: absolute !important;
+        left: 50%;
+        top: 50%;
+        display: inline-block !important;
+        height: auto !important;
+        min-height: 0 !important;
+        max-height: none !important;
+        margin: 0;
+        white-space: nowrap;
+        transform: translate(-50%, -50%);
       }
     `;
 
@@ -1026,6 +1328,7 @@
       getConfig: loadConfig,
       setConfig: updateConfig,
       scan,
+      leafTimeHint: () => scan().leafTimeHint,
       resetHints: () => scan().resetHints,
       tick: () => runAutomation(loadConfig()),
     };

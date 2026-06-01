@@ -22,6 +22,7 @@ Enabled automation features:
 - Optional compost mode for visible `compost-button` controls.
 - Reset hint display for visible `layer-reset-button` and sacred reset controls.
 - Inline reset ratio hints under visible reset buttons.
+- Inline leaf time-to-next-purchase hint inside the visible leaf layer frame.
 - Manual tick button and browser console API via `window.__trutolHelper`.
 
 Known risks or limits:
@@ -34,6 +35,9 @@ Known risks or limits:
 - Reset ratio hints are approximate and are calculated from visible game notation,
   including suffix notation and scientific notation such as `1e303`, `1E303`,
   and `1e3,003`.
+- Leaf time hints are approximate and use the visible leaf layer amount,
+  visible per-second leaf production, and visible unbought leaf-cost upgrades
+  only. Estimates longer than seven days are shown as greater than one week.
 - A game update can change DOM classes or text and require selector updates.
 
 Manual controls:
@@ -48,6 +52,7 @@ Manual controls:
 window.__trutolHelper.getConfig()
 window.__trutolHelper.setConfig({ scanOnly: false, autoCompost: true })
 window.__trutolHelper.scan()
+window.__trutolHelper.leafTimeHint()
 window.__trutolHelper.resetHints()
 window.__trutolHelper.tick()
 ```
