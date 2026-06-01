@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         The Really Upgrade Tree of Life Helper
 // @namespace    local.incremental.userscripts
-// @version      0.5.0
+// @version      0.6.0
 // @description  Conservative automation helper for The Really Upgrade Tree of Life.
 // @match        https://the-really-upgrade-tree-of-life.g8hh.com.cn/*
 // @grant        GM_getValue
@@ -27,6 +27,7 @@
     scanOnly: true,
     autoUpgrades: true,
     autoCompost: true,
+    panelCollapsed: false,
     tickMs: 750,
     maxUpgradeClicksPerTick: 3,
     maxCompostClicksPerTick: 1,
@@ -76,6 +77,14 @@
     reason: "Starting",
   };
 
+  const reasonLabels = {
+    "Buy mode": "购买模式",
+    Paused: "已暂停",
+    "Scan only": "仅扫描",
+    Starting: "启动中",
+    "Waiting for app": "等待游戏",
+  };
+
   function gmGetValue(key, fallback) {
     if (typeof GM_getValue === "function") {
       return GM_getValue(key, fallback);
@@ -115,6 +124,10 @@
 
   function log(...args) {
     console.log(LOG_PREFIX, ...args);
+  }
+
+  function formatReason(reason) {
+    return reasonLabels[reason] || reason;
   }
 
   function normalizeText(text) {
@@ -707,11 +720,7 @@
       activeHints.add(hintNode);
     }
 
-    for (const node of document.querySelectorAll(`.${LEAF_HINT_CLASS}`)) {
-      if (!activeHints.has(node)) {
-        node.remove();
-      }
-    }
+    removeInactiveHintNodes(LEAF_HINT_CLASS, activeHints);
 
     if (!hint) {
       return null;
@@ -719,6 +728,14 @@
 
     const { element, ...serializableHint } = hint;
     return serializableHint;
+  }
+
+  function removeInactiveHintNodes(className, activeHints) {
+    for (const node of document.querySelectorAll(`.${className}`)) {
+      if (!activeHints.has(node)) {
+        node.remove();
+      }
+    }
   }
 
   function getResetRatioHints() {
@@ -772,11 +789,7 @@
       activeHints.add(hintNode);
     }
 
-    for (const node of document.querySelectorAll(`.${RESET_HINT_CLASS}`)) {
-      if (!activeHints.has(node)) {
-        node.remove();
-      }
-    }
+    removeInactiveHintNodes(RESET_HINT_CLASS, activeHints);
 
     return hints.map(({ button, ...hint }) => hint);
   }
@@ -959,6 +972,10 @@
         box-shadow: 0 14px 34px rgba(0, 0, 0, 0.36);
         backdrop-filter: blur(12px);
       }
+      #${PANEL_ID}.is-collapsed {
+        width: 158px;
+        padding: 8px 9px;
+      }
       #${PANEL_ID} * {
         box-sizing: border-box;
       }
@@ -969,12 +986,20 @@
         gap: 8px;
         margin-bottom: 10px;
       }
+      #${PANEL_ID}.is-collapsed .trutol-header {
+        margin-bottom: 0;
+      }
       #${PANEL_ID} .trutol-title {
         font-weight: 700;
         letter-spacing: 0;
       }
+      #${PANEL_ID} .trutol-header-actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
       #${PANEL_ID} .trutol-badge {
-        min-width: 44px;
+        min-width: 32px;
         padding: 2px 7px;
         border-radius: 999px;
         text-align: center;
@@ -982,6 +1007,21 @@
         color: #a7f3d0;
         background: rgba(16, 185, 129, 0.16);
         border: 1px solid rgba(16, 185, 129, 0.28);
+      }
+      #${PANEL_ID} .trutol-collapse {
+        min-width: 36px;
+        height: 22px;
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        border-radius: 6px;
+        color: #e2e8f0;
+        background: rgba(30, 41, 59, 0.74);
+        cursor: pointer;
+        font: inherit;
+        font-size: 11px;
+        font-weight: 700;
+      }
+      #${PANEL_ID}.is-collapsed .trutol-body {
+        display: none;
       }
       #${PANEL_ID} .trutol-control {
         display: flex;
@@ -1143,6 +1183,14 @@
     return button;
   }
 
+  function createCollapseButton(onClick) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "trutol-collapse";
+    button.addEventListener("click", onClick);
+    return button;
+  }
+
   function createSegmentedControl(options, onSelect) {
     const wrapper = document.createElement("div");
     wrapper.className = "trutol-segmented";
@@ -1195,7 +1243,7 @@
   function setSwitchState(button, isOn) {
     button.classList.toggle("is-on", isOn);
     button.setAttribute("aria-checked", String(isOn));
-    button.setAttribute("title", isOn ? "On" : "Off");
+    button.setAttribute("title", isOn ? "已开启" : "已关闭");
   }
 
   function setSegmentedState(buttons, activeValue) {
@@ -1212,6 +1260,8 @@
 
     ensureStyles();
 
+    document.getElementById(PANEL_ID)?.remove();
+
     panel = document.createElement("div");
     panel.id = PANEL_ID;
 
@@ -1220,14 +1270,28 @@
 
     const title = document.createElement("div");
     title.className = "trutol-title";
-    title.textContent = "TRUTOL Helper";
+    title.textContent = "TRUTOL 助手";
 
     const badge = document.createElement("div");
     badge.className = "trutol-badge";
 
+    const collapseButton = createCollapseButton(() => {
+      const config = loadConfig();
+      updateConfig({ panelCollapsed: !config.panelCollapsed });
+    });
+
+    const headerActions = document.createElement("div");
+    headerActions.className = "trutol-header-actions";
+    headerActions.appendChild(badge);
+    headerActions.appendChild(collapseButton);
+
     header.appendChild(title);
-    header.appendChild(badge);
+    header.appendChild(headerActions);
     panel.appendChild(header);
+
+    const panelBody = document.createElement("div");
+    panelBody.className = "trutol-body";
+    panel.appendChild(panelBody);
 
     const enabledSwitch = createSwitch(() => {
       const config = loadConfig();
@@ -1235,8 +1299,8 @@
     });
 
     const modeControl = createSegmentedControl([
-      { label: "Scan", value: "scan" },
-      { label: "Buy", value: "buy" },
+      { label: "扫描", value: "scan" },
+      { label: "购买", value: "buy" },
     ], (value) => {
       updateConfig({ scanOnly: value === "scan" });
     });
@@ -1246,27 +1310,29 @@
       updateConfig({ autoCompost: !config.autoCompost });
     });
 
-    panel.appendChild(createControlRow("Power", enabledSwitch));
-    panel.appendChild(createControlRow("Mode", modeControl.wrapper));
-    panel.appendChild(createControlRow("Compost", compostSwitch));
+    panelBody.appendChild(createControlRow("开关", enabledSwitch));
+    panelBody.appendChild(createControlRow("模式", modeControl.wrapper));
+    panelBody.appendChild(createControlRow("堆肥", compostSwitch));
 
     const actions = document.createElement("div");
     actions.className = "trutol-action-row";
-    actions.appendChild(createActionButton("Tick Now", () => {
+    actions.appendChild(createActionButton("立即执行", () => {
       runAutomation(loadConfig());
     }));
-    panel.appendChild(actions);
+    panelBody.appendChild(actions);
 
     statusNode = document.createElement("div");
     statusNode.className = "trutol-stats";
-    panel.appendChild(statusNode);
+    panelBody.appendChild(statusNode);
 
     resetNode = document.createElement("div");
     resetNode.className = "trutol-reset";
-    panel.appendChild(resetNode);
+    panelBody.appendChild(resetNode);
 
     controlRefs = {
       badge,
+      collapseButton,
+      title,
       enabledSwitch,
       modeButtons: modeControl.buttons,
       compostSwitch,
@@ -1280,17 +1346,23 @@
     ensurePanel();
 
     const resetHintText = lastSummary.resetHints.length === 0
-      ? "none"
+      ? "无"
       : lastSummary.resetHints
         .slice(0, 2)
         .map((hint) => hint.hint || hint.text)
-        .join(" || ");
+        .join(" ｜ ");
+
+    panel.classList.toggle("is-collapsed", Boolean(config.panelCollapsed));
+    controlRefs.title.textContent = config.panelCollapsed ? "TRUTOL" : "TRUTOL 助手";
+    controlRefs.collapseButton.textContent = config.panelCollapsed ? "展开" : "收起";
+    controlRefs.collapseButton.setAttribute("title", config.panelCollapsed ? "展开辅助面板" : "收起辅助面板");
+    controlRefs.collapseButton.setAttribute("aria-expanded", String(!config.panelCollapsed));
 
     setSwitchState(controlRefs.enabledSwitch, config.enabled);
     setSwitchState(controlRefs.compostSwitch, config.autoCompost);
     setSegmentedState(controlRefs.modeButtons, config.scanOnly ? "scan" : "buy");
 
-    controlRefs.badge.textContent = config.enabled ? "ON" : "OFF";
+    controlRefs.badge.textContent = config.enabled ? "开" : "关";
     controlRefs.badge.style.color = config.enabled ? "#a7f3d0" : "#cbd5e1";
     controlRefs.badge.style.background = config.enabled
       ? "rgba(16, 185, 129, 0.16)"
@@ -1300,12 +1372,12 @@
       : "rgba(148, 163, 184, 0.24)";
 
     statusNode.replaceChildren(
-      createStatRow("Upgrades", `${lastSummary.upgrades.candidates}/${lastSummary.upgrades.clicked}`),
-      createStatRow("Compost", `${lastSummary.compost.candidates}/${lastSummary.compost.clicked}`),
-      createStatRow("Last", lastSummary.reason),
+      createStatRow("升级", `${lastSummary.upgrades.candidates}/${lastSummary.upgrades.clicked}`),
+      createStatRow("堆肥", `${lastSummary.compost.candidates}/${lastSummary.compost.clicked}`),
+      createStatRow("状态", formatReason(lastSummary.reason)),
     );
 
-    resetNode.textContent = `Reset hints: ${resetHintText}`;
+    resetNode.textContent = `重置提示：${resetHintText}`;
   }
 
   function startLoop() {

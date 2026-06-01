@@ -8,7 +8,7 @@ Script goals:
 
 - Observe visible upgrade buttons and identify which ones are currently buyable.
 - Provide a small in-page control panel for pausing, scanning, enabling purchase clicks,
-  and toggling compost automation.
+  toggling compost automation, and collapsing the panel when screen space is tight.
 - Automate safe visible upgrade and compost actions before adding reset, challenge, or
   prestige logic.
 - Surface reset/prestige opportunities as hints without clicking them.
@@ -23,7 +23,8 @@ Enabled automation features:
 - Reset hint display for visible `layer-reset-button` and sacred reset controls.
 - Inline reset ratio hints under visible reset buttons.
 - Inline leaf time-to-next-purchase hint inside the visible leaf layer frame.
-- Manual tick button and browser console API via `window.__trutolHelper`.
+- Collapsible Chinese control panel.
+- Manual run button and browser console API via `window.__trutolHelper`.
 
 Known risks or limits:
 
@@ -42,15 +43,16 @@ Known risks or limits:
 
 Manual controls:
 
-- Panel `Power` switch: pause or resume helper ticks.
-- Panel `Mode` segmented control: scan-only mode versus clicking visible safe upgrades.
-- Panel `Compost` switch: allow or block visible compost button clicks in buy mode.
-- Panel `Tick Now`: run one immediate scan/click pass.
+- Panel `开关` switch: pause or resume helper ticks.
+- Panel `模式` segmented control: scan-only mode versus clicking visible safe upgrades.
+- Panel `堆肥` switch: allow or block visible compost button clicks in buy mode.
+- Panel `立即执行`: run one immediate scan/click pass.
+- Panel `收起` / `展开`: collapse or restore the helper panel.
 - Console:
 
 ```js
 window.__trutolHelper.getConfig()
-window.__trutolHelper.setConfig({ scanOnly: false, autoCompost: true })
+window.__trutolHelper.setConfig({ scanOnly: false, autoCompost: true, panelCollapsed: false })
 window.__trutolHelper.scan()
 window.__trutolHelper.leafTimeHint()
 window.__trutolHelper.resetHints()
