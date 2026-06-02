@@ -6,39 +6,49 @@ Recommended layout:
 
 ```text
 userscripts/
-  shared/      Shared helpers and reusable snippets.
-  games/       One folder per game.
-  templates/   Starter .user.js files.
+  shared/      Shared helpers bundled into game scripts.
+  games/       One source folder per game.
+  dist/        Generated single-file userscripts for installation.
+  scripts/     Build tools.
+  templates/   Starter snippets.
 ```
 
-Start simple:
+Use game source folders for development:
 
 ```text
 games/
   game-name/
     README.md
-    game-name.user.js
-```
-
-When a script gets large, split its source:
-
-```text
-games/
-  game-name/
-    README.md
+    userscript.config.json
     src/
+      config.js
       main.js
       selectors.js
-      state.js
       strategy.js
       ui.js
-      storage.js
-    dist/
-      game-name.user.js
 ```
 
-Keep the final script that Tampermonkey installs in `dist/` or directly as
-`game-name.user.js` for small projects.
+Generated installable scripts are written to root `dist/`:
+
+```text
+dist/
+  game-name.user.js
+```
+
+Do not edit `dist/*.user.js` directly. Change `shared/` or
+`games/<game-name>/src/`, then rebuild.
+
+Build one game:
+
+```bash
+node scripts/build-userscript.js <game-name>
+```
+
+Build all configured games:
+
+```bash
+node scripts/build-userscript.js
+```
 
 ## Git Workflow
 
@@ -68,22 +78,25 @@ Recommended flow:
 
 1. Start from the stable branch and update it.
 2. Create a versioned branch for the game or feature.
-3. Make the script and README changes on that branch.
-4. Let the user test or review the feature in the browser.
-5. After the user confirms the feature is complete, commit the branch.
-6. Merge the confirmed branch back into `main`.
-7. Keep `main` clean after the merge.
+3. Change `shared/` helpers or `games/<game-name>/src/` source files.
+4. Run `node scripts/build-userscript.js <game-name>` to refresh `dist/`.
+5. Verify the generated script in the browser or Tampermonkey.
+6. After the user confirms the feature is complete, commit source and `dist/`.
+7. Merge the confirmed branch back into `main`.
+8. Keep `main` clean after the merge.
 
 Typical commands:
 
 ```bash
 git switch main
 git switch -c feature/<game-name>/v<version>
+node scripts/build-userscript.js <game-name>
 git status
 git add .
-git commit -m "Update <game-name> helper to v<version>"
+git commit -m "feat: 更新 <game-name> 到 v<version>"
 git switch main
 git merge --no-ff feature/<game-name>/v<version>
+git push
 ```
 
 Do not merge unfinished automation behavior into the stable branch. Reset,
