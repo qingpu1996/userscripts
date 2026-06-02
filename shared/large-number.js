@@ -249,6 +249,26 @@ function subtractLog10(minuendLog10, subtrahendLog10) {
   return minuendLog10 + Math.log10(1 - (10 ** gap));
 }
 
+function addLog10(leftLog10, rightLog10) {
+  if (leftLog10 === Number.NEGATIVE_INFINITY) {
+    return rightLog10;
+  }
+
+  if (rightLog10 === Number.NEGATIVE_INFINITY) {
+    return leftLog10;
+  }
+
+  const high = Math.max(leftLog10, rightLog10);
+  const low = Math.min(leftLog10, rightLog10);
+  const gap = low - high;
+
+  if (gap < -15) {
+    return high;
+  }
+
+  return high + Math.log10(1 + (10 ** gap));
+}
+
 function formatDuration(log10Seconds) {
   if (log10Seconds > oneWeekLog10) {
     return "大于一周";
