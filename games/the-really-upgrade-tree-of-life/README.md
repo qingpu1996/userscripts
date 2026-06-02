@@ -4,6 +4,23 @@ Target URL:
 
 - https://the-really-upgrade-tree-of-life.g8hh.com.cn/
 
+Install URL:
+
+- https://raw.githubusercontent.com/qingpu1996/userscripts/main/dist/the-really-upgrade-tree-of-life.user.js
+
+Source layout:
+
+- `userscript.config.json`: userscript metadata, source order, and dist output.
+- `src/`: game-specific source files.
+- `../../shared/`: shared helpers bundled by the build script.
+- `../../dist/the-really-upgrade-tree-of-life.user.js`: generated Tampermonkey script.
+
+Build:
+
+```bash
+node scripts/build-userscript.js the-really-upgrade-tree-of-life
+```
+
 Script goals:
 
 - Observe visible upgrade buttons and identify which ones are currently buyable.

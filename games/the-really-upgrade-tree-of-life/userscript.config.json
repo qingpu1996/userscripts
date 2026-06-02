@@ -1,0 +1,31 @@
+{
+  "slug": "the-really-upgrade-tree-of-life",
+  "output": "dist/the-really-upgrade-tree-of-life.user.js",
+  "rawBaseUrl": "https://raw.githubusercontent.com/qingpu1996/userscripts/main",
+  "metadata": {
+    "name": "The Really Upgrade Tree of Life Helper",
+    "namespace": "local.incremental.userscripts",
+    "version": "0.7.0",
+    "description": "Conservative automation helper for The Really Upgrade Tree of Life.",
+    "match": [
+      "https://the-really-upgrade-tree-of-life.g8hh.com.cn/*"
+    ],
+    "grant": [
+      "GM_getValue",
+      "GM_setValue"
+    ],
+    "run-at": "document-idle"
+  },
+  "sources": [
+    "shared/storage.js",
+    "shared/dom.js",
+    "shared/large-number.js",
+    "games/the-really-upgrade-tree-of-life/src/config.js",
+    "games/the-really-upgrade-tree-of-life/src/selectors.js",
+    "games/the-really-upgrade-tree-of-life/src/resources.js",
+    "games/the-really-upgrade-tree-of-life/src/hints.js",
+    "games/the-really-upgrade-tree-of-life/src/automation.js",
+    "games/the-really-upgrade-tree-of-life/src/panel.js",
+    "games/the-really-upgrade-tree-of-life/src/main.js"
+  ]
+}

@@ -1,89 +1,21 @@
 // ==UserScript==
 // @name         The Really Upgrade Tree of Life Helper
 // @namespace    local.incremental.userscripts
-// @version      0.6.0
+// @version      0.7.0
 // @description  Conservative automation helper for The Really Upgrade Tree of Life.
 // @match        https://the-really-upgrade-tree-of-life.g8hh.com.cn/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @run-at       document-idle
+// @updateURL    https://raw.githubusercontent.com/qingpu1996/userscripts/main/dist/the-really-upgrade-tree-of-life.user.js
+// @downloadURL  https://raw.githubusercontent.com/qingpu1996/userscripts/main/dist/the-really-upgrade-tree-of-life.user.js
 // ==/UserScript==
 
+// This file is generated. Edit shared/ or games/*/src/ and rebuild it.
 (function () {
   "use strict";
 
-  const CONFIG_KEY = "trutol-helper-config";
-  const PANEL_ID = "trutol-helper-panel";
-  const STYLE_ID = "trutol-helper-style";
-  const LOG_PREFIX = "[TRUTOL Helper]";
-  const RESET_HINT_CLASS = "trutol-inline-reset-hint";
-  const LEAF_HINT_CLASS = "trutol-inline-leaf-hint";
-  const decimalNumberSource = "(?:\\d+(?:[\\d,]*\\d)?(?:\\.\\d+)?|\\.\\d+)";
-  const oneWeekSeconds = 7 * 24 * 60 * 60;
-  const oneWeekLog10 = Math.log10(oneWeekSeconds);
-
-  const defaultConfig = {
-    enabled: true,
-    scanOnly: true,
-    autoUpgrades: true,
-    autoCompost: true,
-    panelCollapsed: false,
-    tickMs: 750,
-    maxUpgradeClicksPerTick: 3,
-    maxCompostClicksPerTick: 1,
-    logScans: false,
-    logClicks: true,
-  };
-
-  const riskyTextPatterns = [
-    /\bWIPE\b/i,
-    /\bSave\b/i,
-    /\bExport\b/i,
-    /\bImport\b/i,
-    /\bReset\b/i,
-    /\bRespec\b/i,
-    /\bReload\b/i,
-    /\bReinforcement\b/i,
-    /\bTransform\b/i,
-    /\bChallenge\b/i,
-    /\bEnter\b/i,
-    /\bExit\b/i,
-    /\bSacred\b/i,
-    /\bPrestige\b/i,
-  ];
-
-  const suffixes = buildSuffixMap();
-
-  let panel;
-  let statusNode;
-  let resetNode;
-  let intervalId;
-  let controlRefs = {};
-  let lastSummary = {
-    candidates: 0,
-    clicked: 0,
-    skipped: 0,
-    upgrades: {
-      candidates: 0,
-      clicked: 0,
-      skipped: 0,
-    },
-    compost: {
-      candidates: 0,
-      clicked: 0,
-      skipped: 0,
-    },
-    resetHints: [],
-    reason: "Starting",
-  };
-
-  const reasonLabels = {
-    "Buy mode": "购买模式",
-    Paused: "已暂停",
-    "Scan only": "仅扫描",
-    Starting: "启动中",
-    "Waiting for app": "等待游戏",
-  };
+  // Source: shared/storage.js
 
   function gmGetValue(key, fallback) {
     if (typeof GM_getValue === "function") {
@@ -107,28 +39,7 @@
     window.localStorage.setItem(key, JSON.stringify(value));
   }
 
-  function loadConfig() {
-    return Object.assign({}, defaultConfig, gmGetValue(CONFIG_KEY, {}));
-  }
-
-  function saveConfig(config) {
-    gmSetValue(CONFIG_KEY, config);
-  }
-
-  function updateConfig(nextConfig) {
-    const config = Object.assign({}, loadConfig(), nextConfig);
-    saveConfig(config);
-    renderPanel(config);
-    return config;
-  }
-
-  function log(...args) {
-    console.log(LOG_PREFIX, ...args);
-  }
-
-  function formatReason(reason) {
-    return reasonLabels[reason] || reason;
-  }
+  // Source: shared/dom.js
 
   function normalizeText(text) {
     return String(text || "").replace(/\s+/g, " ").trim();
@@ -143,63 +54,19 @@
     return Array.from(element.classList).some((className) => className.startsWith(prefix));
   }
 
-  function isRiskyButton(button) {
-    const text = normalizeText(button.textContent);
-
-    if (button.closest(".o-options-grid")) {
-      return true;
+  function removeInactiveHintNodes(className, activeHints) {
+    for (const node of document.querySelectorAll(`.${className}`)) {
+      if (!activeHints.has(node)) {
+        node.remove();
+      }
     }
-
-    if (button.matches(".tab-button, .stab-button, .no-active, .layer-reset-button")) {
-      return true;
-    }
-
-    return riskyTextPatterns.some((pattern) => pattern.test(text));
   }
 
-  function isUpgradeLike(button) {
-    return hasClassStartingWith(button, "upgrade-") || button.classList.contains("repeatable-upgrade");
-  }
+  // Source: shared/large-number.js
 
-  function isClickablePrimary(button) {
-    return !button.disabled && !button.classList.contains("o-primary-btn--disabled");
-  }
-
-  function getVisibleUpgradeButtons() {
-    return Array.from(document.querySelectorAll("button.o-primary-btn, button.repeatable-upgrade"))
-      .filter((button) => isVisible(button))
-      .filter((button) => isUpgradeLike(button));
-  }
-
-  function getBuyableUpgradeButtons() {
-    return getVisibleUpgradeButtons()
-      .filter(isClickablePrimary)
-      .filter((button) => !button.classList.contains("o-primary-btn--bought"))
-      .filter((button) => !isRiskyButton(button));
-  }
-
-  function getVisibleCompostButtons() {
-    return Array.from(document.querySelectorAll("button.compost-button"))
-      .filter((button) => isVisible(button));
-  }
-
-  function getBuyableCompostButtons() {
-    return getVisibleCompostButtons()
-      .filter(isClickablePrimary)
-      .filter((button) => !isRiskyButton(button));
-  }
-
-  function getVisibleResetButtons() {
-    return Array.from(document.querySelectorAll("button.layer-reset-button, button#sacred-reset"))
-      .filter((button) => isVisible(button));
-  }
-
-  function describeButton(button) {
-    return {
-      text: normalizeText(button.textContent),
-      classes: Array.from(button.classList),
-    };
-  }
+  const decimalNumberSource = "(?:\\d+(?:[\\d,]*\\d)?(?:\\.\\d+)?|\\.\\d+)";
+  const oneWeekSeconds = 7 * 24 * 60 * 60;
+  const oneWeekLog10 = Math.log10(oneWeekSeconds);
 
   function buildSuffixMap() {
     const units = ["", "U", "D", "T", "Qa", "Qt", "Sx", "Sp", "Oc", "No"];
@@ -290,6 +157,8 @@
 
     return map;
   }
+
+  const suffixes = buildSuffixMap();
 
   function parseDisplayedNumber(value) {
     const text = normalizeText(value)
@@ -479,6 +348,161 @@
     return hours > 0 ? `${days} 天 ${hours} 小时` : `${days} 天`;
   }
 
+  // Source: games/the-really-upgrade-tree-of-life/src/config.js
+
+  const CONFIG_KEY = "trutol-helper-config";
+  const PANEL_ID = "trutol-helper-panel";
+  const STYLE_ID = "trutol-helper-style";
+  const LOG_PREFIX = "[TRUTOL Helper]";
+  const RESET_HINT_CLASS = "trutol-inline-reset-hint";
+  const LEAF_HINT_CLASS = "trutol-inline-leaf-hint";
+
+  const defaultConfig = {
+    enabled: true,
+    scanOnly: true,
+    autoUpgrades: true,
+    autoCompost: true,
+    panelCollapsed: false,
+    tickMs: 750,
+    maxUpgradeClicksPerTick: 3,
+    maxCompostClicksPerTick: 1,
+    logScans: false,
+    logClicks: true,
+  };
+
+  const riskyTextPatterns = [
+    /\bWIPE\b/i,
+    /\bSave\b/i,
+    /\bExport\b/i,
+    /\bImport\b/i,
+    /\bReset\b/i,
+    /\bRespec\b/i,
+    /\bReload\b/i,
+    /\bReinforcement\b/i,
+    /\bTransform\b/i,
+    /\bChallenge\b/i,
+    /\bEnter\b/i,
+    /\bExit\b/i,
+    /\bSacred\b/i,
+    /\bPrestige\b/i,
+  ];
+
+  let panel;
+  let statusNode;
+  let resetNode;
+  let intervalId;
+  let controlRefs = {};
+  let lastSummary = {
+    candidates: 0,
+    clicked: 0,
+    skipped: 0,
+    upgrades: {
+      candidates: 0,
+      clicked: 0,
+      skipped: 0,
+    },
+    compost: {
+      candidates: 0,
+      clicked: 0,
+      skipped: 0,
+    },
+    resetHints: [],
+    reason: "Starting",
+  };
+
+  const reasonLabels = {
+    "Buy mode": "购买模式",
+    Paused: "已暂停",
+    "Scan only": "仅扫描",
+    Starting: "启动中",
+    "Waiting for app": "等待游戏",
+  };
+
+  function loadConfig() {
+    return Object.assign({}, defaultConfig, gmGetValue(CONFIG_KEY, {}));
+  }
+
+  function saveConfig(config) {
+    gmSetValue(CONFIG_KEY, config);
+  }
+
+  function updateConfig(nextConfig) {
+    const config = Object.assign({}, loadConfig(), nextConfig);
+    saveConfig(config);
+    renderPanel(config);
+    return config;
+  }
+
+  function log(...args) {
+    console.log(LOG_PREFIX, ...args);
+  }
+
+  function formatReason(reason) {
+    return reasonLabels[reason] || reason;
+  }
+
+  // Source: games/the-really-upgrade-tree-of-life/src/selectors.js
+
+  function isRiskyButton(button) {
+    const text = normalizeText(button.textContent);
+
+    if (button.closest(".o-options-grid")) {
+      return true;
+    }
+
+    if (button.matches(".tab-button, .stab-button, .no-active, .layer-reset-button")) {
+      return true;
+    }
+
+    return riskyTextPatterns.some((pattern) => pattern.test(text));
+  }
+
+  function isUpgradeLike(button) {
+    return hasClassStartingWith(button, "upgrade-") || button.classList.contains("repeatable-upgrade");
+  }
+
+  function isClickablePrimary(button) {
+    return !button.disabled && !button.classList.contains("o-primary-btn--disabled");
+  }
+
+  function getVisibleUpgradeButtons() {
+    return Array.from(document.querySelectorAll("button.o-primary-btn, button.repeatable-upgrade"))
+      .filter((button) => isVisible(button))
+      .filter((button) => isUpgradeLike(button));
+  }
+
+  function getBuyableUpgradeButtons() {
+    return getVisibleUpgradeButtons()
+      .filter(isClickablePrimary)
+      .filter((button) => !button.classList.contains("o-primary-btn--bought"))
+      .filter((button) => !isRiskyButton(button));
+  }
+
+  function getVisibleCompostButtons() {
+    return Array.from(document.querySelectorAll("button.compost-button"))
+      .filter((button) => isVisible(button));
+  }
+
+  function getBuyableCompostButtons() {
+    return getVisibleCompostButtons()
+      .filter(isClickablePrimary)
+      .filter((button) => !isRiskyButton(button));
+  }
+
+  function getVisibleResetButtons() {
+    return Array.from(document.querySelectorAll("button.layer-reset-button, button#sacred-reset"))
+      .filter((button) => isVisible(button));
+  }
+
+  function describeButton(button) {
+    return {
+      text: normalizeText(button.textContent),
+      classes: Array.from(button.classList),
+    };
+  }
+
+  // Source: games/the-really-upgrade-tree-of-life/src/resources.js
+
   function normalizeResourceName(name) {
     const text = normalizeText(name).toLowerCase();
 
@@ -658,6 +682,8 @@
       .sort((left, right) => left.cost.amount.log10 - right.cost.amount.log10);
   }
 
+  // Source: games/the-really-upgrade-tree-of-life/src/hints.js
+
   function getLeafTimeHint() {
     const leaves = readVisibleLeafLayerResource();
 
@@ -730,14 +756,6 @@
     return serializableHint;
   }
 
-  function removeInactiveHintNodes(className, activeHints) {
-    for (const node of document.querySelectorAll(`.${className}`)) {
-      if (!activeHints.has(node)) {
-        node.remove();
-      }
-    }
-  }
-
   function getResetRatioHints() {
     const resources = readVisibleResources();
 
@@ -793,6 +811,8 @@
 
     return hints.map(({ button, ...hint }) => hint);
   }
+
+  // Source: games/the-really-upgrade-tree-of-life/src/automation.js
 
   function scan() {
     const visibleUpgrades = getVisibleUpgradeButtons();
@@ -945,6 +965,8 @@
     renderPanel(config);
     return lastSummary;
   }
+
+  // Source: games/the-really-upgrade-tree-of-life/src/panel.js
 
   function ensureStyles() {
     if (document.getElementById(STYLE_ID)) {
@@ -1379,6 +1401,8 @@
 
     resetNode.textContent = `重置提示：${resetHintText}`;
   }
+
+  // Source: games/the-really-upgrade-tree-of-life/src/main.js
 
   function startLoop() {
     const config = loadConfig();

@@ -1,18 +1,27 @@
 # Templates
 
-Copy a template into `games/<game-name>/` when starting a new script.
+Copy or adapt template snippets when starting a new script.
 
 Example:
 
 ```text
 games/
   example-game/
-    example-game.user.js
+    userscript.config.json
+    src/
+      config.js
+      main.js
 ```
 
-Then update the userscript metadata block:
+Then update `userscript.config.json` metadata:
 
-- `@name`
-- `@description`
-- `@match`
-- `@grant`
+- `name`
+- `description`
+- `match`
+- `grant`
+
+Build the final userscript into `dist/`:
+
+```bash
+node scripts/build-userscript.js example-game
+```

@@ -6,7 +6,10 @@ Create one folder per game:
 games/
   game-name/
     README.md
-    game-name.user.js
+    userscript.config.json
+    src/
+      config.js
+      main.js
 ```
 
 Use lowercase kebab-case for folder names, for example:
@@ -20,7 +23,11 @@ kittens-game/
 Each game folder should describe:
 
 - target URL
+- install URL in `dist/`
 - script goals
 - enabled automation features
 - known risks or limits
 - manual controls
+
+The installable Tampermonkey file is generated into root `dist/`, not kept
+inside the game source folder.
