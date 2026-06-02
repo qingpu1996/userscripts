@@ -21,6 +21,14 @@ Build:
 node scripts/build-userscript.js the-really-upgrade-tree-of-life
 ```
 
+Tampermonkey verification:
+
+- After pasting or updating the generated script, make sure both Tampermonkey's
+  site/global switch and the individual `The Really Upgrade Tree of Life Helper`
+  script row switch are enabled.
+- Refresh the game tab after enabling the script. If the helper panel is missing,
+  first check the script row switch before debugging the source code.
+
 Script goals:
 
 - Observe visible upgrade buttons and identify which ones are currently buyable.

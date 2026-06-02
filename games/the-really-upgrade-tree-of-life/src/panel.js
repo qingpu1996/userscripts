@@ -198,7 +198,10 @@ function ensureStyles() {
       pointer-events: none;
     }
     .${RESET_HINT_CLASS} {
-      margin: 3px auto 8px;
+      margin: 3px auto 5px;
+    }
+    .${RESET_HINT_CLASS} + .${RESET_HINT_CLASS} {
+      margin-top: -2px;
     }
     .${LEAF_HINT_CLASS} {
       position: absolute !important;

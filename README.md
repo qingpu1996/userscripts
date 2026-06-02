@@ -102,3 +102,15 @@ git push
 Do not merge unfinished automation behavior into the stable branch. Reset,
 prestige, import/export, and destructive actions should stay hint-only unless the
 game README explicitly documents that automation and the user has confirmed it.
+
+## Tampermonkey Verification
+
+When testing a generated script in Tampermonkey, verify both enable switches:
+
+1. The Tampermonkey extension/global switch is enabled for the current site.
+2. The individual script row switch is enabled. Do not confuse the global
+   "enabled" status with the script-specific switch.
+3. Refresh the game tab after saving or re-enabling the script so Tampermonkey
+   injects the latest code.
+4. Confirm the helper actually injected, for example by checking the in-page
+   panel, inline hints, or `window.__trutolHelper`.
