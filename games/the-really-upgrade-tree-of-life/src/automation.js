@@ -30,6 +30,22 @@ function emptyClickSummary() {
   };
 }
 
+function createClickSummary(upgrades, compost, resetHints, reason) {
+  return {
+    candidates: upgrades.candidates + compost.candidates,
+    clicked: upgrades.clicked + compost.clicked,
+    skipped: upgrades.skipped + compost.skipped,
+    upgrades,
+    compost,
+    resetHints,
+    reason,
+  };
+}
+
+function createIdleClickSummary(reason) {
+  return createClickSummary(emptyClickSummary(), emptyClickSummary(), [], reason);
+}
+
 function clickButtons(buttons, limit, label, config) {
   let clicked = 0;
 
@@ -76,6 +92,29 @@ function clickBuyableCompost(config) {
   return clickButtons(candidates, limit, "compost", config);
 }
 
+function runPurchaseTick(config = loadConfig()) {
+  if (!document.querySelector("#app")) {
+    lastPurchaseSummary = createIdleClickSummary("Waiting for app");
+    return lastPurchaseSummary;
+  }
+
+  if (!config.enabled) {
+    lastPurchaseSummary = createIdleClickSummary("Paused");
+    return lastPurchaseSummary;
+  }
+
+  if (config.scanOnly) {
+    lastPurchaseSummary = createIdleClickSummary("Scan only");
+    return lastPurchaseSummary;
+  }
+
+  const upgrades = config.autoUpgrades ? clickBuyableUpgrades(config) : emptyClickSummary();
+  const compost = config.autoCompost ? clickBuyableCompost(config) : emptyClickSummary();
+
+  lastPurchaseSummary = createClickSummary(upgrades, compost, [], "Buy mode");
+  return lastPurchaseSummary;
+}
+
 function summarizeScanOnly(scanResult, reason) {
   const upgradeCandidates = scanResult.upgrades.buyable.length;
   const compostCandidates = scanResult.compost.buyable.length;
@@ -99,17 +138,52 @@ function summarizeScanOnly(scanResult, reason) {
   };
 }
 
+function summarizeBuyMode(scanResult) {
+  return Object.assign({}, lastPurchaseSummary, {
+    resetHints: scanResult.resetHints,
+    reason: "Buy mode",
+  });
+}
+
+function createWaitingSummary() {
+  return createClickSummary(emptyClickSummary(), emptyClickSummary(), [], "Waiting for app");
+}
+
+function runStatusTick(config = loadConfig()) {
+  if (!document.querySelector("#app")) {
+    lastSummary = createWaitingSummary();
+    renderPanel(config);
+    return lastSummary;
+  }
+
+  const scanResult = scan();
+  updateInlineLeafHint();
+  updateInlineResetHints();
+
+  if (config.logScans) {
+    log("scan", scanResult);
+  }
+
+  if (!config.enabled) {
+    lastSummary = summarizeScanOnly(scanResult, "Paused");
+    renderPanel(config);
+    return lastSummary;
+  }
+
+  if (config.scanOnly) {
+    lastSummary = summarizeScanOnly(scanResult, "Scan only");
+    renderPanel(config);
+    return lastSummary;
+  }
+
+  lastSummary = summarizeBuyMode(scanResult);
+  renderPanel(config);
+  return lastSummary;
+}
+
 function runAutomation(config = loadConfig()) {
   if (!document.querySelector("#app")) {
-    lastSummary = {
-      candidates: 0,
-      clicked: 0,
-      skipped: 0,
-      upgrades: emptyClickSummary(),
-      compost: emptyClickSummary(),
-      resetHints: [],
-      reason: "Waiting for app",
-    };
+    lastSummary = createWaitingSummary();
     renderPanel(config);
     return lastSummary;
   }
@@ -137,15 +211,8 @@ function runAutomation(config = loadConfig()) {
   const upgrades = config.autoUpgrades ? clickBuyableUpgrades(config) : emptyClickSummary();
   const compost = config.autoCompost ? clickBuyableCompost(config) : emptyClickSummary();
 
-  lastSummary = {
-    candidates: upgrades.candidates + compost.candidates,
-    clicked: upgrades.clicked + compost.clicked,
-    skipped: upgrades.skipped + compost.skipped,
-    upgrades,
-    compost,
-    resetHints: scanResult.resetHints,
-    reason: "Buy mode",
-  };
+  lastPurchaseSummary = createClickSummary(upgrades, compost, [], "Buy mode");
+  lastSummary = createClickSummary(upgrades, compost, scanResult.resetHints, "Buy mode");
   renderPanel(config);
   return lastSummary;
 }

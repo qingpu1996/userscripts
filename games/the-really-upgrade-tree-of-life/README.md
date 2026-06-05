@@ -49,6 +49,8 @@ Enabled automation features:
 - Inline reset ratio hints under visible reset buttons.
 - Inline leaf time-to-next-purchase hint inside the visible leaf layer frame.
 - Collapsible Chinese control panel.
+- Configurable speed modes with a fast purchase loop separated from the slower
+  status, panel, and inline-hint refresh loop.
 - Manual run button and browser console API via `window.__trutolHelper`.
 
 Known risks or limits:
@@ -64,12 +66,17 @@ Known risks or limits:
 - Leaf time hints are approximate and use the visible leaf layer amount,
   visible per-second leaf production, and visible unbought leaf-cost upgrades
   only. Estimates longer than seven days are shown as greater than one week.
+- Burst speed mode runs purchase scans every 50ms. It is intended for early
+  fast-growth phases and still avoids reset, challenge, and prestige actions.
 - A game update can change DOM classes or text and require selector updates.
 
 Manual controls:
 
 - Panel `开关` switch: pause or resume helper ticks.
 - Panel `模式` segmented control: scan-only mode versus clicking visible safe upgrades.
+- Panel `速度` segmented control: `稳健` uses 750ms purchase/status ticks, `快速`
+  uses 250ms purchase and 500ms status ticks, and `爆发` uses 50ms purchase and
+  500ms status ticks.
 - Panel `堆肥` switch: allow or block visible compost button clicks in buy mode.
 - Panel `立即执行`: run one immediate scan/click pass.
 - Panel `收起` / `展开`: collapse or restore the helper panel.
@@ -77,9 +84,12 @@ Manual controls:
 
 ```js
 window.__trutolHelper.getConfig()
-window.__trutolHelper.setConfig({ scanOnly: false, autoCompost: true, panelCollapsed: false })
+window.__trutolHelper.setConfig({ scanOnly: false, autoCompost: true, speedMode: "burst" })
+window.__trutolHelper.timings()
 window.__trutolHelper.scan()
 window.__trutolHelper.leafTimeHint()
 window.__trutolHelper.resetHints()
+window.__trutolHelper.purchaseTick()
+window.__trutolHelper.statusTick()
 window.__trutolHelper.tick()
 ```
