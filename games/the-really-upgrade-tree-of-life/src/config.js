@@ -5,12 +5,36 @@ const LOG_PREFIX = "[TRUTOL Helper]";
 const RESET_HINT_CLASS = "trutol-inline-reset-hint";
 const LEAF_HINT_CLASS = "trutol-inline-leaf-hint";
 
+const minBuyTickMs = 20;
+const minStatusTickMs = 250;
+
+const speedProfiles = {
+  steady: {
+    label: "稳健",
+    buyTickMs: 750,
+    statusTickMs: 750,
+  },
+  fast: {
+    label: "快速",
+    buyTickMs: 250,
+    statusTickMs: 500,
+  },
+  burst: {
+    label: "爆发",
+    buyTickMs: 50,
+    statusTickMs: 500,
+  },
+};
+
 const defaultConfig = {
   enabled: true,
   scanOnly: true,
   autoUpgrades: true,
   autoCompost: true,
   panelCollapsed: false,
+  speedMode: "fast",
+  buyTickMs: null,
+  statusTickMs: null,
   tickMs: 750,
   maxUpgradeClicksPerTick: 3,
   maxCompostClicksPerTick: 1,
@@ -38,8 +62,25 @@ const riskyTextPatterns = [
 let panel;
 let statusNode;
 let resetNode;
-let intervalId;
+let buyIntervalId;
+let statusIntervalId;
 let controlRefs = {};
+let lastPurchaseSummary = {
+  candidates: 0,
+  clicked: 0,
+  skipped: 0,
+  upgrades: {
+    candidates: 0,
+    clicked: 0,
+    skipped: 0,
+  },
+  compost: {
+    candidates: 0,
+    clicked: 0,
+    skipped: 0,
+  },
+  reason: "Starting",
+};
 let lastSummary = {
   candidates: 0,
   clicked: 0,
@@ -77,6 +118,11 @@ function saveConfig(config) {
 function updateConfig(nextConfig) {
   const config = Object.assign({}, loadConfig(), nextConfig);
   saveConfig(config);
+
+  if (typeof restartLoops === "function") {
+    restartLoops(config);
+  }
+
   renderPanel(config);
   return config;
 }
@@ -87,4 +133,31 @@ function log(...args) {
 
 function formatReason(reason) {
   return reasonLabels[reason] || reason;
+}
+
+function getSpeedMode(config = loadConfig()) {
+  return speedProfiles[config.speedMode] ? config.speedMode : defaultConfig.speedMode;
+}
+
+function getSpeedProfile(config = loadConfig()) {
+  return speedProfiles[getSpeedMode(config)];
+}
+
+function formatSpeedMode(config = loadConfig()) {
+  return getSpeedProfile(config).label;
+}
+
+function readTickMs(value, fallback, minimum) {
+  const tickMs = Number(value);
+  const resolved = Number.isFinite(tickMs) && tickMs > 0 ? tickMs : fallback;
+  return Math.max(minimum, resolved);
+}
+
+function getAutomationTimings(config = loadConfig()) {
+  const profile = getSpeedProfile(config);
+
+  return {
+    buyTickMs: readTickMs(config.buyTickMs, profile.buyTickMs, minBuyTickMs),
+    statusTickMs: readTickMs(config.statusTickMs, profile.statusTickMs, minStatusTickMs),
+  };
 }

@@ -119,7 +119,7 @@ function ensureStyles() {
     }
     #${PANEL_ID} .trutol-segmented {
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: repeat(var(--trutol-segments, 2), minmax(0, 1fr));
       flex: 1;
       min-width: 0;
       padding: 3px;
@@ -249,6 +249,7 @@ function createCollapseButton(onClick) {
 function createSegmentedControl(options, onSelect) {
   const wrapper = document.createElement("div");
   wrapper.className = "trutol-segmented";
+  wrapper.style.setProperty("--trutol-segments", String(options.length));
 
   const buttons = {};
 
@@ -257,6 +258,9 @@ function createSegmentedControl(options, onSelect) {
     button.type = "button";
     button.className = "trutol-segment";
     button.textContent = option.label;
+    if (option.title) {
+      button.setAttribute("title", option.title);
+    }
     button.addEventListener("click", () => onSelect(option.value));
     buttons[option.value] = button;
     wrapper.appendChild(button);
@@ -360,6 +364,14 @@ function ensurePanel() {
     updateConfig({ scanOnly: value === "scan" });
   });
 
+  const speedControl = createSegmentedControl([
+    { label: "稳健", value: "steady", title: "750ms 购买 / 750ms 状态" },
+    { label: "快速", value: "fast", title: "250ms 购买 / 500ms 状态" },
+    { label: "爆发", value: "burst", title: "50ms 购买 / 500ms 状态" },
+  ], (value) => {
+    updateConfig({ speedMode: value, buyTickMs: null, statusTickMs: null });
+  });
+
   const compostSwitch = createSwitch(() => {
     const config = loadConfig();
     updateConfig({ autoCompost: !config.autoCompost });
@@ -367,6 +379,7 @@ function ensurePanel() {
 
   panelBody.appendChild(createControlRow("开关", enabledSwitch));
   panelBody.appendChild(createControlRow("模式", modeControl.wrapper));
+  panelBody.appendChild(createControlRow("速度", speedControl.wrapper));
   panelBody.appendChild(createControlRow("堆肥", compostSwitch));
 
   const actions = document.createElement("div");
@@ -390,6 +403,7 @@ function ensurePanel() {
     title,
     enabledSwitch,
     modeButtons: modeControl.buttons,
+    speedButtons: speedControl.buttons,
     compostSwitch,
   };
 
@@ -416,6 +430,7 @@ function renderPanel(config = loadConfig()) {
   setSwitchState(controlRefs.enabledSwitch, config.enabled);
   setSwitchState(controlRefs.compostSwitch, config.autoCompost);
   setSegmentedState(controlRefs.modeButtons, config.scanOnly ? "scan" : "buy");
+  setSegmentedState(controlRefs.speedButtons, getSpeedMode(config));
 
   controlRefs.badge.textContent = config.enabled ? "开" : "关";
   controlRefs.badge.style.color = config.enabled ? "#a7f3d0" : "#cbd5e1";
@@ -429,6 +444,7 @@ function renderPanel(config = loadConfig()) {
   statusNode.replaceChildren(
     createStatRow("升级", `${lastSummary.upgrades.candidates}/${lastSummary.upgrades.clicked}`),
     createStatRow("堆肥", `${lastSummary.compost.candidates}/${lastSummary.compost.clicked}`),
+    createStatRow("速度", formatSpeedMode(config)),
     createStatRow("状态", formatReason(lastSummary.reason)),
   );
 

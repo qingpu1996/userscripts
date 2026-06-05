@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         The Really Upgrade Tree of Life Helper
 // @namespace    local.incremental.userscripts
-// @version      0.8.0
+// @version      0.9.0
 // @description  Conservative automation helper for The Really Upgrade Tree of Life.
 // @match        https://the-really-upgrade-tree-of-life.g8hh.com.cn/*
 // @grant        GM_getValue
@@ -377,12 +377,36 @@
   const RESET_HINT_CLASS = "trutol-inline-reset-hint";
   const LEAF_HINT_CLASS = "trutol-inline-leaf-hint";
 
+  const minBuyTickMs = 20;
+  const minStatusTickMs = 250;
+
+  const speedProfiles = {
+    steady: {
+      label: "稳健",
+      buyTickMs: 750,
+      statusTickMs: 750,
+    },
+    fast: {
+      label: "快速",
+      buyTickMs: 250,
+      statusTickMs: 500,
+    },
+    burst: {
+      label: "爆发",
+      buyTickMs: 50,
+      statusTickMs: 500,
+    },
+  };
+
   const defaultConfig = {
     enabled: true,
     scanOnly: true,
     autoUpgrades: true,
     autoCompost: true,
     panelCollapsed: false,
+    speedMode: "fast",
+    buyTickMs: null,
+    statusTickMs: null,
     tickMs: 750,
     maxUpgradeClicksPerTick: 3,
     maxCompostClicksPerTick: 1,
@@ -410,8 +434,25 @@
   let panel;
   let statusNode;
   let resetNode;
-  let intervalId;
+  let buyIntervalId;
+  let statusIntervalId;
   let controlRefs = {};
+  let lastPurchaseSummary = {
+    candidates: 0,
+    clicked: 0,
+    skipped: 0,
+    upgrades: {
+      candidates: 0,
+      clicked: 0,
+      skipped: 0,
+    },
+    compost: {
+      candidates: 0,
+      clicked: 0,
+      skipped: 0,
+    },
+    reason: "Starting",
+  };
   let lastSummary = {
     candidates: 0,
     clicked: 0,
@@ -449,6 +490,11 @@
   function updateConfig(nextConfig) {
     const config = Object.assign({}, loadConfig(), nextConfig);
     saveConfig(config);
+
+    if (typeof restartLoops === "function") {
+      restartLoops(config);
+    }
+
     renderPanel(config);
     return config;
   }
@@ -459,6 +505,33 @@
 
   function formatReason(reason) {
     return reasonLabels[reason] || reason;
+  }
+
+  function getSpeedMode(config = loadConfig()) {
+    return speedProfiles[config.speedMode] ? config.speedMode : defaultConfig.speedMode;
+  }
+
+  function getSpeedProfile(config = loadConfig()) {
+    return speedProfiles[getSpeedMode(config)];
+  }
+
+  function formatSpeedMode(config = loadConfig()) {
+    return getSpeedProfile(config).label;
+  }
+
+  function readTickMs(value, fallback, minimum) {
+    const tickMs = Number(value);
+    const resolved = Number.isFinite(tickMs) && tickMs > 0 ? tickMs : fallback;
+    return Math.max(minimum, resolved);
+  }
+
+  function getAutomationTimings(config = loadConfig()) {
+    const profile = getSpeedProfile(config);
+
+    return {
+      buyTickMs: readTickMs(config.buyTickMs, profile.buyTickMs, minBuyTickMs),
+      statusTickMs: readTickMs(config.statusTickMs, profile.statusTickMs, minStatusTickMs),
+    };
   }
 
   // Source: games/the-really-upgrade-tree-of-life/src/selectors.js
@@ -1059,6 +1132,22 @@
     };
   }
 
+  function createClickSummary(upgrades, compost, resetHints, reason) {
+    return {
+      candidates: upgrades.candidates + compost.candidates,
+      clicked: upgrades.clicked + compost.clicked,
+      skipped: upgrades.skipped + compost.skipped,
+      upgrades,
+      compost,
+      resetHints,
+      reason,
+    };
+  }
+
+  function createIdleClickSummary(reason) {
+    return createClickSummary(emptyClickSummary(), emptyClickSummary(), [], reason);
+  }
+
   function clickButtons(buttons, limit, label, config) {
     let clicked = 0;
 
@@ -1105,6 +1194,29 @@
     return clickButtons(candidates, limit, "compost", config);
   }
 
+  function runPurchaseTick(config = loadConfig()) {
+    if (!document.querySelector("#app")) {
+      lastPurchaseSummary = createIdleClickSummary("Waiting for app");
+      return lastPurchaseSummary;
+    }
+
+    if (!config.enabled) {
+      lastPurchaseSummary = createIdleClickSummary("Paused");
+      return lastPurchaseSummary;
+    }
+
+    if (config.scanOnly) {
+      lastPurchaseSummary = createIdleClickSummary("Scan only");
+      return lastPurchaseSummary;
+    }
+
+    const upgrades = config.autoUpgrades ? clickBuyableUpgrades(config) : emptyClickSummary();
+    const compost = config.autoCompost ? clickBuyableCompost(config) : emptyClickSummary();
+
+    lastPurchaseSummary = createClickSummary(upgrades, compost, [], "Buy mode");
+    return lastPurchaseSummary;
+  }
+
   function summarizeScanOnly(scanResult, reason) {
     const upgradeCandidates = scanResult.upgrades.buyable.length;
     const compostCandidates = scanResult.compost.buyable.length;
@@ -1128,17 +1240,52 @@
     };
   }
 
+  function summarizeBuyMode(scanResult) {
+    return Object.assign({}, lastPurchaseSummary, {
+      resetHints: scanResult.resetHints,
+      reason: "Buy mode",
+    });
+  }
+
+  function createWaitingSummary() {
+    return createClickSummary(emptyClickSummary(), emptyClickSummary(), [], "Waiting for app");
+  }
+
+  function runStatusTick(config = loadConfig()) {
+    if (!document.querySelector("#app")) {
+      lastSummary = createWaitingSummary();
+      renderPanel(config);
+      return lastSummary;
+    }
+
+    const scanResult = scan();
+    updateInlineLeafHint();
+    updateInlineResetHints();
+
+    if (config.logScans) {
+      log("scan", scanResult);
+    }
+
+    if (!config.enabled) {
+      lastSummary = summarizeScanOnly(scanResult, "Paused");
+      renderPanel(config);
+      return lastSummary;
+    }
+
+    if (config.scanOnly) {
+      lastSummary = summarizeScanOnly(scanResult, "Scan only");
+      renderPanel(config);
+      return lastSummary;
+    }
+
+    lastSummary = summarizeBuyMode(scanResult);
+    renderPanel(config);
+    return lastSummary;
+  }
+
   function runAutomation(config = loadConfig()) {
     if (!document.querySelector("#app")) {
-      lastSummary = {
-        candidates: 0,
-        clicked: 0,
-        skipped: 0,
-        upgrades: emptyClickSummary(),
-        compost: emptyClickSummary(),
-        resetHints: [],
-        reason: "Waiting for app",
-      };
+      lastSummary = createWaitingSummary();
       renderPanel(config);
       return lastSummary;
     }
@@ -1166,15 +1313,8 @@
     const upgrades = config.autoUpgrades ? clickBuyableUpgrades(config) : emptyClickSummary();
     const compost = config.autoCompost ? clickBuyableCompost(config) : emptyClickSummary();
 
-    lastSummary = {
-      candidates: upgrades.candidates + compost.candidates,
-      clicked: upgrades.clicked + compost.clicked,
-      skipped: upgrades.skipped + compost.skipped,
-      upgrades,
-      compost,
-      resetHints: scanResult.resetHints,
-      reason: "Buy mode",
-    };
+    lastPurchaseSummary = createClickSummary(upgrades, compost, [], "Buy mode");
+    lastSummary = createClickSummary(upgrades, compost, scanResult.resetHints, "Buy mode");
     renderPanel(config);
     return lastSummary;
   }
@@ -1302,7 +1442,7 @@
       }
       #${PANEL_ID} .trutol-segmented {
         display: grid;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: repeat(var(--trutol-segments, 2), minmax(0, 1fr));
         flex: 1;
         min-width: 0;
         padding: 3px;
@@ -1432,6 +1572,7 @@
   function createSegmentedControl(options, onSelect) {
     const wrapper = document.createElement("div");
     wrapper.className = "trutol-segmented";
+    wrapper.style.setProperty("--trutol-segments", String(options.length));
 
     const buttons = {};
 
@@ -1440,6 +1581,9 @@
       button.type = "button";
       button.className = "trutol-segment";
       button.textContent = option.label;
+      if (option.title) {
+        button.setAttribute("title", option.title);
+      }
       button.addEventListener("click", () => onSelect(option.value));
       buttons[option.value] = button;
       wrapper.appendChild(button);
@@ -1543,6 +1687,14 @@
       updateConfig({ scanOnly: value === "scan" });
     });
 
+    const speedControl = createSegmentedControl([
+      { label: "稳健", value: "steady", title: "750ms 购买 / 750ms 状态" },
+      { label: "快速", value: "fast", title: "250ms 购买 / 500ms 状态" },
+      { label: "爆发", value: "burst", title: "50ms 购买 / 500ms 状态" },
+    ], (value) => {
+      updateConfig({ speedMode: value, buyTickMs: null, statusTickMs: null });
+    });
+
     const compostSwitch = createSwitch(() => {
       const config = loadConfig();
       updateConfig({ autoCompost: !config.autoCompost });
@@ -1550,6 +1702,7 @@
 
     panelBody.appendChild(createControlRow("开关", enabledSwitch));
     panelBody.appendChild(createControlRow("模式", modeControl.wrapper));
+    panelBody.appendChild(createControlRow("速度", speedControl.wrapper));
     panelBody.appendChild(createControlRow("堆肥", compostSwitch));
 
     const actions = document.createElement("div");
@@ -1573,6 +1726,7 @@
       title,
       enabledSwitch,
       modeButtons: modeControl.buttons,
+      speedButtons: speedControl.buttons,
       compostSwitch,
     };
 
@@ -1599,6 +1753,7 @@
     setSwitchState(controlRefs.enabledSwitch, config.enabled);
     setSwitchState(controlRefs.compostSwitch, config.autoCompost);
     setSegmentedState(controlRefs.modeButtons, config.scanOnly ? "scan" : "buy");
+    setSegmentedState(controlRefs.speedButtons, getSpeedMode(config));
 
     controlRefs.badge.textContent = config.enabled ? "开" : "关";
     controlRefs.badge.style.color = config.enabled ? "#a7f3d0" : "#cbd5e1";
@@ -1612,6 +1767,7 @@
     statusNode.replaceChildren(
       createStatRow("升级", `${lastSummary.upgrades.candidates}/${lastSummary.upgrades.clicked}`),
       createStatRow("堆肥", `${lastSummary.compost.candidates}/${lastSummary.compost.clicked}`),
+      createStatRow("速度", formatSpeedMode(config)),
       createStatRow("状态", formatReason(lastSummary.reason)),
     );
 
@@ -1620,32 +1776,54 @@
 
   // Source: games/the-really-upgrade-tree-of-life/src/main.js
 
-  function startLoop() {
-    const config = loadConfig();
-
-    if (intervalId) {
-      window.clearInterval(intervalId);
+  function clearLoops() {
+    if (buyIntervalId) {
+      window.clearInterval(buyIntervalId);
+      buyIntervalId = null;
     }
 
-    intervalId = window.setInterval(() => {
-      runAutomation(loadConfig());
-    }, Math.max(250, Number(config.tickMs) || defaultConfig.tickMs));
+    if (statusIntervalId) {
+      window.clearInterval(statusIntervalId);
+      statusIntervalId = null;
+    }
+  }
 
-    renderPanel(config);
-    log("started", config);
+  function startLoops(config = loadConfig()) {
+    const timings = getAutomationTimings(config);
+
+    clearLoops();
+
+    buyIntervalId = window.setInterval(() => {
+      runPurchaseTick(loadConfig());
+    }, timings.buyTickMs);
+
+    statusIntervalId = window.setInterval(() => {
+      runStatusTick(loadConfig());
+    }, timings.statusTickMs);
+
+    log("started", Object.assign({}, config, { timings }));
+  }
+
+  function restartLoops(config = loadConfig()) {
+    startLoops(config);
   }
 
   function main() {
     window.__trutolHelper = {
       getConfig: loadConfig,
       setConfig: updateConfig,
+      timings: () => getAutomationTimings(loadConfig()),
       scan,
       leafTimeHint: () => scan().leafTimeHint,
       resetHints: () => scan().resetHints,
+      purchaseTick: () => runPurchaseTick(loadConfig()),
+      statusTick: () => runStatusTick(loadConfig()),
       tick: () => runAutomation(loadConfig()),
     };
 
-    startLoop();
+    const config = loadConfig();
+    startLoops(config);
+    runStatusTick(config);
   }
 
   main();
