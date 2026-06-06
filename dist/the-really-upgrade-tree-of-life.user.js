@@ -704,11 +704,58 @@
       return { key: "bacteria", label: "细菌" };
     }
 
-    if (text.includes("树叶") || text.includes("leaf") || text.includes("leaves")) {
+    if (text.includes("树叶")
+      || text.includes("叶子")
+      || text.includes("leaf")
+      || text.includes("leaves")) {
       return { key: "leaves", label: "树叶" };
     }
 
     return { key: text, label: normalizeText(name) };
+  }
+
+  const buttonResourceHints = [
+    { key: "leaves", label: "树叶", labels: ["树叶", "叶子", "leaf"], groups: ["L", "LR"] },
+    { key: "seeds", label: "种子", labels: ["种子", "seed"], groups: ["S", "SR"] },
+    { key: "fruits", label: "水果", labels: ["水果", "fruit"], groups: ["F", "FR"] },
+    { key: "entropy", label: "熵", labels: ["熵", "entropy"], groups: ["E", "ER"] },
+    { key: "roots", label: "根", labels: ["根", "root"], groups: ["RO", "ROR"] },
+    { key: "cells", label: "细胞", labels: ["细胞", "cell"], groups: ["cell"] },
+    { key: "bacteria", label: "细菌", labels: ["细菌", "bacteria"], groups: ["bacteria"] },
+  ];
+
+  function getUpgradeGroupFromButton(button) {
+    const text = normalizeText(button.textContent);
+    const bracket = text.match(/^\s*\[([^\]\s]+)(?:\s+\d+)?\]/);
+
+    if (bracket) {
+      const label = bracket[1].toLowerCase();
+      const matched = buttonResourceHints.find((hint) => hint.labels
+        .some((candidate) => label.includes(candidate.toLowerCase())));
+
+      if (matched) {
+        return matched.groups[0];
+      }
+
+      return bracket[1].toUpperCase();
+    }
+
+    const className = Array.from(button.classList)
+      .find((name) => name.startsWith("upgrade-"));
+
+    return className ? className.replace(/^upgrade-/, "").toUpperCase() : null;
+  }
+
+  function inferButtonCostResource(button) {
+    const group = getUpgradeGroupFromButton(button);
+
+    if (!group) {
+      return null;
+    }
+
+    const normalizedGroup = group.toUpperCase();
+    return buttonResourceHints.find((hint) => hint.groups
+      .some((candidate) => candidate.toUpperCase() === normalizedGroup)) || null;
   }
 
   function readVisibleResources() {
@@ -828,13 +875,15 @@
   }
 
   function parseCostFromText(text) {
-    const match = normalizeText(text).match(/(?:成本|cost)[:：]?\s*(.+)$/i);
+    const normalized = normalizeText(text);
+    const matches = Array.from(normalized.matchAll(/(?:成本|cost)[:：]?\s*/gi));
+    const match = matches[matches.length - 1];
 
     if (!match) {
       return null;
     }
 
-    const parsed = splitLeadingAmount(match[1]);
+    const parsed = splitLeadingAmount(normalized.slice(match.index + match[0].length));
 
     if (!parsed || !parsed.amount) {
       return null;
@@ -853,8 +902,16 @@
 
   function parseButtonCost(button) {
     const directCost = parseCostFromText(button.textContent);
+    const inferredResource = inferButtonCostResource(button);
 
     if (directCost) {
+      if (inferredResource && getSpendResourceKey(directCost.resourceKey) === "other") {
+        return Object.assign({}, directCost, {
+          resourceKey: inferredResource.key,
+          resourceLabel: inferredResource.label,
+        });
+      }
+
       return directCost;
     }
 
