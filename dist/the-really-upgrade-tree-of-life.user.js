@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         The Really Upgrade Tree of Life Helper
 // @namespace    local.incremental.userscripts
-// @version      0.10.0
+// @version      0.11.0
 // @description  Conservative automation helper for The Really Upgrade Tree of Life.
 // @match        https://the-really-upgrade-tree-of-life.g8hh.com.cn/*
 // @grant        GM_getValue
@@ -423,6 +423,7 @@
     scanOnly: true,
     autoUpgrades: true,
     autoCompost: true,
+    backgroundAutomation: true,
     panelCollapsed: false,
     speedMode: "fast",
     buyTickMs: null,
@@ -431,6 +432,7 @@
     spendResources: createDefaultSpendResources(),
     maxUpgradeClicksPerTick: 3,
     maxCompostClicksPerTick: 1,
+    maxBackgroundClicksPerTick: 3,
     logScans: false,
     logClicks: true,
   };
@@ -472,6 +474,11 @@
       clicked: 0,
       skipped: 0,
     },
+    background: {
+      candidates: 0,
+      clicked: 0,
+      skipped: 0,
+    },
     reason: "Starting",
   };
   let lastSummary = {
@@ -484,6 +491,11 @@
       skipped: 0,
     },
     compost: {
+      candidates: 0,
+      clicked: 0,
+      skipped: 0,
+    },
+    background: {
       candidates: 0,
       clicked: 0,
       skipped: 0,
@@ -1190,6 +1202,217 @@
 
   // Source: games/the-really-upgrade-tree-of-life/src/automation.js
 
+  const learnedAutomationActions = new Map();
+  let learnedAutomationCursor = 0;
+
+  function getButtonAutomationKind(button) {
+    if (button.classList.contains("compost-button")) {
+      return "compost";
+    }
+
+    return isUpgradeLike(button) ? "upgrade" : null;
+  }
+
+  function normalizeActionLabel(text) {
+    return normalizeText(text).replace(/\s+/g, " ").slice(0, 120);
+  }
+
+  function getButtonAutomationId(button) {
+    const kind = getButtonAutomationKind(button);
+
+    if (!kind) {
+      return null;
+    }
+
+    if (kind === "compost") {
+      const frames = Array.from(document.querySelectorAll(".composter-frame"));
+      const frameIndex = frames.indexOf(button.closest(".composter-frame"));
+      return `${kind}:${frameIndex}:${normalizeActionLabel(button.textContent)}`;
+    }
+
+    const text = normalizeText(button.textContent);
+    const bracket = text.match(/^\s*\[([^\]]+)\]/);
+
+    if (bracket) {
+      return `${kind}:${normalizeActionLabel(bracket[1])}`;
+    }
+
+    const upgradeClass = Array.from(button.classList)
+      .find((className) => /^upgrade-/.test(className));
+
+    if (upgradeClass) {
+      return `${kind}:${upgradeClass}`;
+    }
+
+    return `${kind}:${normalizeActionLabel(text)}`;
+  }
+
+  function createSyntheticClickEvent(button) {
+    const view = button.ownerDocument?.defaultView || window;
+
+    if (typeof view.MouseEvent === "function") {
+      return new view.MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        view,
+      });
+    }
+
+    return { type: "click", target: button, currentTarget: button };
+  }
+
+  function getVueClickInvoker(button) {
+    for (const key of Reflect.ownKeys(button)) {
+      const keyText = typeof key === "symbol" ? key.description || String(key) : String(key);
+
+      if (!keyText || !keyText.includes("_vei")) {
+        continue;
+      }
+
+      const store = button[key];
+
+      if (!store || typeof store !== "object") {
+        continue;
+      }
+
+      for (const [eventName, invoker] of Object.entries(store)) {
+        if (!/click/i.test(eventName) || typeof invoker !== "function") {
+          continue;
+        }
+
+        return invoker;
+      }
+    }
+
+    return null;
+  }
+
+  function createButtonActionRunner(button) {
+    const vueInvoker = getVueClickInvoker(button);
+
+    if (vueInvoker) {
+      return {
+        source: "vue",
+        run: () => vueInvoker.call(button, createSyntheticClickEvent(button)),
+      };
+    }
+
+    if (typeof button.click === "function") {
+      return {
+        source: "dom",
+        run: () => button.click(),
+      };
+    }
+
+    return null;
+  }
+
+  function getVisibleAutomationButtons() {
+    return [
+      ...getVisibleUpgradeButtons(),
+      ...getVisibleCompostButtons(),
+    ].filter((button) => !isRiskyButton(button));
+  }
+
+  function learnAutomationAction(button) {
+    const id = getButtonAutomationId(button);
+    const kind = getButtonAutomationKind(button);
+
+    if (!id || !kind) {
+      return null;
+    }
+
+    const runner = createButtonActionRunner(button);
+
+    if (!runner) {
+      return null;
+    }
+
+    const existing = learnedAutomationActions.get(id) || {};
+    const cost = parseButtonCost(button) || existing.cost || null;
+    const action = Object.assign({}, existing, {
+      id,
+      kind,
+      label: normalizeActionLabel(button.textContent),
+      cost,
+      element: button,
+      runner,
+      source: runner.source,
+      lastSeenAt: Date.now(),
+    });
+
+    learnedAutomationActions.set(id, action);
+    return action;
+  }
+
+  function learnVisibleAutomationActions() {
+    for (const button of getVisibleAutomationButtons()) {
+      learnAutomationAction(button);
+    }
+  }
+
+  function isLearnedActionVisible(action) {
+    return action.element && document.contains(action.element) && isVisible(action.element);
+  }
+
+  function isLearnedActionAllowed(action, config = loadConfig()) {
+    if (!action.cost) {
+      return true;
+    }
+
+    return isSpendResourceAllowed(action.cost.resourceKey, config);
+  }
+
+  function getLearnedAutomationActions(config = loadConfig()) {
+    return Array.from(learnedAutomationActions.values())
+      .filter((action) => action.runner && typeof action.runner.run === "function")
+      .filter((action) => !isLearnedActionVisible(action))
+      .filter((action) => isLearnedActionAllowed(action, config))
+      .filter((action) => (action.kind === "upgrade" && config.autoUpgrades)
+        || (action.kind === "compost" && config.autoCompost));
+  }
+
+  function rotateActions(actions, limit) {
+    if (actions.length === 0 || limit <= 0) {
+      return [];
+    }
+
+    const start = learnedAutomationCursor % actions.length;
+    const rotated = actions.slice(start).concat(actions.slice(0, start));
+    learnedAutomationCursor += Math.min(limit, actions.length);
+    return rotated.slice(0, limit);
+  }
+
+  function getLearnedAutomationSummary(config = loadConfig()) {
+    const actions = getLearnedAutomationActions(config);
+    const all = Array.from(learnedAutomationActions.values());
+
+    return {
+      total: all.length,
+      ready: actions.length,
+      upgrades: all.filter((action) => action.kind === "upgrade").length,
+      compost: all.filter((action) => action.kind === "compost").length,
+      sources: actions.reduce((counts, action) => {
+        counts[action.source] = (counts[action.source] || 0) + 1;
+        return counts;
+      }, {}),
+      actions: all.map((action) => ({
+        id: action.id,
+        kind: action.kind,
+        label: action.label,
+        source: action.source,
+        visible: isLearnedActionVisible(action),
+        cost: action.cost
+          ? {
+            amountText: action.cost.amountText,
+            resourceKey: action.cost.resourceKey,
+            resourceLabel: action.cost.resourceLabel,
+          }
+          : null,
+      })),
+    };
+  }
+
   function isAutoSpendAllowed(button, config = loadConfig()) {
     const cost = parseButtonCost(button);
     return !cost || isSpendResourceAllowed(cost.resourceKey, config);
@@ -1200,6 +1423,8 @@
   }
 
   function scan(config = loadConfig()) {
+    learnVisibleAutomationActions();
+
     const visibleUpgrades = getVisibleUpgradeButtons();
     const rawBuyableUpgrades = getBuyableUpgradeButtons();
     const buyableUpgrades = filterAutoSpendAllowed(rawBuyableUpgrades, config);
@@ -1228,6 +1453,7 @@
       leafTimeHint: leafTimeHint
         ? (({ element, ...hint }) => hint)(leafTimeHint)
         : null,
+      background: getLearnedAutomationSummary(config),
     };
   }
 
@@ -1239,20 +1465,21 @@
     };
   }
 
-  function createClickSummary(upgrades, compost, resetHints, reason) {
+  function createClickSummary(upgrades, compost, background, resetHints, reason) {
     return {
-      candidates: upgrades.candidates + compost.candidates,
-      clicked: upgrades.clicked + compost.clicked,
-      skipped: upgrades.skipped + compost.skipped,
+      candidates: upgrades.candidates + compost.candidates + background.candidates,
+      clicked: upgrades.clicked + compost.clicked + background.clicked,
+      skipped: upgrades.skipped + compost.skipped + background.skipped,
       upgrades,
       compost,
+      background,
       resetHints,
       reason,
     };
   }
 
   function createIdleClickSummary(reason) {
-    return createClickSummary(emptyClickSummary(), emptyClickSummary(), [], reason);
+    return createClickSummary(emptyClickSummary(), emptyClickSummary(), emptyClickSummary(), [], reason);
   }
 
   function clickButtons(buttons, limit, label, config) {
@@ -1301,6 +1528,28 @@
     return clickButtons(candidates, limit, "compost", config);
   }
 
+  function clickBackgroundActions(config) {
+    const candidates = getLearnedAutomationActions(config);
+    const limit = readLimit(config.maxBackgroundClicksPerTick, defaultConfig.maxBackgroundClicksPerTick);
+    const actions = rotateActions(candidates, limit);
+    let clicked = 0;
+
+    for (const action of actions) {
+      if (config.logClicks) {
+        log("background", action.kind, action.source, action.label);
+      }
+
+      action.runner.run();
+      clicked += 1;
+    }
+
+    return {
+      candidates: candidates.length,
+      clicked,
+      skipped: Math.max(0, candidates.length - clicked),
+    };
+  }
+
   function runPurchaseTick(config = loadConfig()) {
     if (!document.querySelector("#app")) {
       lastPurchaseSummary = createIdleClickSummary("Waiting for app");
@@ -1317,10 +1566,13 @@
       return lastPurchaseSummary;
     }
 
+    learnVisibleAutomationActions();
+
     const upgrades = config.autoUpgrades ? clickBuyableUpgrades(config) : emptyClickSummary();
     const compost = config.autoCompost ? clickBuyableCompost(config) : emptyClickSummary();
+    const background = config.backgroundAutomation ? clickBackgroundActions(config) : emptyClickSummary();
 
-    lastPurchaseSummary = createClickSummary(upgrades, compost, [], "Buy mode");
+    lastPurchaseSummary = createClickSummary(upgrades, compost, background, [], "Buy mode");
     return lastPurchaseSummary;
   }
 
@@ -1342,6 +1594,7 @@
         clicked: 0,
         skipped: compostCandidates,
       },
+      background: emptyClickSummary(),
       resetHints: scanResult.resetHints,
       reason,
     };
@@ -1355,7 +1608,7 @@
   }
 
   function createWaitingSummary() {
-    return createClickSummary(emptyClickSummary(), emptyClickSummary(), [], "Waiting for app");
+    return createClickSummary(emptyClickSummary(), emptyClickSummary(), emptyClickSummary(), [], "Waiting for app");
   }
 
   function runStatusTick(config = loadConfig()) {
@@ -1419,9 +1672,10 @@
 
     const upgrades = config.autoUpgrades ? clickBuyableUpgrades(config) : emptyClickSummary();
     const compost = config.autoCompost ? clickBuyableCompost(config) : emptyClickSummary();
+    const background = config.backgroundAutomation ? clickBackgroundActions(config) : emptyClickSummary();
 
-    lastPurchaseSummary = createClickSummary(upgrades, compost, [], "Buy mode");
-    lastSummary = createClickSummary(upgrades, compost, scanResult.resetHints, "Buy mode");
+    lastPurchaseSummary = createClickSummary(upgrades, compost, background, [], "Buy mode");
+    lastSummary = createClickSummary(upgrades, compost, background, scanResult.resetHints, "Buy mode");
     renderPanel(config);
     return lastSummary;
   }
@@ -1875,11 +2129,17 @@
       updateConfig({ autoCompost: !config.autoCompost });
     });
 
+    const backgroundSwitch = createSwitch(() => {
+      const config = loadConfig();
+      updateConfig({ backgroundAutomation: !config.backgroundAutomation });
+    });
+
     panelBody.appendChild(createControlRow("开关", enabledSwitch));
     panelBody.appendChild(createControlRow("模式", modeControl.wrapper));
     panelBody.appendChild(createControlRow("速度", speedControl.wrapper));
     panelBody.appendChild(createControlRow("花费", spendControl.wrapper, { alignTop: true }));
     panelBody.appendChild(createControlRow("堆肥", compostSwitch));
+    panelBody.appendChild(createControlRow("后台", backgroundSwitch));
 
     const actions = document.createElement("div");
     actions.className = "trutol-action-row";
@@ -1905,6 +2165,7 @@
       speedButtons: speedControl.buttons,
       spendButtons: spendControl.buttons,
       compostSwitch,
+      backgroundSwitch,
     };
 
     document.documentElement.appendChild(panel);
@@ -1929,6 +2190,7 @@
 
     setSwitchState(controlRefs.enabledSwitch, config.enabled);
     setSwitchState(controlRefs.compostSwitch, config.autoCompost);
+    setSwitchState(controlRefs.backgroundSwitch, config.backgroundAutomation);
     setSegmentedState(controlRefs.modeButtons, config.scanOnly ? "scan" : "buy");
     setSegmentedState(controlRefs.speedButtons, getSpeedMode(config));
     setResourceToggleState(controlRefs.spendButtons, config);
@@ -1945,6 +2207,7 @@
     statusNode.replaceChildren(
       createStatRow("升级", `${lastSummary.upgrades.candidates}/${lastSummary.upgrades.clicked}`),
       createStatRow("堆肥", `${lastSummary.compost.candidates}/${lastSummary.compost.clicked}`),
+      createStatRow("后台", `${lastSummary.background.candidates}/${lastSummary.background.clicked}`),
       createStatRow("速度", formatSpeedMode(config)),
       createStatRow("状态", formatReason(lastSummary.reason)),
     );
@@ -1992,6 +2255,7 @@
       setConfig: updateConfig,
       timings: () => getAutomationTimings(loadConfig()),
       spendResources: () => getSpendResourceConfig(loadConfig()),
+      learnedActions: () => getLearnedAutomationSummary(loadConfig()),
       scan,
       leafTimeHint: () => scan().leafTimeHint,
       resetHints: () => scan().resetHints,
