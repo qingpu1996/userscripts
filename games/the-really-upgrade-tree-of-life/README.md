@@ -54,14 +54,18 @@ Enabled automation features:
 - Per-resource spend protection for automated purchases. Leaves, Seeds, and
   Fruits are allowed by default; Entropy and later resources are protected by
   default until enabled in the panel.
+- Background automation for safe upgrades and compost actions that have already
+  been seen once in a rendered game panel. It reuses the button's own click
+  handler and still respects the spend resource toggles.
 - Manual run button and browser console API via `window.__trutolHelper`.
 
 Known risks or limits:
 
 - The script relies on the game's current button classes, especially
   `o-primary-btn--disabled`, `o-primary-btn--bought`, and `upgrade-*`.
-- It only sees the current tab/subtab. Hidden upgrades on other tabs are not clicked.
-- Compost automation only acts on visible compost buttons.
+- Background automation only works after the relevant button has appeared once
+  during the current page load. Fully unseen tabs still need to be visited once
+  so the helper can learn their safe button handlers.
 - Reset, challenge, and prestige automation is intentionally hint-only for now.
 - Reset ratio hints are approximate and are calculated from visible game notation,
   including suffix notation and scientific notation such as `1e303`, `1E303`,
@@ -85,6 +89,8 @@ Manual controls:
 - Panel `花费` toggles: choose which resources the helper may spend while buying
   visible upgrades or compost actions.
 - Panel `堆肥` switch: allow or block visible compost button clicks in buy mode.
+- Panel `后台` switch: allow or block learned background actions for hidden safe
+  upgrades and compost buttons.
 - Panel `立即执行`: run one immediate scan/click pass.
 - Panel `收起` / `展开`: collapse or restore the helper panel.
 - Console:
@@ -94,6 +100,7 @@ window.__trutolHelper.getConfig()
 window.__trutolHelper.setConfig({ scanOnly: false, autoCompost: true, speedMode: "burst" })
 window.__trutolHelper.timings()
 window.__trutolHelper.spendResources()
+window.__trutolHelper.learnedActions()
 window.__trutolHelper.scan()
 window.__trutolHelper.leafTimeHint()
 window.__trutolHelper.resetHints()

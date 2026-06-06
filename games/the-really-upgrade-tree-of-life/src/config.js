@@ -51,6 +51,7 @@ const defaultConfig = {
   scanOnly: true,
   autoUpgrades: true,
   autoCompost: true,
+  backgroundAutomation: true,
   panelCollapsed: false,
   speedMode: "fast",
   buyTickMs: null,
@@ -59,6 +60,7 @@ const defaultConfig = {
   spendResources: createDefaultSpendResources(),
   maxUpgradeClicksPerTick: 3,
   maxCompostClicksPerTick: 1,
+  maxBackgroundClicksPerTick: 3,
   logScans: false,
   logClicks: true,
 };
@@ -100,6 +102,11 @@ let lastPurchaseSummary = {
     clicked: 0,
     skipped: 0,
   },
+  background: {
+    candidates: 0,
+    clicked: 0,
+    skipped: 0,
+  },
   reason: "Starting",
 };
 let lastSummary = {
@@ -112,6 +119,11 @@ let lastSummary = {
     skipped: 0,
   },
   compost: {
+    candidates: 0,
+    clicked: 0,
+    skipped: 0,
+  },
+  background: {
     candidates: 0,
     clicked: 0,
     skipped: 0,
