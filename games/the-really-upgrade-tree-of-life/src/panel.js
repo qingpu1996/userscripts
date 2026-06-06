@@ -445,6 +445,11 @@ function ensurePanel() {
     updateConfig({ autoCompost: !config.autoCompost });
   });
 
+  const cellLabSwitch = createSwitch(() => {
+    const config = loadConfig();
+    updateConfig({ autoCellLab: !config.autoCellLab });
+  });
+
   const backgroundSwitch = createSwitch(() => {
     const config = loadConfig();
     updateConfig({ backgroundAutomation: !config.backgroundAutomation });
@@ -455,6 +460,7 @@ function ensurePanel() {
   panelBody.appendChild(createControlRow("速度", speedControl.wrapper));
   panelBody.appendChild(createControlRow("花费", spendControl.wrapper, { alignTop: true }));
   panelBody.appendChild(createControlRow("堆肥", compostSwitch));
+  panelBody.appendChild(createControlRow("细胞", cellLabSwitch));
   panelBody.appendChild(createControlRow("后台", backgroundSwitch));
 
   const actions = document.createElement("div");
@@ -481,6 +487,7 @@ function ensurePanel() {
     speedButtons: speedControl.buttons,
     spendButtons: spendControl.buttons,
     compostSwitch,
+    cellLabSwitch,
     backgroundSwitch,
   };
 
@@ -506,6 +513,7 @@ function renderPanel(config = loadConfig()) {
 
   setSwitchState(controlRefs.enabledSwitch, config.enabled);
   setSwitchState(controlRefs.compostSwitch, config.autoCompost);
+  setSwitchState(controlRefs.cellLabSwitch, config.autoCellLab);
   setSwitchState(controlRefs.backgroundSwitch, config.backgroundAutomation);
   setSegmentedState(controlRefs.modeButtons, config.scanOnly ? "scan" : "buy");
   setSegmentedState(controlRefs.speedButtons, getSpeedMode(config));
@@ -523,6 +531,7 @@ function renderPanel(config = loadConfig()) {
   statusNode.replaceChildren(
     createStatRow("升级", `${lastSummary.upgrades.candidates}/${lastSummary.upgrades.clicked}`),
     createStatRow("堆肥", `${lastSummary.compost.candidates}/${lastSummary.compost.clicked}`),
+    createStatRow("细胞", `${lastSummary.cellLab.candidates}/${lastSummary.cellLab.clicked}`),
     createStatRow("后台", `${lastSummary.background.candidates}/${lastSummary.background.clicked}`),
     createStatRow("速度", formatSpeedMode(config)),
     createStatRow("状态", formatReason(lastSummary.reason)),

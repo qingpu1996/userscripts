@@ -9,6 +9,18 @@ function getButtonAutomationKind(button) {
   return isUpgradeLike(button) ? "upgrade" : null;
 }
 
+function getButtonAutomationArea(button) {
+  if (button.classList.contains("compost-button")) {
+    return "compost";
+  }
+
+  if (isCellLabUpgradeButton(button)) {
+    return "cellLab";
+  }
+
+  return "upgrade";
+}
+
 function normalizeActionLabel(text) {
   return normalizeText(text).replace(/\s+/g, " ").slice(0, 120);
 }
@@ -129,6 +141,7 @@ function learnAutomationAction(button) {
   const action = Object.assign({}, existing, {
     id,
     kind,
+    area: getButtonAutomationArea(button),
     label: normalizeActionLabel(button.textContent),
     cost,
     element: button,
@@ -164,8 +177,9 @@ function getLearnedAutomationActions(config = loadConfig()) {
     .filter((action) => action.runner && typeof action.runner.run === "function")
     .filter((action) => !isLearnedActionVisible(action))
     .filter((action) => isLearnedActionAllowed(action, config))
-    .filter((action) => (action.kind === "upgrade" && config.autoUpgrades)
-      || (action.kind === "compost" && config.autoCompost));
+    .filter((action) => (action.area === "upgrade" && config.autoUpgrades)
+      || (action.area === "cellLab" && config.autoCellLab)
+      || (action.area === "compost" && config.autoCompost));
 }
 
 function rotateActions(actions, limit) {
@@ -195,6 +209,7 @@ function getLearnedAutomationSummary(config = loadConfig()) {
     actions: all.map((action) => ({
       id: action.id,
       kind: action.kind,
+      area: action.area,
       label: action.label,
       source: action.source,
       visible: isLearnedActionVisible(action),
@@ -222,8 +237,10 @@ function scan(config = loadConfig()) {
   learnVisibleAutomationActions();
 
   const visibleUpgrades = getVisibleUpgradeButtons();
-  const rawBuyableUpgrades = getBuyableUpgradeButtons();
+  const rawBuyableUpgrades = getBuyableNormalUpgradeButtons();
   const buyableUpgrades = filterAutoSpendAllowed(rawBuyableUpgrades, config);
+  const rawBuyableCellLab = getBuyableCellLabUpgradeButtons();
+  const buyableCellLab = filterAutoSpendAllowed(rawBuyableCellLab, config);
   const visibleCompost = getVisibleCompostButtons();
   const rawBuyableCompost = getBuyableCompostButtons();
   const buyableCompost = filterAutoSpendAllowed(rawBuyableCompost, config);
@@ -245,6 +262,15 @@ function scan(config = loadConfig()) {
         .filter((button) => !isAutoSpendAllowed(button, config))
         .map(describeButton),
     },
+    cellLab: {
+      visible: visibleUpgrades
+        .filter(isCellLabUpgradeButton)
+        .map(describeButton),
+      buyable: buyableCellLab.map(describeButton),
+      blockedByResource: rawBuyableCellLab
+        .filter((button) => !isAutoSpendAllowed(button, config))
+        .map(describeButton),
+    },
     resetHints: resetHints.map(({ button, ...hint }) => hint),
     leafTimeHint: leafTimeHint
       ? (({ element, ...hint }) => hint)(leafTimeHint)
@@ -261,13 +287,14 @@ function emptyClickSummary() {
   };
 }
 
-function createClickSummary(upgrades, compost, background, resetHints, reason) {
+function createClickSummary(upgrades, compost, cellLab, background, resetHints, reason) {
   return {
-    candidates: upgrades.candidates + compost.candidates + background.candidates,
-    clicked: upgrades.clicked + compost.clicked + background.clicked,
-    skipped: upgrades.skipped + compost.skipped + background.skipped,
+    candidates: upgrades.candidates + compost.candidates + cellLab.candidates + background.candidates,
+    clicked: upgrades.clicked + compost.clicked + cellLab.clicked + background.clicked,
+    skipped: upgrades.skipped + compost.skipped + cellLab.skipped + background.skipped,
     upgrades,
     compost,
+    cellLab,
     background,
     resetHints,
     reason,
@@ -275,7 +302,14 @@ function createClickSummary(upgrades, compost, background, resetHints, reason) {
 }
 
 function createIdleClickSummary(reason) {
-  return createClickSummary(emptyClickSummary(), emptyClickSummary(), emptyClickSummary(), [], reason);
+  return createClickSummary(
+    emptyClickSummary(),
+    emptyClickSummary(),
+    emptyClickSummary(),
+    emptyClickSummary(),
+    [],
+    reason,
+  );
 }
 
 function clickButtons(buttons, limit, label, config) {
@@ -307,7 +341,7 @@ function readLimit(value, fallback) {
 }
 
 function clickBuyableUpgrades(config) {
-  const candidates = filterAutoSpendAllowed(getBuyableUpgradeButtons(), config);
+  const candidates = filterAutoSpendAllowed(getBuyableNormalUpgradeButtons(), config);
   const legacyLimit = config.maxClicksPerTick;
   const configuredLimit = config.maxUpgradeClicksPerTick === undefined
     ? legacyLimit
@@ -315,6 +349,17 @@ function clickBuyableUpgrades(config) {
   const limit = readLimit(configuredLimit, defaultConfig.maxUpgradeClicksPerTick);
 
   return clickButtons(candidates, limit, "upgrade", config);
+}
+
+function clickBuyableCellLab(config) {
+  const candidates = filterAutoSpendAllowed(getBuyableCellLabUpgradeButtons(), config);
+  const legacyLimit = config.maxClicksPerTick;
+  const configuredLimit = config.maxCellLabClicksPerTick === undefined
+    ? legacyLimit
+    : config.maxCellLabClicksPerTick;
+  const limit = readLimit(configuredLimit, defaultConfig.maxUpgradeClicksPerTick);
+
+  return clickButtons(candidates, limit, "cellLab", config);
 }
 
 function clickBuyableCompost(config) {
@@ -366,20 +411,22 @@ function runPurchaseTick(config = loadConfig()) {
 
   const upgrades = config.autoUpgrades ? clickBuyableUpgrades(config) : emptyClickSummary();
   const compost = config.autoCompost ? clickBuyableCompost(config) : emptyClickSummary();
+  const cellLab = config.autoCellLab ? clickBuyableCellLab(config) : emptyClickSummary();
   const background = config.backgroundAutomation ? clickBackgroundActions(config) : emptyClickSummary();
 
-  lastPurchaseSummary = createClickSummary(upgrades, compost, background, [], "Buy mode");
+  lastPurchaseSummary = createClickSummary(upgrades, compost, cellLab, background, [], "Buy mode");
   return lastPurchaseSummary;
 }
 
 function summarizeScanOnly(scanResult, reason) {
   const upgradeCandidates = scanResult.upgrades.buyable.length;
   const compostCandidates = scanResult.compost.buyable.length;
+  const cellLabCandidates = scanResult.cellLab.buyable.length;
 
   return {
-    candidates: upgradeCandidates + compostCandidates,
+    candidates: upgradeCandidates + compostCandidates + cellLabCandidates,
     clicked: 0,
-    skipped: upgradeCandidates + compostCandidates,
+    skipped: upgradeCandidates + compostCandidates + cellLabCandidates,
     upgrades: {
       candidates: upgradeCandidates,
       clicked: 0,
@@ -389,6 +436,11 @@ function summarizeScanOnly(scanResult, reason) {
       candidates: compostCandidates,
       clicked: 0,
       skipped: compostCandidates,
+    },
+    cellLab: {
+      candidates: cellLabCandidates,
+      clicked: 0,
+      skipped: cellLabCandidates,
     },
     background: emptyClickSummary(),
     resetHints: scanResult.resetHints,
@@ -404,7 +456,14 @@ function summarizeBuyMode(scanResult) {
 }
 
 function createWaitingSummary() {
-  return createClickSummary(emptyClickSummary(), emptyClickSummary(), emptyClickSummary(), [], "Waiting for app");
+  return createClickSummary(
+    emptyClickSummary(),
+    emptyClickSummary(),
+    emptyClickSummary(),
+    emptyClickSummary(),
+    [],
+    "Waiting for app",
+  );
 }
 
 function runStatusTick(config = loadConfig()) {
@@ -468,10 +527,11 @@ function runAutomation(config = loadConfig()) {
 
   const upgrades = config.autoUpgrades ? clickBuyableUpgrades(config) : emptyClickSummary();
   const compost = config.autoCompost ? clickBuyableCompost(config) : emptyClickSummary();
+  const cellLab = config.autoCellLab ? clickBuyableCellLab(config) : emptyClickSummary();
   const background = config.backgroundAutomation ? clickBackgroundActions(config) : emptyClickSummary();
 
-  lastPurchaseSummary = createClickSummary(upgrades, compost, background, [], "Buy mode");
-  lastSummary = createClickSummary(upgrades, compost, background, scanResult.resetHints, "Buy mode");
+  lastPurchaseSummary = createClickSummary(upgrades, compost, cellLab, background, [], "Buy mode");
+  lastSummary = createClickSummary(upgrades, compost, cellLab, background, scanResult.resetHints, "Buy mode");
   renderPanel(config);
   return lastSummary;
 }

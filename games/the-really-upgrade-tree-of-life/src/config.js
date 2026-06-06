@@ -51,6 +51,7 @@ const defaultConfig = {
   scanOnly: true,
   autoUpgrades: true,
   autoCompost: true,
+  autoCellLab: false,
   backgroundAutomation: true,
   panelCollapsed: false,
   speedMode: "fast",
@@ -60,6 +61,7 @@ const defaultConfig = {
   spendResources: createDefaultSpendResources(),
   maxUpgradeClicksPerTick: 3,
   maxCompostClicksPerTick: 1,
+  maxCellLabClicksPerTick: 3,
   maxBackgroundClicksPerTick: 3,
   logScans: false,
   logClicks: true,
@@ -78,6 +80,11 @@ const riskyTextPatterns = [
   /\bChallenge\b/i,
   /\bEnter\b/i,
   /\bExit\b/i,
+  /\bConvert\b/i,
+  /\bHarvest\b/i,
+  /\bDecompolize\b/i,
+  /\bReinforce\b/i,
+  /\bExtend\s+Limit\b/i,
   /\bSacred\b/i,
   /\bPrestige\b/i,
 ];
@@ -102,6 +109,11 @@ let lastPurchaseSummary = {
     clicked: 0,
     skipped: 0,
   },
+  cellLab: {
+    candidates: 0,
+    clicked: 0,
+    skipped: 0,
+  },
   background: {
     candidates: 0,
     clicked: 0,
@@ -119,6 +131,11 @@ let lastSummary = {
     skipped: 0,
   },
   compost: {
+    candidates: 0,
+    clicked: 0,
+    skipped: 0,
+  },
+  cellLab: {
     candidates: 0,
     clicked: 0,
     skipped: 0,
