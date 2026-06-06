@@ -54,6 +54,9 @@ Enabled automation features:
 - Per-resource spend protection for automated purchases. Leaves, Seeds, and
   Fruits are allowed by default; Entropy and later resources are protected by
   default until enabled in the panel.
+- Separate Cell Lab automation switch for visible Cell, Bacteria, Virus, and
+  Beneficial Virus upgrades. It is off by default so stored Entropy is not spent
+  just by opening a Cell Lab subtab.
 - Background automation for safe upgrades and compost actions that have already
   been seen once in a rendered game panel. It reuses the button's own click
   handler and still respects the spend resource toggles.
@@ -77,6 +80,8 @@ Known risks or limits:
   fast-growth phases and still avoids reset, challenge, and prestige actions.
 - Automated purchase only clicks visible buttons and respects the panel's spend
   resource toggles. Buttons that would spend a protected resource are skipped.
+- Bacteria reset and Cell limit extension are intentionally blocked even when
+  Cell Lab automation is enabled, because they behave like reset actions.
 - A game update can change DOM classes or text and require selector updates.
 
 Manual controls:
@@ -89,6 +94,7 @@ Manual controls:
 - Panel `花费` toggles: choose which resources the helper may spend while buying
   visible upgrades or compost actions.
 - Panel `堆肥` switch: allow or block visible compost button clicks in buy mode.
+- Panel `细胞` switch: allow or block visible Cell Lab upgrade clicks in buy mode.
 - Panel `后台` switch: allow or block learned background actions for hidden safe
   upgrades and compost buttons.
 - Panel `立即执行`: run one immediate scan/click pass.

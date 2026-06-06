@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         The Really Upgrade Tree of Life Helper
 // @namespace    local.incremental.userscripts
-// @version      0.11.0
+// @version      0.12.0
 // @description  Conservative automation helper for The Really Upgrade Tree of Life.
 // @match        https://the-really-upgrade-tree-of-life.g8hh.com.cn/*
 // @grant        GM_getValue
@@ -423,6 +423,7 @@
     scanOnly: true,
     autoUpgrades: true,
     autoCompost: true,
+    autoCellLab: false,
     backgroundAutomation: true,
     panelCollapsed: false,
     speedMode: "fast",
@@ -432,6 +433,7 @@
     spendResources: createDefaultSpendResources(),
     maxUpgradeClicksPerTick: 3,
     maxCompostClicksPerTick: 1,
+    maxCellLabClicksPerTick: 3,
     maxBackgroundClicksPerTick: 3,
     logScans: false,
     logClicks: true,
@@ -450,6 +452,11 @@
     /\bChallenge\b/i,
     /\bEnter\b/i,
     /\bExit\b/i,
+    /\bConvert\b/i,
+    /\bHarvest\b/i,
+    /\bDecompolize\b/i,
+    /\bReinforce\b/i,
+    /\bExtend\s+Limit\b/i,
     /\bSacred\b/i,
     /\bPrestige\b/i,
   ];
@@ -474,6 +481,11 @@
       clicked: 0,
       skipped: 0,
     },
+    cellLab: {
+      candidates: 0,
+      clicked: 0,
+      skipped: 0,
+    },
     background: {
       candidates: 0,
       clicked: 0,
@@ -491,6 +503,11 @@
       skipped: 0,
     },
     compost: {
+      candidates: 0,
+      clicked: 0,
+      skipped: 0,
+    },
+    cellLab: {
       candidates: 0,
       clicked: 0,
       skipped: 0,
@@ -598,7 +615,7 @@
       return true;
     }
 
-    if (button.matches(".tab-button, .stab-button, .no-active, .layer-reset-button")) {
+    if (button.matches(".tab-button, .stab-button, .no-active, .layer-reset-button, #sacred-reset, #bacteria-reset, .no-grid-big-upgrade")) {
       return true;
     }
 
@@ -624,6 +641,28 @@
       .filter(isClickablePrimary)
       .filter((button) => !button.classList.contains("o-primary-btn--bought"))
       .filter((button) => !isRiskyButton(button));
+  }
+
+  const cellLabUpgradeClasses = [
+    "upgrade-cell",
+    "upgrade-bacteria",
+    "upgrade-virus",
+    "upgrade-BV",
+  ];
+
+  function isCellLabUpgradeButton(button) {
+    return button.classList.contains("big-upgrade")
+      && cellLabUpgradeClasses.some((className) => button.classList.contains(className));
+  }
+
+  function getBuyableNormalUpgradeButtons() {
+    return getBuyableUpgradeButtons()
+      .filter((button) => !isCellLabUpgradeButton(button));
+  }
+
+  function getBuyableCellLabUpgradeButtons() {
+    return getBuyableUpgradeButtons()
+      .filter(isCellLabUpgradeButton);
   }
 
   function getVisibleCompostButtons() {
@@ -1270,6 +1309,18 @@
     return isUpgradeLike(button) ? "upgrade" : null;
   }
 
+  function getButtonAutomationArea(button) {
+    if (button.classList.contains("compost-button")) {
+      return "compost";
+    }
+
+    if (isCellLabUpgradeButton(button)) {
+      return "cellLab";
+    }
+
+    return "upgrade";
+  }
+
   function normalizeActionLabel(text) {
     return normalizeText(text).replace(/\s+/g, " ").slice(0, 120);
   }
@@ -1390,6 +1441,7 @@
     const action = Object.assign({}, existing, {
       id,
       kind,
+      area: getButtonAutomationArea(button),
       label: normalizeActionLabel(button.textContent),
       cost,
       element: button,
@@ -1425,8 +1477,9 @@
       .filter((action) => action.runner && typeof action.runner.run === "function")
       .filter((action) => !isLearnedActionVisible(action))
       .filter((action) => isLearnedActionAllowed(action, config))
-      .filter((action) => (action.kind === "upgrade" && config.autoUpgrades)
-        || (action.kind === "compost" && config.autoCompost));
+      .filter((action) => (action.area === "upgrade" && config.autoUpgrades)
+        || (action.area === "cellLab" && config.autoCellLab)
+        || (action.area === "compost" && config.autoCompost));
   }
 
   function rotateActions(actions, limit) {
@@ -1456,6 +1509,7 @@
       actions: all.map((action) => ({
         id: action.id,
         kind: action.kind,
+        area: action.area,
         label: action.label,
         source: action.source,
         visible: isLearnedActionVisible(action),
@@ -1483,8 +1537,10 @@
     learnVisibleAutomationActions();
 
     const visibleUpgrades = getVisibleUpgradeButtons();
-    const rawBuyableUpgrades = getBuyableUpgradeButtons();
+    const rawBuyableUpgrades = getBuyableNormalUpgradeButtons();
     const buyableUpgrades = filterAutoSpendAllowed(rawBuyableUpgrades, config);
+    const rawBuyableCellLab = getBuyableCellLabUpgradeButtons();
+    const buyableCellLab = filterAutoSpendAllowed(rawBuyableCellLab, config);
     const visibleCompost = getVisibleCompostButtons();
     const rawBuyableCompost = getBuyableCompostButtons();
     const buyableCompost = filterAutoSpendAllowed(rawBuyableCompost, config);
@@ -1506,6 +1562,15 @@
           .filter((button) => !isAutoSpendAllowed(button, config))
           .map(describeButton),
       },
+      cellLab: {
+        visible: visibleUpgrades
+          .filter(isCellLabUpgradeButton)
+          .map(describeButton),
+        buyable: buyableCellLab.map(describeButton),
+        blockedByResource: rawBuyableCellLab
+          .filter((button) => !isAutoSpendAllowed(button, config))
+          .map(describeButton),
+      },
       resetHints: resetHints.map(({ button, ...hint }) => hint),
       leafTimeHint: leafTimeHint
         ? (({ element, ...hint }) => hint)(leafTimeHint)
@@ -1522,13 +1587,14 @@
     };
   }
 
-  function createClickSummary(upgrades, compost, background, resetHints, reason) {
+  function createClickSummary(upgrades, compost, cellLab, background, resetHints, reason) {
     return {
-      candidates: upgrades.candidates + compost.candidates + background.candidates,
-      clicked: upgrades.clicked + compost.clicked + background.clicked,
-      skipped: upgrades.skipped + compost.skipped + background.skipped,
+      candidates: upgrades.candidates + compost.candidates + cellLab.candidates + background.candidates,
+      clicked: upgrades.clicked + compost.clicked + cellLab.clicked + background.clicked,
+      skipped: upgrades.skipped + compost.skipped + cellLab.skipped + background.skipped,
       upgrades,
       compost,
+      cellLab,
       background,
       resetHints,
       reason,
@@ -1536,7 +1602,14 @@
   }
 
   function createIdleClickSummary(reason) {
-    return createClickSummary(emptyClickSummary(), emptyClickSummary(), emptyClickSummary(), [], reason);
+    return createClickSummary(
+      emptyClickSummary(),
+      emptyClickSummary(),
+      emptyClickSummary(),
+      emptyClickSummary(),
+      [],
+      reason,
+    );
   }
 
   function clickButtons(buttons, limit, label, config) {
@@ -1568,7 +1641,7 @@
   }
 
   function clickBuyableUpgrades(config) {
-    const candidates = filterAutoSpendAllowed(getBuyableUpgradeButtons(), config);
+    const candidates = filterAutoSpendAllowed(getBuyableNormalUpgradeButtons(), config);
     const legacyLimit = config.maxClicksPerTick;
     const configuredLimit = config.maxUpgradeClicksPerTick === undefined
       ? legacyLimit
@@ -1576,6 +1649,17 @@
     const limit = readLimit(configuredLimit, defaultConfig.maxUpgradeClicksPerTick);
 
     return clickButtons(candidates, limit, "upgrade", config);
+  }
+
+  function clickBuyableCellLab(config) {
+    const candidates = filterAutoSpendAllowed(getBuyableCellLabUpgradeButtons(), config);
+    const legacyLimit = config.maxClicksPerTick;
+    const configuredLimit = config.maxCellLabClicksPerTick === undefined
+      ? legacyLimit
+      : config.maxCellLabClicksPerTick;
+    const limit = readLimit(configuredLimit, defaultConfig.maxUpgradeClicksPerTick);
+
+    return clickButtons(candidates, limit, "cellLab", config);
   }
 
   function clickBuyableCompost(config) {
@@ -1627,20 +1711,22 @@
 
     const upgrades = config.autoUpgrades ? clickBuyableUpgrades(config) : emptyClickSummary();
     const compost = config.autoCompost ? clickBuyableCompost(config) : emptyClickSummary();
+    const cellLab = config.autoCellLab ? clickBuyableCellLab(config) : emptyClickSummary();
     const background = config.backgroundAutomation ? clickBackgroundActions(config) : emptyClickSummary();
 
-    lastPurchaseSummary = createClickSummary(upgrades, compost, background, [], "Buy mode");
+    lastPurchaseSummary = createClickSummary(upgrades, compost, cellLab, background, [], "Buy mode");
     return lastPurchaseSummary;
   }
 
   function summarizeScanOnly(scanResult, reason) {
     const upgradeCandidates = scanResult.upgrades.buyable.length;
     const compostCandidates = scanResult.compost.buyable.length;
+    const cellLabCandidates = scanResult.cellLab.buyable.length;
 
     return {
-      candidates: upgradeCandidates + compostCandidates,
+      candidates: upgradeCandidates + compostCandidates + cellLabCandidates,
       clicked: 0,
-      skipped: upgradeCandidates + compostCandidates,
+      skipped: upgradeCandidates + compostCandidates + cellLabCandidates,
       upgrades: {
         candidates: upgradeCandidates,
         clicked: 0,
@@ -1650,6 +1736,11 @@
         candidates: compostCandidates,
         clicked: 0,
         skipped: compostCandidates,
+      },
+      cellLab: {
+        candidates: cellLabCandidates,
+        clicked: 0,
+        skipped: cellLabCandidates,
       },
       background: emptyClickSummary(),
       resetHints: scanResult.resetHints,
@@ -1665,7 +1756,14 @@
   }
 
   function createWaitingSummary() {
-    return createClickSummary(emptyClickSummary(), emptyClickSummary(), emptyClickSummary(), [], "Waiting for app");
+    return createClickSummary(
+      emptyClickSummary(),
+      emptyClickSummary(),
+      emptyClickSummary(),
+      emptyClickSummary(),
+      [],
+      "Waiting for app",
+    );
   }
 
   function runStatusTick(config = loadConfig()) {
@@ -1729,10 +1827,11 @@
 
     const upgrades = config.autoUpgrades ? clickBuyableUpgrades(config) : emptyClickSummary();
     const compost = config.autoCompost ? clickBuyableCompost(config) : emptyClickSummary();
+    const cellLab = config.autoCellLab ? clickBuyableCellLab(config) : emptyClickSummary();
     const background = config.backgroundAutomation ? clickBackgroundActions(config) : emptyClickSummary();
 
-    lastPurchaseSummary = createClickSummary(upgrades, compost, background, [], "Buy mode");
-    lastSummary = createClickSummary(upgrades, compost, background, scanResult.resetHints, "Buy mode");
+    lastPurchaseSummary = createClickSummary(upgrades, compost, cellLab, background, [], "Buy mode");
+    lastSummary = createClickSummary(upgrades, compost, cellLab, background, scanResult.resetHints, "Buy mode");
     renderPanel(config);
     return lastSummary;
   }
@@ -2186,6 +2285,11 @@
       updateConfig({ autoCompost: !config.autoCompost });
     });
 
+    const cellLabSwitch = createSwitch(() => {
+      const config = loadConfig();
+      updateConfig({ autoCellLab: !config.autoCellLab });
+    });
+
     const backgroundSwitch = createSwitch(() => {
       const config = loadConfig();
       updateConfig({ backgroundAutomation: !config.backgroundAutomation });
@@ -2196,6 +2300,7 @@
     panelBody.appendChild(createControlRow("速度", speedControl.wrapper));
     panelBody.appendChild(createControlRow("花费", spendControl.wrapper, { alignTop: true }));
     panelBody.appendChild(createControlRow("堆肥", compostSwitch));
+    panelBody.appendChild(createControlRow("细胞", cellLabSwitch));
     panelBody.appendChild(createControlRow("后台", backgroundSwitch));
 
     const actions = document.createElement("div");
@@ -2222,6 +2327,7 @@
       speedButtons: speedControl.buttons,
       spendButtons: spendControl.buttons,
       compostSwitch,
+      cellLabSwitch,
       backgroundSwitch,
     };
 
@@ -2247,6 +2353,7 @@
 
     setSwitchState(controlRefs.enabledSwitch, config.enabled);
     setSwitchState(controlRefs.compostSwitch, config.autoCompost);
+    setSwitchState(controlRefs.cellLabSwitch, config.autoCellLab);
     setSwitchState(controlRefs.backgroundSwitch, config.backgroundAutomation);
     setSegmentedState(controlRefs.modeButtons, config.scanOnly ? "scan" : "buy");
     setSegmentedState(controlRefs.speedButtons, getSpeedMode(config));
@@ -2264,6 +2371,7 @@
     statusNode.replaceChildren(
       createStatRow("升级", `${lastSummary.upgrades.candidates}/${lastSummary.upgrades.clicked}`),
       createStatRow("堆肥", `${lastSummary.compost.candidates}/${lastSummary.compost.clicked}`),
+      createStatRow("细胞", `${lastSummary.cellLab.candidates}/${lastSummary.cellLab.clicked}`),
       createStatRow("后台", `${lastSummary.background.candidates}/${lastSummary.background.clicked}`),
       createStatRow("速度", formatSpeedMode(config)),
       createStatRow("状态", formatReason(lastSummary.reason)),

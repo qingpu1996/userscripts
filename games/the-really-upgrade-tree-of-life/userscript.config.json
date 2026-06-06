@@ -5,7 +5,7 @@
   "metadata": {
     "name": "The Really Upgrade Tree of Life Helper",
     "namespace": "local.incremental.userscripts",
-    "version": "0.11.0",
+    "version": "0.12.0",
     "description": "Conservative automation helper for The Really Upgrade Tree of Life.",
     "match": [
       "https://the-really-upgrade-tree-of-life.g8hh.com.cn/*"

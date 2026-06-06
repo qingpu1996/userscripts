@@ -5,7 +5,7 @@ function isRiskyButton(button) {
     return true;
   }
 
-  if (button.matches(".tab-button, .stab-button, .no-active, .layer-reset-button")) {
+  if (button.matches(".tab-button, .stab-button, .no-active, .layer-reset-button, #sacred-reset, #bacteria-reset, .no-grid-big-upgrade")) {
     return true;
   }
 
@@ -31,6 +31,28 @@ function getBuyableUpgradeButtons() {
     .filter(isClickablePrimary)
     .filter((button) => !button.classList.contains("o-primary-btn--bought"))
     .filter((button) => !isRiskyButton(button));
+}
+
+const cellLabUpgradeClasses = [
+  "upgrade-cell",
+  "upgrade-bacteria",
+  "upgrade-virus",
+  "upgrade-BV",
+];
+
+function isCellLabUpgradeButton(button) {
+  return button.classList.contains("big-upgrade")
+    && cellLabUpgradeClasses.some((className) => button.classList.contains(className));
+}
+
+function getBuyableNormalUpgradeButtons() {
+  return getBuyableUpgradeButtons()
+    .filter((button) => !isCellLabUpgradeButton(button));
+}
+
+function getBuyableCellLabUpgradeButtons() {
+  return getBuyableUpgradeButtons()
+    .filter(isCellLabUpgradeButton);
 }
 
 function getVisibleCompostButtons() {
