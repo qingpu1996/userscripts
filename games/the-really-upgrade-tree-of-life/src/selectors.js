@@ -50,8 +50,17 @@ function getVisibleResetButtons() {
 }
 
 function describeButton(button) {
+  const cost = typeof parseButtonCost === "function" ? parseButtonCost(button) : null;
+
   return {
     text: normalizeText(button.textContent),
     classes: Array.from(button.classList),
+    cost: cost
+      ? {
+        amountText: cost.amountText,
+        resourceKey: cost.resourceKey,
+        resourceLabel: cost.resourceLabel,
+      }
+      : null,
   };
 }

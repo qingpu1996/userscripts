@@ -82,6 +82,9 @@ function ensureStyles() {
       gap: 10px;
       margin-top: 8px;
     }
+    #${PANEL_ID} .trutol-control.is-top {
+      align-items: flex-start;
+    }
     #${PANEL_ID} .trutol-label {
       min-width: 62px;
       color: #cbd5e1;
@@ -143,6 +146,30 @@ function ensureStyles() {
       color: #0f172a;
       background: #e2e8f0;
       box-shadow: 0 1px 8px rgba(0, 0, 0, 0.2);
+    }
+    #${PANEL_ID} .trutol-resource-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      flex: 1;
+      gap: 4px;
+      min-width: 0;
+    }
+    #${PANEL_ID} .trutol-resource-toggle {
+      min-width: 0;
+      height: 24px;
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: 6px;
+      color: #cbd5e1;
+      background: rgba(30, 41, 59, 0.76);
+      cursor: pointer;
+      font: inherit;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    #${PANEL_ID} .trutol-resource-toggle.is-on {
+      color: #064e3b;
+      background: #86efac;
+      border-color: rgba(134, 239, 172, 0.75);
     }
     #${PANEL_ID} .trutol-action-row {
       display: flex;
@@ -269,9 +296,29 @@ function createSegmentedControl(options, onSelect) {
   return { wrapper, buttons };
 }
 
-function createControlRow(labelText, control) {
+function createResourceToggleGrid(options, onToggle) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "trutol-resource-grid";
+
+  const buttons = {};
+
+  for (const option of options) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "trutol-resource-toggle";
+    button.textContent = option.label;
+    button.addEventListener("click", () => onToggle(option.key));
+    buttons[option.key] = button;
+    wrapper.appendChild(button);
+  }
+
+  return { wrapper, buttons };
+}
+
+function createControlRow(labelText, control, options = {}) {
   const row = document.createElement("div");
   row.className = "trutol-control";
+  row.classList.toggle("is-top", Boolean(options.alignTop));
 
   const label = document.createElement("div");
   label.className = "trutol-label";
@@ -309,6 +356,17 @@ function setSegmentedState(buttons, activeValue) {
   for (const [value, button] of Object.entries(buttons)) {
     button.classList.toggle("is-active", value === activeValue);
     button.setAttribute("aria-pressed", String(value === activeValue));
+  }
+}
+
+function setResourceToggleState(buttons, config) {
+  const spendResources = getSpendResourceConfig(config);
+
+  for (const [key, button] of Object.entries(buttons)) {
+    const isOn = Boolean(spendResources[key]);
+    button.classList.toggle("is-on", isOn);
+    button.setAttribute("aria-pressed", String(isOn));
+    button.setAttribute("title", isOn ? `允许自动花费${button.textContent}` : `保护${button.textContent}`);
   }
 }
 
@@ -372,6 +430,16 @@ function ensurePanel() {
     updateConfig({ speedMode: value, buyTickMs: null, statusTickMs: null });
   });
 
+  const spendControl = createResourceToggleGrid(spendResourceOptions, (key) => {
+    const config = loadConfig();
+    const spendResources = getSpendResourceConfig(config);
+    updateConfig({
+      spendResources: Object.assign({}, spendResources, {
+        [key]: !spendResources[key],
+      }),
+    });
+  });
+
   const compostSwitch = createSwitch(() => {
     const config = loadConfig();
     updateConfig({ autoCompost: !config.autoCompost });
@@ -380,6 +448,7 @@ function ensurePanel() {
   panelBody.appendChild(createControlRow("开关", enabledSwitch));
   panelBody.appendChild(createControlRow("模式", modeControl.wrapper));
   panelBody.appendChild(createControlRow("速度", speedControl.wrapper));
+  panelBody.appendChild(createControlRow("花费", spendControl.wrapper, { alignTop: true }));
   panelBody.appendChild(createControlRow("堆肥", compostSwitch));
 
   const actions = document.createElement("div");
@@ -404,6 +473,7 @@ function ensurePanel() {
     enabledSwitch,
     modeButtons: modeControl.buttons,
     speedButtons: speedControl.buttons,
+    spendButtons: spendControl.buttons,
     compostSwitch,
   };
 
@@ -431,6 +501,7 @@ function renderPanel(config = loadConfig()) {
   setSwitchState(controlRefs.compostSwitch, config.autoCompost);
   setSegmentedState(controlRefs.modeButtons, config.scanOnly ? "scan" : "buy");
   setSegmentedState(controlRefs.speedButtons, getSpeedMode(config));
+  setResourceToggleState(controlRefs.spendButtons, config);
 
   controlRefs.badge.textContent = config.enabled ? "开" : "关";
   controlRefs.badge.style.color = config.enabled ? "#a7f3d0" : "#cbd5e1";

@@ -51,6 +51,9 @@ Enabled automation features:
 - Collapsible Chinese control panel.
 - Configurable speed modes with a fast purchase loop separated from the slower
   status, panel, and inline-hint refresh loop.
+- Per-resource spend protection for automated purchases. Leaves, Seeds, and
+  Fruits are allowed by default; Entropy and later resources are protected by
+  default until enabled in the panel.
 - Manual run button and browser console API via `window.__trutolHelper`.
 
 Known risks or limits:
@@ -68,6 +71,8 @@ Known risks or limits:
   only. Estimates longer than seven days are shown as greater than one week.
 - Burst speed mode runs purchase scans every 50ms. It is intended for early
   fast-growth phases and still avoids reset, challenge, and prestige actions.
+- Automated purchase only clicks visible buttons and respects the panel's spend
+  resource toggles. Buttons that would spend a protected resource are skipped.
 - A game update can change DOM classes or text and require selector updates.
 
 Manual controls:
@@ -77,6 +82,8 @@ Manual controls:
 - Panel `速度` segmented control: `稳健` uses 750ms purchase/status ticks, `快速`
   uses 250ms purchase and 500ms status ticks, and `爆发` uses 50ms purchase and
   500ms status ticks.
+- Panel `花费` toggles: choose which resources the helper may spend while buying
+  visible upgrades or compost actions.
 - Panel `堆肥` switch: allow or block visible compost button clicks in buy mode.
 - Panel `立即执行`: run one immediate scan/click pass.
 - Panel `收起` / `展开`: collapse or restore the helper panel.
@@ -86,6 +93,7 @@ Manual controls:
 window.__trutolHelper.getConfig()
 window.__trutolHelper.setConfig({ scanOnly: false, autoCompost: true, speedMode: "burst" })
 window.__trutolHelper.timings()
+window.__trutolHelper.spendResources()
 window.__trutolHelper.scan()
 window.__trutolHelper.leafTimeHint()
 window.__trutolHelper.resetHints()

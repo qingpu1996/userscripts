@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         The Really Upgrade Tree of Life Helper
 // @namespace    local.incremental.userscripts
-// @version      0.9.0
+// @version      0.10.0
 // @description  Conservative automation helper for The Really Upgrade Tree of Life.
 // @match        https://the-really-upgrade-tree-of-life.g8hh.com.cn/*
 // @grant        GM_getValue
@@ -380,6 +380,26 @@
   const minBuyTickMs = 20;
   const minStatusTickMs = 250;
 
+  const spendResourceOptions = [
+    { key: "leaves", label: "树叶", defaultAllowed: true },
+    { key: "seeds", label: "种子", defaultAllowed: true },
+    { key: "fruits", label: "水果", defaultAllowed: true },
+    { key: "entropy", label: "熵", defaultAllowed: false },
+    { key: "roots", label: "根", defaultAllowed: false },
+    { key: "ash", label: "灰烬", defaultAllowed: false },
+    { key: "fallen", label: "落叶", defaultAllowed: false },
+    { key: "sacred", label: "圣叶", defaultAllowed: false },
+    { key: "cells", label: "细胞", defaultAllowed: false },
+    { key: "bacteria", label: "细菌", defaultAllowed: false },
+    { key: "other", label: "其他", defaultAllowed: false },
+  ];
+
+  function createDefaultSpendResources() {
+    return Object.fromEntries(
+      spendResourceOptions.map((option) => [option.key, option.defaultAllowed]),
+    );
+  }
+
   const speedProfiles = {
     steady: {
       label: "稳健",
@@ -408,6 +428,7 @@
     buyTickMs: null,
     statusTickMs: null,
     tickMs: 750,
+    spendResources: createDefaultSpendResources(),
     maxUpgradeClicksPerTick: 3,
     maxCompostClicksPerTick: 1,
     logScans: false,
@@ -480,7 +501,14 @@
   };
 
   function loadConfig() {
-    return Object.assign({}, defaultConfig, gmGetValue(CONFIG_KEY, {}));
+    const storedConfig = gmGetValue(CONFIG_KEY, {});
+    const config = Object.assign({}, defaultConfig, storedConfig);
+    config.spendResources = Object.assign(
+      {},
+      defaultConfig.spendResources,
+      storedConfig.spendResources || {},
+    );
+    return config;
   }
 
   function saveConfig(config) {
@@ -505,6 +533,21 @@
 
   function formatReason(reason) {
     return reasonLabels[reason] || reason;
+  }
+
+  function getSpendResourceConfig(config = loadConfig()) {
+    return Object.assign({}, defaultConfig.spendResources, config.spendResources || {});
+  }
+
+  function getSpendResourceKey(resourceKey) {
+    return spendResourceOptions.some((option) => option.key === resourceKey)
+      ? resourceKey
+      : "other";
+  }
+
+  function isSpendResourceAllowed(resourceKey, config = loadConfig()) {
+    const spendResources = getSpendResourceConfig(config);
+    return Boolean(spendResources[getSpendResourceKey(resourceKey)]);
   }
 
   function getSpeedMode(config = loadConfig()) {
@@ -588,9 +631,18 @@
   }
 
   function describeButton(button) {
+    const cost = typeof parseButtonCost === "function" ? parseButtonCost(button) : null;
+
     return {
       text: normalizeText(button.textContent),
       classes: Array.from(button.classList),
+      cost: cost
+        ? {
+          amountText: cost.amountText,
+          resourceKey: cost.resourceKey,
+          resourceLabel: cost.resourceLabel,
+        }
+        : null,
     };
   }
 
@@ -598,6 +650,19 @@
 
   function normalizeResourceName(name) {
     const text = normalizeText(name).toLowerCase();
+
+    if (text.includes("圣") || text.includes("sacred")) {
+      return { key: "sacred", label: "圣叶" };
+    }
+
+    if (text.includes("落叶")
+      || text.includes("fallen")
+      || text.includes("bronze")
+      || text.includes("silver")
+      || text.includes("gold")
+      || text.includes("autumn")) {
+      return { key: "fallen", label: "落叶" };
+    }
 
     if (text.includes("种子") || text.includes("seed")) {
       return { key: "seeds", label: "种子" };
@@ -613,6 +678,18 @@
 
     if (text.includes("熵") || text.includes("entropy")) {
       return { key: "entropy", label: "熵" };
+    }
+
+    if (text.includes("灰") || text.includes("ash")) {
+      return { key: "ash", label: "灰烬" };
+    }
+
+    if (text.includes("细胞") || text.includes("cell")) {
+      return { key: "cells", label: "细胞" };
+    }
+
+    if (text.includes("细菌") || text.includes("bacteria")) {
+      return { key: "bacteria", label: "细菌" };
     }
 
     if (text.includes("树叶") || text.includes("leaf") || text.includes("leaves")) {
@@ -738,9 +815,8 @@
     };
   }
 
-  function parseButtonCost(button) {
-    const text = normalizeText(button.textContent);
-    const match = text.match(/(?:成本|cost)[:：]?\s*(.+)$/i);
+  function parseCostFromText(text) {
+    const match = normalizeText(text).match(/(?:成本|cost)[:：]?\s*(.+)$/i);
 
     if (!match) {
       return null;
@@ -761,6 +837,20 @@
       resourceKey: resource.key,
       resourceLabel: resource.label,
     };
+  }
+
+  function parseButtonCost(button) {
+    const directCost = parseCostFromText(button.textContent);
+
+    if (directCost) {
+      return directCost;
+    }
+
+    if (button.classList.contains("compost-button")) {
+      return parseCostFromText(button.closest(".composter-frame")?.textContent);
+    }
+
+    return null;
   }
 
   function getVisibleCostTargets(resourceKey) {
@@ -1100,11 +1190,22 @@
 
   // Source: games/the-really-upgrade-tree-of-life/src/automation.js
 
-  function scan() {
+  function isAutoSpendAllowed(button, config = loadConfig()) {
+    const cost = parseButtonCost(button);
+    return !cost || isSpendResourceAllowed(cost.resourceKey, config);
+  }
+
+  function filterAutoSpendAllowed(buttons, config = loadConfig()) {
+    return buttons.filter((button) => isAutoSpendAllowed(button, config));
+  }
+
+  function scan(config = loadConfig()) {
     const visibleUpgrades = getVisibleUpgradeButtons();
-    const buyableUpgrades = getBuyableUpgradeButtons();
+    const rawBuyableUpgrades = getBuyableUpgradeButtons();
+    const buyableUpgrades = filterAutoSpendAllowed(rawBuyableUpgrades, config);
     const visibleCompost = getVisibleCompostButtons();
-    const buyableCompost = getBuyableCompostButtons();
+    const rawBuyableCompost = getBuyableCompostButtons();
+    const buyableCompost = filterAutoSpendAllowed(rawBuyableCompost, config);
     const resetHints = getResetRatioHints();
     const leafTimeHint = getLeafTimeHint();
 
@@ -1112,10 +1213,16 @@
       upgrades: {
         visible: visibleUpgrades.map(describeButton),
         buyable: buyableUpgrades.map(describeButton),
+        blockedByResource: rawBuyableUpgrades
+          .filter((button) => !isAutoSpendAllowed(button, config))
+          .map(describeButton),
       },
       compost: {
         visible: visibleCompost.map(describeButton),
         buyable: buyableCompost.map(describeButton),
+        blockedByResource: rawBuyableCompost
+          .filter((button) => !isAutoSpendAllowed(button, config))
+          .map(describeButton),
       },
       resetHints: resetHints.map(({ button, ...hint }) => hint),
       leafTimeHint: leafTimeHint
@@ -1177,7 +1284,7 @@
   }
 
   function clickBuyableUpgrades(config) {
-    const candidates = getBuyableUpgradeButtons();
+    const candidates = filterAutoSpendAllowed(getBuyableUpgradeButtons(), config);
     const legacyLimit = config.maxClicksPerTick;
     const configuredLimit = config.maxUpgradeClicksPerTick === undefined
       ? legacyLimit
@@ -1188,7 +1295,7 @@
   }
 
   function clickBuyableCompost(config) {
-    const candidates = getBuyableCompostButtons();
+    const candidates = filterAutoSpendAllowed(getBuyableCompostButtons(), config);
     const limit = readLimit(config.maxCompostClicksPerTick, defaultConfig.maxCompostClicksPerTick);
 
     return clickButtons(candidates, limit, "compost", config);
@@ -1258,7 +1365,7 @@
       return lastSummary;
     }
 
-    const scanResult = scan();
+    const scanResult = scan(config);
     updateInlineLeafHint();
     updateInlineResetHints();
 
@@ -1290,7 +1397,7 @@
       return lastSummary;
     }
 
-    const scanResult = scan();
+    const scanResult = scan(config);
     updateInlineLeafHint();
     updateInlineResetHints();
 
@@ -1405,6 +1512,9 @@
         gap: 10px;
         margin-top: 8px;
       }
+      #${PANEL_ID} .trutol-control.is-top {
+        align-items: flex-start;
+      }
       #${PANEL_ID} .trutol-label {
         min-width: 62px;
         color: #cbd5e1;
@@ -1466,6 +1576,30 @@
         color: #0f172a;
         background: #e2e8f0;
         box-shadow: 0 1px 8px rgba(0, 0, 0, 0.2);
+      }
+      #${PANEL_ID} .trutol-resource-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        flex: 1;
+        gap: 4px;
+        min-width: 0;
+      }
+      #${PANEL_ID} .trutol-resource-toggle {
+        min-width: 0;
+        height: 24px;
+        border: 1px solid rgba(148, 163, 184, 0.24);
+        border-radius: 6px;
+        color: #cbd5e1;
+        background: rgba(30, 41, 59, 0.76);
+        cursor: pointer;
+        font: inherit;
+        font-size: 11px;
+        font-weight: 700;
+      }
+      #${PANEL_ID} .trutol-resource-toggle.is-on {
+        color: #064e3b;
+        background: #86efac;
+        border-color: rgba(134, 239, 172, 0.75);
       }
       #${PANEL_ID} .trutol-action-row {
         display: flex;
@@ -1592,9 +1726,29 @@
     return { wrapper, buttons };
   }
 
-  function createControlRow(labelText, control) {
+  function createResourceToggleGrid(options, onToggle) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "trutol-resource-grid";
+
+    const buttons = {};
+
+    for (const option of options) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "trutol-resource-toggle";
+      button.textContent = option.label;
+      button.addEventListener("click", () => onToggle(option.key));
+      buttons[option.key] = button;
+      wrapper.appendChild(button);
+    }
+
+    return { wrapper, buttons };
+  }
+
+  function createControlRow(labelText, control, options = {}) {
     const row = document.createElement("div");
     row.className = "trutol-control";
+    row.classList.toggle("is-top", Boolean(options.alignTop));
 
     const label = document.createElement("div");
     label.className = "trutol-label";
@@ -1632,6 +1786,17 @@
     for (const [value, button] of Object.entries(buttons)) {
       button.classList.toggle("is-active", value === activeValue);
       button.setAttribute("aria-pressed", String(value === activeValue));
+    }
+  }
+
+  function setResourceToggleState(buttons, config) {
+    const spendResources = getSpendResourceConfig(config);
+
+    for (const [key, button] of Object.entries(buttons)) {
+      const isOn = Boolean(spendResources[key]);
+      button.classList.toggle("is-on", isOn);
+      button.setAttribute("aria-pressed", String(isOn));
+      button.setAttribute("title", isOn ? `允许自动花费${button.textContent}` : `保护${button.textContent}`);
     }
   }
 
@@ -1695,6 +1860,16 @@
       updateConfig({ speedMode: value, buyTickMs: null, statusTickMs: null });
     });
 
+    const spendControl = createResourceToggleGrid(spendResourceOptions, (key) => {
+      const config = loadConfig();
+      const spendResources = getSpendResourceConfig(config);
+      updateConfig({
+        spendResources: Object.assign({}, spendResources, {
+          [key]: !spendResources[key],
+        }),
+      });
+    });
+
     const compostSwitch = createSwitch(() => {
       const config = loadConfig();
       updateConfig({ autoCompost: !config.autoCompost });
@@ -1703,6 +1878,7 @@
     panelBody.appendChild(createControlRow("开关", enabledSwitch));
     panelBody.appendChild(createControlRow("模式", modeControl.wrapper));
     panelBody.appendChild(createControlRow("速度", speedControl.wrapper));
+    panelBody.appendChild(createControlRow("花费", spendControl.wrapper, { alignTop: true }));
     panelBody.appendChild(createControlRow("堆肥", compostSwitch));
 
     const actions = document.createElement("div");
@@ -1727,6 +1903,7 @@
       enabledSwitch,
       modeButtons: modeControl.buttons,
       speedButtons: speedControl.buttons,
+      spendButtons: spendControl.buttons,
       compostSwitch,
     };
 
@@ -1754,6 +1931,7 @@
     setSwitchState(controlRefs.compostSwitch, config.autoCompost);
     setSegmentedState(controlRefs.modeButtons, config.scanOnly ? "scan" : "buy");
     setSegmentedState(controlRefs.speedButtons, getSpeedMode(config));
+    setResourceToggleState(controlRefs.spendButtons, config);
 
     controlRefs.badge.textContent = config.enabled ? "开" : "关";
     controlRefs.badge.style.color = config.enabled ? "#a7f3d0" : "#cbd5e1";
@@ -1813,6 +1991,7 @@
       getConfig: loadConfig,
       setConfig: updateConfig,
       timings: () => getAutomationTimings(loadConfig()),
+      spendResources: () => getSpendResourceConfig(loadConfig()),
       scan,
       leafTimeHint: () => scan().leafTimeHint,
       resetHints: () => scan().resetHints,
