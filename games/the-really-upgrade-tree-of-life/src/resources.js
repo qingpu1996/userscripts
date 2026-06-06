@@ -1,6 +1,19 @@
 function normalizeResourceName(name) {
   const text = normalizeText(name).toLowerCase();
 
+  if (text.includes("圣") || text.includes("sacred")) {
+    return { key: "sacred", label: "圣叶" };
+  }
+
+  if (text.includes("落叶")
+    || text.includes("fallen")
+    || text.includes("bronze")
+    || text.includes("silver")
+    || text.includes("gold")
+    || text.includes("autumn")) {
+    return { key: "fallen", label: "落叶" };
+  }
+
   if (text.includes("种子") || text.includes("seed")) {
     return { key: "seeds", label: "种子" };
   }
@@ -15,6 +28,18 @@ function normalizeResourceName(name) {
 
   if (text.includes("熵") || text.includes("entropy")) {
     return { key: "entropy", label: "熵" };
+  }
+
+  if (text.includes("灰") || text.includes("ash")) {
+    return { key: "ash", label: "灰烬" };
+  }
+
+  if (text.includes("细胞") || text.includes("cell")) {
+    return { key: "cells", label: "细胞" };
+  }
+
+  if (text.includes("细菌") || text.includes("bacteria")) {
+    return { key: "bacteria", label: "细菌" };
   }
 
   if (text.includes("树叶") || text.includes("leaf") || text.includes("leaves")) {
@@ -140,9 +165,8 @@ function parseResetGain(button) {
   };
 }
 
-function parseButtonCost(button) {
-  const text = normalizeText(button.textContent);
-  const match = text.match(/(?:成本|cost)[:：]?\s*(.+)$/i);
+function parseCostFromText(text) {
+  const match = normalizeText(text).match(/(?:成本|cost)[:：]?\s*(.+)$/i);
 
   if (!match) {
     return null;
@@ -163,6 +187,20 @@ function parseButtonCost(button) {
     resourceKey: resource.key,
     resourceLabel: resource.label,
   };
+}
+
+function parseButtonCost(button) {
+  const directCost = parseCostFromText(button.textContent);
+
+  if (directCost) {
+    return directCost;
+  }
+
+  if (button.classList.contains("compost-button")) {
+    return parseCostFromText(button.closest(".composter-frame")?.textContent);
+  }
+
+  return null;
 }
 
 function getVisibleCostTargets(resourceKey) {

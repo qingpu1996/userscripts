@@ -1,8 +1,19 @@
-function scan() {
+function isAutoSpendAllowed(button, config = loadConfig()) {
+  const cost = parseButtonCost(button);
+  return !cost || isSpendResourceAllowed(cost.resourceKey, config);
+}
+
+function filterAutoSpendAllowed(buttons, config = loadConfig()) {
+  return buttons.filter((button) => isAutoSpendAllowed(button, config));
+}
+
+function scan(config = loadConfig()) {
   const visibleUpgrades = getVisibleUpgradeButtons();
-  const buyableUpgrades = getBuyableUpgradeButtons();
+  const rawBuyableUpgrades = getBuyableUpgradeButtons();
+  const buyableUpgrades = filterAutoSpendAllowed(rawBuyableUpgrades, config);
   const visibleCompost = getVisibleCompostButtons();
-  const buyableCompost = getBuyableCompostButtons();
+  const rawBuyableCompost = getBuyableCompostButtons();
+  const buyableCompost = filterAutoSpendAllowed(rawBuyableCompost, config);
   const resetHints = getResetRatioHints();
   const leafTimeHint = getLeafTimeHint();
 
@@ -10,10 +21,16 @@ function scan() {
     upgrades: {
       visible: visibleUpgrades.map(describeButton),
       buyable: buyableUpgrades.map(describeButton),
+      blockedByResource: rawBuyableUpgrades
+        .filter((button) => !isAutoSpendAllowed(button, config))
+        .map(describeButton),
     },
     compost: {
       visible: visibleCompost.map(describeButton),
       buyable: buyableCompost.map(describeButton),
+      blockedByResource: rawBuyableCompost
+        .filter((button) => !isAutoSpendAllowed(button, config))
+        .map(describeButton),
     },
     resetHints: resetHints.map(({ button, ...hint }) => hint),
     leafTimeHint: leafTimeHint
@@ -75,7 +92,7 @@ function readLimit(value, fallback) {
 }
 
 function clickBuyableUpgrades(config) {
-  const candidates = getBuyableUpgradeButtons();
+  const candidates = filterAutoSpendAllowed(getBuyableUpgradeButtons(), config);
   const legacyLimit = config.maxClicksPerTick;
   const configuredLimit = config.maxUpgradeClicksPerTick === undefined
     ? legacyLimit
@@ -86,7 +103,7 @@ function clickBuyableUpgrades(config) {
 }
 
 function clickBuyableCompost(config) {
-  const candidates = getBuyableCompostButtons();
+  const candidates = filterAutoSpendAllowed(getBuyableCompostButtons(), config);
   const limit = readLimit(config.maxCompostClicksPerTick, defaultConfig.maxCompostClicksPerTick);
 
   return clickButtons(candidates, limit, "compost", config);
@@ -156,7 +173,7 @@ function runStatusTick(config = loadConfig()) {
     return lastSummary;
   }
 
-  const scanResult = scan();
+  const scanResult = scan(config);
   updateInlineLeafHint();
   updateInlineResetHints();
 
@@ -188,7 +205,7 @@ function runAutomation(config = loadConfig()) {
     return lastSummary;
   }
 
-  const scanResult = scan();
+  const scanResult = scan(config);
   updateInlineLeafHint();
   updateInlineResetHints();
 

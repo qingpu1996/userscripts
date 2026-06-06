@@ -35,6 +35,7 @@ function main() {
     getConfig: loadConfig,
     setConfig: updateConfig,
     timings: () => getAutomationTimings(loadConfig()),
+    spendResources: () => getSpendResourceConfig(loadConfig()),
     scan,
     leafTimeHint: () => scan().leafTimeHint,
     resetHints: () => scan().resetHints,

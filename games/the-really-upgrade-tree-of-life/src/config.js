@@ -8,6 +8,26 @@ const LEAF_HINT_CLASS = "trutol-inline-leaf-hint";
 const minBuyTickMs = 20;
 const minStatusTickMs = 250;
 
+const spendResourceOptions = [
+  { key: "leaves", label: "树叶", defaultAllowed: true },
+  { key: "seeds", label: "种子", defaultAllowed: true },
+  { key: "fruits", label: "水果", defaultAllowed: true },
+  { key: "entropy", label: "熵", defaultAllowed: false },
+  { key: "roots", label: "根", defaultAllowed: false },
+  { key: "ash", label: "灰烬", defaultAllowed: false },
+  { key: "fallen", label: "落叶", defaultAllowed: false },
+  { key: "sacred", label: "圣叶", defaultAllowed: false },
+  { key: "cells", label: "细胞", defaultAllowed: false },
+  { key: "bacteria", label: "细菌", defaultAllowed: false },
+  { key: "other", label: "其他", defaultAllowed: false },
+];
+
+function createDefaultSpendResources() {
+  return Object.fromEntries(
+    spendResourceOptions.map((option) => [option.key, option.defaultAllowed]),
+  );
+}
+
 const speedProfiles = {
   steady: {
     label: "稳健",
@@ -36,6 +56,7 @@ const defaultConfig = {
   buyTickMs: null,
   statusTickMs: null,
   tickMs: 750,
+  spendResources: createDefaultSpendResources(),
   maxUpgradeClicksPerTick: 3,
   maxCompostClicksPerTick: 1,
   logScans: false,
@@ -108,7 +129,14 @@ const reasonLabels = {
 };
 
 function loadConfig() {
-  return Object.assign({}, defaultConfig, gmGetValue(CONFIG_KEY, {}));
+  const storedConfig = gmGetValue(CONFIG_KEY, {});
+  const config = Object.assign({}, defaultConfig, storedConfig);
+  config.spendResources = Object.assign(
+    {},
+    defaultConfig.spendResources,
+    storedConfig.spendResources || {},
+  );
+  return config;
 }
 
 function saveConfig(config) {
@@ -133,6 +161,21 @@ function log(...args) {
 
 function formatReason(reason) {
   return reasonLabels[reason] || reason;
+}
+
+function getSpendResourceConfig(config = loadConfig()) {
+  return Object.assign({}, defaultConfig.spendResources, config.spendResources || {});
+}
+
+function getSpendResourceKey(resourceKey) {
+  return spendResourceOptions.some((option) => option.key === resourceKey)
+    ? resourceKey
+    : "other";
+}
+
+function isSpendResourceAllowed(resourceKey, config = loadConfig()) {
+  const spendResources = getSpendResourceConfig(config);
+  return Boolean(spendResources[getSpendResourceKey(resourceKey)]);
 }
 
 function getSpeedMode(config = loadConfig()) {
