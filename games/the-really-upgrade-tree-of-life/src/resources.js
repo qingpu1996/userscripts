@@ -62,6 +62,12 @@ const buttonResourceHints = [
   { key: "bacteria", label: "细菌", labels: ["细菌", "bacteria"], groups: ["bacteria"] },
 ];
 
+const compostFrameSelector = ".fertilizer-frame, .composter-frame";
+
+function getCompostFrame(button) {
+  return button.closest(compostFrameSelector);
+}
+
 function getUpgradeGroupFromButton(button) {
   const text = normalizeText(button.textContent);
   const bracket = text.match(/^\s*\[([^\]\s]+)(?:\s+\d+)?\]/);
@@ -254,7 +260,7 @@ function parseButtonCost(button) {
   }
 
   if (button.classList.contains("compost-button")) {
-    return parseCostFromText(button.closest(".composter-frame")?.textContent);
+    return parseCostFromText(getCompostFrame(button)?.textContent);
   }
 
   return null;

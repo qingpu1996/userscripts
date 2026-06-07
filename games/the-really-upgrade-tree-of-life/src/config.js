@@ -63,6 +63,9 @@ const defaultConfig = {
   maxCompostClicksPerTick: 1,
   maxCellLabClicksPerTick: 3,
   maxBackgroundClicksPerTick: 3,
+  maxBackgroundUpgradeClicksPerTick: 3,
+  maxBackgroundCompostClicksPerTick: 4,
+  maxBackgroundCellLabClicksPerTick: 3,
   logScans: false,
   logClicks: true,
 };
