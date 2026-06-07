@@ -60,6 +60,9 @@ Enabled automation features:
 - Background automation for safe upgrades and compost actions that have already
   been seen once in a rendered game panel. It reuses the button's own click
   handler and still respects the spend resource toggles.
+- Background compost automation uses stable resource IDs and a dedicated
+  compost budget so in-progress compost button text does not crowd out later
+  compost attempts.
 - Manual run button and browser console API via `window.__trutolHelper`.
 
 Known risks or limits:

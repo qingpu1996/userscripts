@@ -1,5 +1,9 @@
 const learnedAutomationActions = new Map();
-let learnedAutomationCursor = 0;
+const learnedAutomationCursors = {
+  upgrade: 0,
+  compost: 0,
+  cellLab: 0,
+};
 
 function getButtonAutomationKind(button) {
   if (button.classList.contains("compost-button")) {
@@ -25,6 +29,27 @@ function normalizeActionLabel(text) {
   return normalizeText(text).replace(/\s+/g, " ").slice(0, 120);
 }
 
+function getCompostAutomationId(button) {
+  const cost = typeof parseButtonCost === "function" ? parseButtonCost(button) : null;
+
+  if (cost?.resourceKey) {
+    return `compost:${cost.resourceKey}`;
+  }
+
+  const headingText = getCompostFrame(button)?.querySelector("h3")?.textContent;
+  const resource = headingText && typeof normalizeResourceName === "function"
+    ? normalizeResourceName(headingText)
+    : null;
+
+  if (resource?.key) {
+    return `compost:${resource.key}`;
+  }
+
+  const frames = Array.from(document.querySelectorAll(compostFrameSelector));
+  const frameIndex = frames.indexOf(getCompostFrame(button));
+  return `compost:${frameIndex}`;
+}
+
 function getButtonAutomationId(button) {
   const kind = getButtonAutomationKind(button);
 
@@ -33,9 +58,7 @@ function getButtonAutomationId(button) {
   }
 
   if (kind === "compost") {
-    const frames = Array.from(document.querySelectorAll(".composter-frame"));
-    const frameIndex = frames.indexOf(button.closest(".composter-frame"));
-    return `${kind}:${frameIndex}:${normalizeActionLabel(button.textContent)}`;
+    return getCompostAutomationId(button);
   }
 
   const text = normalizeText(button.textContent);
@@ -172,24 +195,26 @@ function isLearnedActionAllowed(action, config = loadConfig()) {
   return isSpendResourceAllowed(action.cost.resourceKey, config);
 }
 
-function getLearnedAutomationActions(config = loadConfig()) {
+function getLearnedAutomationActions(config = loadConfig(), area = null) {
   return Array.from(learnedAutomationActions.values())
     .filter((action) => action.runner && typeof action.runner.run === "function")
     .filter((action) => !isLearnedActionVisible(action))
+    .filter((action) => !area || action.area === area)
     .filter((action) => isLearnedActionAllowed(action, config))
     .filter((action) => (action.area === "upgrade" && config.autoUpgrades)
       || (action.area === "cellLab" && config.autoCellLab)
       || (action.area === "compost" && config.autoCompost));
 }
 
-function rotateActions(actions, limit) {
+function rotateActions(actions, limit, cursorKey = "upgrade") {
   if (actions.length === 0 || limit <= 0) {
     return [];
   }
 
-  const start = learnedAutomationCursor % actions.length;
+  const start = (learnedAutomationCursors[cursorKey] || 0) % actions.length;
   const rotated = actions.slice(start).concat(actions.slice(0, start));
-  learnedAutomationCursor += Math.min(limit, actions.length);
+  learnedAutomationCursors[cursorKey] = (learnedAutomationCursors[cursorKey] || 0)
+    + Math.min(limit, actions.length);
   return rotated.slice(0, limit);
 }
 
@@ -370,24 +395,50 @@ function clickBuyableCompost(config) {
 }
 
 function clickBackgroundActions(config) {
-  const candidates = getLearnedAutomationActions(config);
-  const limit = readLimit(config.maxBackgroundClicksPerTick, defaultConfig.maxBackgroundClicksPerTick);
-  const actions = rotateActions(candidates, limit);
+  const groups = [
+    {
+      area: "compost",
+      limitKey: "maxBackgroundCompostClicksPerTick",
+      fallback: defaultConfig.maxBackgroundCompostClicksPerTick,
+    },
+    {
+      area: "upgrade",
+      limitKey: "maxBackgroundUpgradeClicksPerTick",
+      fallback: defaultConfig.maxBackgroundUpgradeClicksPerTick,
+    },
+    {
+      area: "cellLab",
+      limitKey: "maxBackgroundCellLabClicksPerTick",
+      fallback: defaultConfig.maxBackgroundCellLabClicksPerTick,
+    },
+  ];
+  let candidateCount = 0;
   let clicked = 0;
 
-  for (const action of actions) {
-    if (config.logClicks) {
-      log("background", action.kind, action.source, action.label);
-    }
+  for (const group of groups) {
+    const candidates = getLearnedAutomationActions(config, group.area);
+    const legacyLimit = config.maxBackgroundClicksPerTick;
+    const configuredLimit = config[group.limitKey] === undefined
+      ? legacyLimit
+      : config[group.limitKey];
+    const limit = readLimit(configuredLimit, group.fallback);
+    const actions = rotateActions(candidates, limit, group.area);
+    candidateCount += candidates.length;
 
-    action.runner.run();
-    clicked += 1;
+    for (const action of actions) {
+      if (config.logClicks) {
+        log("background", action.kind, action.source, action.label);
+      }
+
+      action.runner.run();
+      clicked += 1;
+    }
   }
 
   return {
-    candidates: candidates.length,
+    candidates: candidateCount,
     clicked,
-    skipped: Math.max(0, candidates.length - clicked),
+    skipped: Math.max(0, candidateCount - clicked),
   };
 }
 
