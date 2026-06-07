@@ -47,6 +47,19 @@ Enabled automation features:
 - Optional compost mode for visible `compost-button` controls.
 - Reset hint display for visible `layer-reset-button` and sacred reset controls.
 - Inline reset ratio hints under visible reset buttons.
+- Optional auto-reset controls for Seed, Fruit, and Entropy. They are off by
+  default and can trigger by gain multiplier, fixed gain amount, or elapsed time
+  since the last reset. A hybrid multiplier-or-time mode can trigger on either
+  condition, whichever is reached first. Time-based triggers also require a
+  configurable minimum gain multiplier, defaulting to `1`.
+- The helper panel includes a global auto-reset switch for temporarily pausing
+  all auto resets during challenges without changing each resource's saved
+  thresholds.
+- Persistent auto-reset controls in the helper panel, so reset settings can be
+  changed even when the matching reset button is currently unavailable or hidden.
+- Layer reset resources are recognized by the game's reset button classes
+  (`layer-reset-button` with `upgrade-S`, `upgrade-F`, or `upgrade-E`), not by
+  localized button wording.
 - Inline leaf time-to-next-purchase hint inside the visible leaf layer frame.
 - Collapsible Chinese control panel.
 - Configurable speed modes with a fast purchase loop separated from the slower
@@ -63,6 +76,9 @@ Enabled automation features:
 - Background compost automation uses stable resource IDs and a dedicated
   compost budget so in-progress compost button text does not crowd out later
   compost attempts.
+- Background automation keeps the last clickable Vue handler for learned
+  compost actions, so an in-progress compost button does not overwrite the
+  hidden-tab runner with a no-op state.
 - Manual run button and browser console API via `window.__trutolHelper`.
 
 Known risks or limits:
@@ -72,7 +88,11 @@ Known risks or limits:
 - Background automation only works after the relevant button has appeared once
   during the current page load. Fully unseen tabs still need to be visited once
   so the helper can learn their safe button handlers.
-- Reset, challenge, and prestige automation is intentionally hint-only for now.
+- Auto reset is intentionally limited to Seeds, Fruits, and Entropy. Other reset-like
+  actions remain hint-only unless explicitly added later.
+- Auto reset uses a short global duplicate-click cooldown, while each resource
+  keeps its own elapsed-time baseline. A Fruit reset does not reset the Seed
+  timer, and vice versa.
 - Reset ratio hints are approximate and are calculated from visible game notation,
   including suffix notation and scientific notation such as `1e303`, `1E303`,
   and `1e3,003`.
@@ -102,6 +122,15 @@ Manual controls:
   upgrades and compost buttons.
 - Panel `立即执行`: run one immediate scan/click pass.
 - Panel `收起` / `展开`: collapse or restore the helper panel.
+- Panel `重置` controls: configure Seed, Fruit, and Entropy auto reset even when
+  the matching reset button is unavailable. The switch enables that resource
+  only; the mode chooses multiplier, fixed gain amount, elapsed-time, or
+  multiplier-or-time hybrid triggering. Time and hybrid modes expose a minimum
+  multiplier guard so elapsed-time fallback does not reset into a worse reward.
+- Panel `重置` total switch: pause or resume all auto resets without changing
+  individual resource settings.
+- Inline reset controls: when a supported reset button is visible, the same
+  resource controls appear below its reset hints with live status near the button.
 - Console:
 
 ```js
@@ -109,7 +138,9 @@ window.__trutolHelper.getConfig()
 window.__trutolHelper.setConfig({ scanOnly: false, autoCompost: true, speedMode: "burst" })
 window.__trutolHelper.timings()
 window.__trutolHelper.spendResources()
+window.__trutolHelper.autoReset()
 window.__trutolHelper.learnedActions()
+window.__trutolHelper.learnedResets()
 window.__trutolHelper.scan()
 window.__trutolHelper.leafTimeHint()
 window.__trutolHelper.resetHints()

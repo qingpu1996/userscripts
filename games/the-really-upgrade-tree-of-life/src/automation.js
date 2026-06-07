@@ -1,4 +1,5 @@
 const learnedAutomationActions = new Map();
+const learnedResetActions = new Map();
 const learnedAutomationCursors = {
   upgrade: 0,
   compost: 0,
@@ -118,13 +119,38 @@ function getVueClickInvoker(button) {
   return null;
 }
 
+function getVueClickHandlerSnapshot(invoker) {
+  const handler = invoker?.value || invoker;
+
+  if (Array.isArray(handler)) {
+    const handlers = handler.filter((item) => typeof item === "function");
+    return handlers.length > 0 ? handlers.slice() : null;
+  }
+
+  return typeof handler === "function" ? handler : null;
+}
+
+function runVueClickHandlerSnapshot(button, handler) {
+  const event = createSyntheticClickEvent(button);
+
+  if (Array.isArray(handler)) {
+    for (const item of handler) {
+      item.call(button, event);
+    }
+    return;
+  }
+
+  handler.call(button, event);
+}
+
 function createButtonActionRunner(button) {
   const vueInvoker = getVueClickInvoker(button);
+  const vueHandler = vueInvoker ? getVueClickHandlerSnapshot(vueInvoker) : null;
 
-  if (vueInvoker) {
+  if (vueHandler) {
     return {
       source: "vue",
-      run: () => vueInvoker.call(button, createSyntheticClickEvent(button)),
+      run: () => runVueClickHandlerSnapshot(button, vueHandler),
     };
   }
 
@@ -136,6 +162,71 @@ function createButtonActionRunner(button) {
   }
 
   return null;
+}
+
+function serializeResetHint(hint) {
+  return {
+    text: hint.text,
+    classes: hint.classes,
+    resourceKey: hint.resourceKey,
+    resourceLabel: hint.resourceLabel,
+    gained: hint.gained,
+    gainedLog10: hint.gainedLog10,
+    current: hint.current,
+    currentLog10: hint.currentLog10,
+    currentMissing: hint.currentMissing,
+    currentWasZero: hint.currentWasZero,
+    ratio: hint.ratio,
+    ratioLog10: hint.ratioLog10,
+    ratioHint: hint.ratioHint,
+    seedAffordabilityHint: hint.seedAffordabilityHint,
+    hint: hint.hint,
+  };
+}
+
+function getResetAutomationId(hint) {
+  if (!hint || !isAutoResetResourceSupported(hint.resourceKey)) {
+    return null;
+  }
+
+  return `reset:${hint.resourceKey}`;
+}
+
+function learnResetAction(hint) {
+  const id = getResetAutomationId(hint);
+
+  if (!id || !hint.button) {
+    return null;
+  }
+
+  const runner = createButtonActionRunner(hint.button);
+
+  if (!runner) {
+    return null;
+  }
+
+  const existing = learnedResetActions.get(id) || {};
+  const action = Object.assign({}, existing, {
+    id,
+    kind: "reset",
+    resourceKey: hint.resourceKey,
+    resourceLabel: hint.resourceLabel,
+    label: normalizeActionLabel(hint.text),
+    hint: serializeResetHint(hint),
+    element: hint.button,
+    runner,
+    source: runner.source,
+    lastSeenAt: Date.now(),
+  });
+
+  learnedResetActions.set(id, action);
+  return action;
+}
+
+function learnResetActions(hints) {
+  for (const hint of hints) {
+    learnResetAction(hint);
+  }
 }
 
 function getVisibleAutomationButtons() {
@@ -153,13 +244,14 @@ function learnAutomationAction(button) {
     return null;
   }
 
-  const runner = createButtonActionRunner(button);
+  const existing = learnedAutomationActions.get(id) || {};
+  const freshRunner = isClickablePrimary(button) ? createButtonActionRunner(button) : null;
+  const runner = freshRunner || existing.runner;
 
   if (!runner) {
     return null;
   }
 
-  const existing = learnedAutomationActions.get(id) || {};
   const cost = parseButtonCost(button) || existing.cost || null;
   const action = Object.assign({}, existing, {
     id,
@@ -169,7 +261,7 @@ function learnAutomationAction(button) {
     cost,
     element: button,
     runner,
-    source: runner.source,
+    source: freshRunner ? freshRunner.source : existing.source || runner.source,
     lastSeenAt: Date.now(),
   });
 
@@ -249,6 +341,328 @@ function getLearnedAutomationSummary(config = loadConfig()) {
   };
 }
 
+function isLearnedResetActionVisible(action) {
+  return action.element && document.contains(action.element) && isVisible(action.element);
+}
+
+function getAutoResetThresholdLog10(value) {
+  const parsed = parseDisplayedNumber(value);
+
+  if (!parsed || parsed.zero || !Number.isFinite(parsed.log10)) {
+    return null;
+  }
+
+  return parsed.log10;
+}
+
+function getAutoResetTimeThresholdSeconds(config) {
+  const seconds = Number(config.timeThresholdSeconds);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+}
+
+function getAutoResetTriggerValue(resourceConfig) {
+  if (resourceConfig.mode === "time") {
+    return `${resourceConfig.timeThresholdSeconds}s / >= ${resourceConfig.timeMinMultiplierThreshold}x`;
+  }
+
+  if (resourceConfig.mode === "amount") {
+    return String(resourceConfig.amountThreshold);
+  }
+
+  if (resourceConfig.mode === "hybrid") {
+    return `${resourceConfig.multiplierThreshold}x / ${resourceConfig.timeThresholdSeconds}s >= ${resourceConfig.timeMinMultiplierThreshold}x`;
+  }
+
+  return String(resourceConfig.multiplierThreshold);
+}
+
+function removeStatusPrefix(statusText) {
+  return String(statusText || "").replace(/^状态：/, "");
+}
+
+function getAutoResetTimeMinMultiplierDecision(hint, resourceConfig) {
+  const thresholdLog10 = getAutoResetThresholdLog10(resourceConfig.timeMinMultiplierThreshold);
+
+  if (thresholdLog10 === null) {
+    return { ready: false, reason: "invalid-time-min-multiplier", statusText: "状态：时间保底倍率无效" };
+  }
+
+  if (!Number.isFinite(hint.ratioLog10)) {
+    return { ready: false, reason: "invalid-ratio", statusText: "状态：倍率无法计算" };
+  }
+
+  if (hint.ratioLog10 >= thresholdLog10) {
+    return {
+      ready: true,
+      reason: "time-min-multiplier",
+      statusText: `状态：当前 ${hint.ratio} 倍，满足保底 ${resourceConfig.timeMinMultiplierThreshold} 倍`,
+    };
+  }
+
+  return {
+    ready: false,
+    reason: "time-min-multiplier-wait",
+    statusText: `状态：时间已到，当前 ${hint.ratio} 倍 / 保底 ${resourceConfig.timeMinMultiplierThreshold} 倍`,
+  };
+}
+
+function getAutoResetTimeDecision(hint, resourceConfig, now) {
+  const thresholdSeconds = getAutoResetTimeThresholdSeconds(resourceConfig);
+  const lastResetAt = Number(resourceConfig.lastResetAt);
+
+  if (!thresholdSeconds) {
+    return { ready: false, reason: "invalid-time", statusText: "状态：时间阈值无效" };
+  }
+
+  if (!Number.isFinite(lastResetAt)) {
+    return { ready: false, reason: "missing-time-base", statusText: "状态：等待计时基准" };
+  }
+
+  const elapsedSeconds = Math.max(0, (now - lastResetAt) / 1000);
+  const remainingSeconds = thresholdSeconds - elapsedSeconds;
+
+  if (remainingSeconds <= 0) {
+    const minDecision = getAutoResetTimeMinMultiplierDecision(hint, resourceConfig);
+
+    if (!minDecision.ready) {
+      return minDecision;
+    }
+
+    return {
+      ready: true,
+      reason: "time",
+      statusText: `状态：已满 ${formatDuration(Math.log10(Math.max(thresholdSeconds, 1e-9)))}，${removeStatusPrefix(minDecision.statusText)}`,
+    };
+  }
+
+  return {
+    ready: false,
+    reason: "time-wait",
+    statusText: `状态：还需 ${formatDuration(Math.log10(Math.max(remainingSeconds, 1e-9)))}`,
+  };
+}
+
+function getAutoResetAmountDecision(hint, resourceConfig, resourceLabel) {
+  const thresholdLog10 = getAutoResetThresholdLog10(resourceConfig.amountThreshold);
+
+  if (thresholdLog10 === null) {
+    return { ready: false, reason: "invalid-amount", statusText: "状态：定额阈值无效" };
+  }
+
+  if (hint.gainedLog10 >= thresholdLog10) {
+    return {
+      ready: true,
+      reason: "amount",
+      statusText: `状态：可获 ${hint.gained} ${resourceLabel}，已达标`,
+    };
+  }
+
+  return {
+    ready: false,
+    reason: "amount-wait",
+    statusText: `状态：可获 ${hint.gained} ${resourceLabel} / 目标 ${resourceConfig.amountThreshold} ${resourceLabel}`,
+  };
+}
+
+function getAutoResetMultiplierDecision(hint, resourceConfig) {
+  const thresholdLog10 = getAutoResetThresholdLog10(resourceConfig.multiplierThreshold);
+
+  if (thresholdLog10 === null) {
+    return { ready: false, reason: "invalid-threshold", statusText: "状态：倍率阈值无效" };
+  }
+
+  if (!Number.isFinite(hint.ratioLog10)) {
+    return { ready: false, reason: "invalid-ratio", statusText: "状态：倍率无法计算" };
+  }
+
+  if (hint.ratioLog10 >= thresholdLog10) {
+    return {
+      ready: true,
+      reason: "multiplier",
+      statusText: `状态：当前 ${hint.ratio} 倍，已达标`,
+    };
+  }
+
+  return {
+    ready: false,
+    reason: "multiplier-wait",
+    statusText: `状态：当前 ${hint.ratio} 倍 / 目标 ${resourceConfig.multiplierThreshold} 倍`,
+  };
+}
+
+function getAutoResetHybridDecision(hint, resourceConfig, now) {
+  const multiplierDecision = getAutoResetMultiplierDecision(hint, resourceConfig);
+  const timeDecision = getAutoResetTimeDecision(hint, resourceConfig, now);
+
+  if (multiplierDecision.ready) {
+    return {
+      ready: true,
+      reason: "hybrid-multiplier",
+      statusText: `状态：混合触发，${removeStatusPrefix(multiplierDecision.statusText)}`,
+    };
+  }
+
+  if (timeDecision.ready) {
+    return {
+      ready: true,
+      reason: "hybrid-time",
+      statusText: `状态：混合触发，${removeStatusPrefix(timeDecision.statusText)}`,
+    };
+  }
+
+  if (multiplierDecision.reason === "invalid-threshold"
+    && (timeDecision.reason === "invalid-time"
+      || timeDecision.reason === "invalid-time-min-multiplier")) {
+    return { ready: false, reason: "invalid-hybrid", statusText: "状态：倍率或时间条件无效" };
+  }
+
+  return {
+    ready: false,
+    reason: "hybrid-wait",
+    statusText: `状态：${removeStatusPrefix(multiplierDecision.statusText)}；${removeStatusPrefix(timeDecision.statusText)}`,
+  };
+}
+
+function getAutoResetDecision(action, config = loadConfig(), now = Date.now()) {
+  const resourceConfig = getAutoResetResourceConfig(action.resourceKey, config);
+  const hint = action.hint;
+  const resourceLabel = action.resourceLabel || hint?.resourceLabel || action.resourceKey;
+
+  if (!resourceConfig) {
+    return { ready: false, reason: "unsupported", statusText: "状态：不支持该资源" };
+  }
+
+  if (!config.autoResetEnabled) {
+    return { ready: false, reason: "global-disabled", statusText: "状态：总开关关闭" };
+  }
+
+  if (!resourceConfig.enabled) {
+    return { ready: false, reason: "disabled", statusText: "状态：未开启" };
+  }
+
+  if (!hint || !Number.isFinite(hint.gainedLog10)) {
+    return { ready: false, reason: "missing-gain", statusText: "状态：无法判断收益" };
+  }
+
+  if (hint.gainedLog10 === Number.NEGATIVE_INFINITY) {
+    return { ready: false, reason: "zero-gain", statusText: "状态：收益为 0" };
+  }
+
+  const autoResetConfig = getAutoResetConfig(config);
+  const lastAutoResetAt = Math.max(
+    ...Object.values(autoResetConfig)
+      .map((resource) => Number(resource.lastAutoResetAt))
+      .filter((value) => Number.isFinite(value)),
+    Number.NEGATIVE_INFINITY,
+  );
+  const configuredCooldownMs = Number(config.autoResetCooldownMs);
+  const cooldownMs = Number.isFinite(configuredCooldownMs) && configuredCooldownMs >= 0
+    ? configuredCooldownMs
+    : defaultConfig.autoResetCooldownMs;
+
+  if (cooldownMs > 0 && Number.isFinite(lastAutoResetAt) && now - lastAutoResetAt < cooldownMs) {
+    const remainingSeconds = Math.max((cooldownMs - (now - lastAutoResetAt)) / 1000, 1e-9);
+    return {
+      ready: false,
+      reason: "cooldown",
+      statusText: `状态：防重复冷却 ${formatDuration(Math.log10(remainingSeconds))}`,
+    };
+  }
+
+  if (isLearnedResetActionVisible(action) && action.element && !isClickablePrimary(action.element)) {
+    return { ready: false, reason: "disabled-button", statusText: "状态：按钮不可用" };
+  }
+
+  if (resourceConfig.mode === "time") {
+    return getAutoResetTimeDecision(hint, resourceConfig, now);
+  }
+
+  if (resourceConfig.mode === "amount") {
+    return getAutoResetAmountDecision(hint, resourceConfig, resourceLabel);
+  }
+
+  if (resourceConfig.mode === "hybrid") {
+    return getAutoResetHybridDecision(hint, resourceConfig, now);
+  }
+
+  return getAutoResetMultiplierDecision(hint, resourceConfig);
+}
+
+function getAutoResetDecisionForHint(hint, config = loadConfig()) {
+  return getAutoResetDecision({
+    resourceKey: hint.resourceKey,
+    resourceLabel: hint.resourceLabel,
+    hint: serializeResetHint(hint),
+    element: hint.button,
+  }, config);
+}
+
+function getAutoResetDecisionForResource(resourceKey, config = loadConfig()) {
+  const resourceConfig = getAutoResetResourceConfig(resourceKey, config);
+  const option = getAutoResetResourceOption(resourceKey);
+
+  if (!resourceConfig || !option) {
+    return { ready: false, reason: "unsupported", statusText: "状态：不支持该资源" };
+  }
+
+  if (!config.autoResetEnabled) {
+    return { ready: false, reason: "global-disabled", statusText: "状态：总开关关闭" };
+  }
+
+  const action = learnedResetActions.get(`reset:${resourceKey}`);
+
+  if (action) {
+    return getAutoResetDecision(action, config);
+  }
+
+  if (!resourceConfig.enabled) {
+    return { ready: false, reason: "disabled", statusText: "状态：未开启" };
+  }
+
+  return { ready: false, reason: "missing-action", statusText: "状态：等待识别重置按钮" };
+}
+
+function getAutoResetActions(config = loadConfig()) {
+  if (!config.autoResetEnabled) {
+    return [];
+  }
+
+  return Array.from(learnedResetActions.values())
+    .filter((action) => action.runner && typeof action.runner.run === "function")
+    .filter((action) => isAutoResetResourceSupported(action.resourceKey))
+    .map((action) => ({
+      action,
+      decision: getAutoResetDecision(action, config),
+    }))
+    .filter((entry) => entry.decision.ready);
+}
+
+function getAutoResetSummary(config = loadConfig()) {
+  const all = Array.from(learnedResetActions.values());
+  const ready = getAutoResetActions(config);
+  const autoResetConfig = getAutoResetConfig(config);
+
+  return {
+    total: all.length,
+    ready: ready.length,
+    enabled: Object.values(autoResetConfig).filter((resource) => resource.enabled).length,
+    actions: all.map((action) => {
+      const decision = getAutoResetDecision(action, config);
+      return {
+        id: action.id,
+        resourceKey: action.resourceKey,
+        resourceLabel: action.resourceLabel,
+        source: action.source,
+        visible: isLearnedResetActionVisible(action),
+        ready: decision.ready,
+        reason: decision.reason,
+        statusText: decision.statusText,
+        hint: action.hint,
+      };
+    }),
+  };
+}
+
 function isAutoSpendAllowed(button, config = loadConfig()) {
   const cost = parseButtonCost(button);
   return !cost || isSpendResourceAllowed(cost.resourceKey, config);
@@ -270,6 +684,7 @@ function scan(config = loadConfig()) {
   const rawBuyableCompost = getBuyableCompostButtons();
   const buyableCompost = filterAutoSpendAllowed(rawBuyableCompost, config);
   const resetHints = getResetRatioHints();
+  learnResetActions(resetHints);
   const leafTimeHint = getLeafTimeHint();
 
   return {
@@ -301,6 +716,7 @@ function scan(config = loadConfig()) {
       ? (({ element, ...hint }) => hint)(leafTimeHint)
       : null,
     background: getLearnedAutomationSummary(config),
+    autoReset: getAutoResetSummary(config),
   };
 }
 
@@ -312,15 +728,19 @@ function emptyClickSummary() {
   };
 }
 
-function createClickSummary(upgrades, compost, cellLab, background, resetHints, reason) {
+function createClickSummary(upgrades, compost, cellLab, background, autoReset, resetHints, reason) {
   return {
-    candidates: upgrades.candidates + compost.candidates + cellLab.candidates + background.candidates,
-    clicked: upgrades.clicked + compost.clicked + cellLab.clicked + background.clicked,
-    skipped: upgrades.skipped + compost.skipped + cellLab.skipped + background.skipped,
+    candidates: upgrades.candidates + compost.candidates + cellLab.candidates
+      + background.candidates + autoReset.candidates,
+    clicked: upgrades.clicked + compost.clicked + cellLab.clicked + background.clicked
+      + autoReset.clicked,
+    skipped: upgrades.skipped + compost.skipped + cellLab.skipped + background.skipped
+      + autoReset.skipped,
     upgrades,
     compost,
     cellLab,
     background,
+    autoReset,
     resetHints,
     reason,
   };
@@ -328,6 +748,7 @@ function createClickSummary(upgrades, compost, cellLab, background, resetHints, 
 
 function createIdleClickSummary(reason) {
   return createClickSummary(
+    emptyClickSummary(),
     emptyClickSummary(),
     emptyClickSummary(),
     emptyClickSummary(),
@@ -442,6 +863,65 @@ function clickBackgroundActions(config) {
   };
 }
 
+function markAutoResetTriggered(action, decision) {
+  const config = loadConfig();
+  const autoReset = getAutoResetConfig(config);
+  const resource = autoReset[action.resourceKey];
+
+  if (!resource) {
+    return;
+  }
+
+  const now = Date.now();
+  autoReset[action.resourceKey] = Object.assign({}, autoReset[action.resourceKey], {
+    lastResetAt: now,
+    lastAutoResetAt: now,
+    lastTrigger: {
+      at: now,
+      mode: resource.mode,
+      reason: decision.reason,
+      value: getAutoResetTriggerValue(resource),
+      ratio: action.hint?.ratio || null,
+      gained: action.hint?.gained || null,
+    },
+  });
+  updateConfig({ autoReset });
+}
+
+function clickAutoResetActions(config) {
+  const initialCandidates = getAutoResetActions(config);
+  const limit = readLimit(config.maxAutoResetsPerTick, defaultConfig.maxAutoResetsPerTick);
+  const clickedIds = new Set();
+  let clicked = 0;
+
+  for (let i = 0; i < limit; i += 1) {
+    const candidates = getAutoResetActions(loadConfig())
+      .filter(({ action }) => !clickedIds.has(action.id));
+    const entry = candidates[0];
+
+    if (!entry) {
+      break;
+    }
+
+    const { action, decision } = entry;
+
+    if (config.logClicks) {
+      log("auto-reset", action.resourceKey, decision.reason, action.hint);
+    }
+
+    action.runner.run();
+    markAutoResetTriggered(action, decision);
+    clickedIds.add(action.id);
+    clicked += 1;
+  }
+
+  return {
+    candidates: initialCandidates.length,
+    clicked,
+    skipped: Math.max(0, initialCandidates.length - clicked),
+  };
+}
+
 function runPurchaseTick(config = loadConfig()) {
   if (!document.querySelector("#app")) {
     lastPurchaseSummary = createIdleClickSummary("Waiting for app");
@@ -459,13 +939,16 @@ function runPurchaseTick(config = loadConfig()) {
   }
 
   learnVisibleAutomationActions();
+  const resetHints = getResetRatioHints();
+  learnResetActions(resetHints);
 
   const upgrades = config.autoUpgrades ? clickBuyableUpgrades(config) : emptyClickSummary();
   const compost = config.autoCompost ? clickBuyableCompost(config) : emptyClickSummary();
   const cellLab = config.autoCellLab ? clickBuyableCellLab(config) : emptyClickSummary();
   const background = config.backgroundAutomation ? clickBackgroundActions(config) : emptyClickSummary();
+  const autoReset = clickAutoResetActions(config);
 
-  lastPurchaseSummary = createClickSummary(upgrades, compost, cellLab, background, [], "Buy mode");
+  lastPurchaseSummary = createClickSummary(upgrades, compost, cellLab, background, autoReset, [], "Buy mode");
   return lastPurchaseSummary;
 }
 
@@ -473,11 +956,12 @@ function summarizeScanOnly(scanResult, reason) {
   const upgradeCandidates = scanResult.upgrades.buyable.length;
   const compostCandidates = scanResult.compost.buyable.length;
   const cellLabCandidates = scanResult.cellLab.buyable.length;
+  const autoResetCandidates = scanResult.autoReset.ready;
 
   return {
-    candidates: upgradeCandidates + compostCandidates + cellLabCandidates,
+    candidates: upgradeCandidates + compostCandidates + cellLabCandidates + autoResetCandidates,
     clicked: 0,
-    skipped: upgradeCandidates + compostCandidates + cellLabCandidates,
+    skipped: upgradeCandidates + compostCandidates + cellLabCandidates + autoResetCandidates,
     upgrades: {
       candidates: upgradeCandidates,
       clicked: 0,
@@ -494,6 +978,11 @@ function summarizeScanOnly(scanResult, reason) {
       skipped: cellLabCandidates,
     },
     background: emptyClickSummary(),
+    autoReset: {
+      candidates: autoResetCandidates,
+      clicked: 0,
+      skipped: autoResetCandidates,
+    },
     resetHints: scanResult.resetHints,
     reason,
   };
@@ -508,6 +997,7 @@ function summarizeBuyMode(scanResult) {
 
 function createWaitingSummary() {
   return createClickSummary(
+    emptyClickSummary(),
     emptyClickSummary(),
     emptyClickSummary(),
     emptyClickSummary(),
@@ -580,9 +1070,10 @@ function runAutomation(config = loadConfig()) {
   const compost = config.autoCompost ? clickBuyableCompost(config) : emptyClickSummary();
   const cellLab = config.autoCellLab ? clickBuyableCellLab(config) : emptyClickSummary();
   const background = config.backgroundAutomation ? clickBackgroundActions(config) : emptyClickSummary();
+  const autoReset = clickAutoResetActions(config);
 
-  lastPurchaseSummary = createClickSummary(upgrades, compost, cellLab, background, [], "Buy mode");
-  lastSummary = createClickSummary(upgrades, compost, cellLab, background, scanResult.resetHints, "Buy mode");
+  lastPurchaseSummary = createClickSummary(upgrades, compost, cellLab, background, autoReset, [], "Buy mode");
+  lastSummary = createClickSummary(upgrades, compost, cellLab, background, autoReset, scanResult.resetHints, "Buy mode");
   renderPanel(config);
   return lastSummary;
 }

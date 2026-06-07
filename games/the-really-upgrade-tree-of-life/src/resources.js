@@ -193,7 +193,65 @@ function parseProductionRate(value) {
   };
 }
 
-function parseResetGain(button) {
+function getResetResourceFromButton(button) {
+  const resourceMap = {
+    seeds: { key: "seeds", label: "种子" },
+    fruits: { key: "fruits", label: "水果" },
+    entropy: { key: "entropy", label: "熵" },
+    roots: { key: "roots", label: "根" },
+  };
+  const dataResource = button.dataset.resetResource;
+
+  if (dataResource && resourceMap[dataResource]) {
+    return resourceMap[dataResource];
+  }
+
+  const classMap = [
+    ["upgrade-S", { key: "seeds", label: "种子" }],
+    ["upgrade-F", { key: "fruits", label: "水果" }],
+    ["upgrade-E", { key: "entropy", label: "熵" }],
+    ["upgrade-RO", { key: "roots", label: "根" }],
+  ];
+
+  for (const [className, resource] of classMap) {
+    if (button.classList.contains(className)) {
+      return resource;
+    }
+  }
+
+  return null;
+}
+
+function parseLastDisplayedAmountFromText(text) {
+  const normalized = normalizeText(text);
+  const matches = Array.from(normalized.matchAll(new RegExp(
+    `(∞|inf(?:inity)?|[+\\-]?${decimalNumberSource}(?:[eE][+\\-]?[\\d,.]+|\\s*[A-Za-z-]+)?)`,
+    "gi",
+  )))
+    .map((match) => normalizeText(match[1]))
+    .map((amountText) => ({
+      amountText,
+      amount: parseDisplayedNumber(amountText),
+    }))
+    .filter((entry) => entry.amount);
+
+  return matches[matches.length - 1] || null;
+}
+
+function parseResetGainAmountFromButton(button) {
+  const boldAmounts = Array.from(button.querySelectorAll("b"))
+    .map((element) => normalizeText(element.textContent))
+    .map((text) => ({
+      amountText: text,
+      amount: parseDisplayedNumber(text),
+    }))
+    .filter((entry) => entry.amount);
+
+  return boldAmounts[boldAmounts.length - 1]
+    || parseLastDisplayedAmountFromText(button.textContent);
+}
+
+function parseTextualResetGain(button) {
   const text = normalizeText(button.textContent);
   const match = text.match(/(?:获得|gain)\s+(.+)/i);
 
@@ -209,6 +267,26 @@ function parseResetGain(button) {
 
   const resourceName = normalizeText(parsed.tail).replace(/[，。,.].*$/, "");
   const resource = normalizeResourceName(resourceName);
+
+  return {
+    amount: parsed.amount,
+    amountText: parsed.amountText,
+    resourceKey: resource.key,
+    resourceLabel: resource.label,
+  };
+}
+
+function parseResetGain(button) {
+  if (!button.classList.contains("layer-reset-button")) {
+    return parseTextualResetGain(button);
+  }
+
+  const resource = getResetResourceFromButton(button);
+  const parsed = parseResetGainAmountFromButton(button);
+
+  if (!resource || !parsed) {
+    return null;
+  }
 
   return {
     amount: parsed.amount,

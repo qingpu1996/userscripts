@@ -11,7 +11,9 @@ function ensureStyles() {
       right: 12px;
       top: 12px;
       z-index: 999999;
-      width: 236px;
+      width: 278px;
+      max-height: calc(100vh - 24px);
+      overflow-y: auto;
       box-sizing: border-box;
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 12px;
@@ -211,6 +213,44 @@ function ensureStyles() {
       font-size: 11px;
       line-height: 1.35;
     }
+    #${PANEL_ID} .trutol-section {
+      display: grid;
+      gap: 6px;
+      margin-top: 10px;
+      padding-top: 9px;
+      border-top: 1px solid rgba(148, 163, 184, 0.18);
+    }
+    #${PANEL_ID} .trutol-section-label {
+      color: #cbd5e1;
+      font-weight: 700;
+    }
+    #${PANEL_ID} .trutol-auto-reset-panel {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+    #${PANEL_ID} .trutol-auto-reset-master {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 5px 7px;
+      border-radius: 6px;
+      color: #14532d;
+      background: rgba(187, 247, 208, 0.46);
+      border: 1px solid rgba(34, 197, 94, 0.28);
+      font-size: 11px;
+      font-weight: 700;
+    }
+    #${PANEL_ID} .trutol-auto-reset-panel .trutol-auto-reset-config {
+      width: 100%;
+      min-width: 0;
+      max-width: none;
+      margin: 0;
+    }
+    #${PANEL_ID} .trutol-auto-reset-panel .trutol-auto-reset-row {
+      justify-content: space-between;
+    }
     .${RESET_HINT_CLASS},
     .${LEAF_HINT_CLASS} {
       width: fit-content;
@@ -229,6 +269,84 @@ function ensureStyles() {
     }
     .${RESET_HINT_CLASS} + .${RESET_HINT_CLASS} {
       margin-top: -2px;
+    }
+    .${AUTO_RESET_HINT_CLASS} {
+      margin: 3px auto 7px;
+    }
+    .trutol-auto-reset-config {
+      display: grid;
+      gap: 4px;
+      width: fit-content;
+      min-width: 226px;
+      max-width: min(360px, 92vw);
+      padding: 5px 7px;
+      border-radius: 6px;
+      color: #14532d;
+      background: rgba(187, 247, 208, 0.58);
+      border: 1px solid rgba(34, 197, 94, 0.32);
+      font-size: 11px;
+      line-height: 1.2;
+    }
+    .trutol-auto-reset-config .trutol-auto-reset-row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+    }
+    .trutol-auto-reset-config .trutol-auto-reset-title {
+      min-width: 54px;
+      font-weight: 700;
+      text-align: left;
+    }
+    .trutol-auto-reset-config .trutol-auto-reset-field {
+      min-width: 28px;
+      font-weight: 700;
+      text-align: left;
+    }
+    .trutol-auto-reset-config button,
+    .trutol-auto-reset-config input,
+    .trutol-auto-reset-config select {
+      height: 22px;
+      border: 1px solid rgba(21, 128, 61, 0.34);
+      border-radius: 5px;
+      font: inherit;
+      font-size: 11px;
+    }
+    .trutol-auto-reset-config button {
+      min-width: 34px;
+      padding: 0 7px;
+      color: #166534;
+      background: rgba(240, 253, 244, 0.74);
+      cursor: pointer;
+      font-weight: 700;
+    }
+    .trutol-auto-reset-config button.is-on,
+    .trutol-auto-reset-config button.is-active {
+      color: #052e16;
+      background: #86efac;
+      border-color: rgba(22, 101, 52, 0.45);
+    }
+    .trutol-auto-reset-config .trutol-auto-reset-input {
+      width: 76px;
+      min-width: 0;
+      padding: 0 5px;
+      color: #052e16;
+      background: rgba(240, 253, 244, 0.82);
+    }
+    .trutol-auto-reset-config .trutol-auto-reset-unit {
+      width: 48px;
+      padding: 0 3px;
+      color: #052e16;
+      background: rgba(240, 253, 244, 0.82);
+    }
+    .trutol-auto-reset-config .trutol-auto-reset-suffix {
+      width: 30px;
+      text-align: left;
+      font-weight: 700;
+    }
+    .trutol-auto-reset-config .trutol-auto-reset-status {
+      text-align: center;
+      color: #166534;
     }
     .${LEAF_HINT_CLASS} {
       position: absolute !important;
@@ -328,6 +446,48 @@ function createControlRow(labelText, control, options = {}) {
   row.appendChild(control);
 
   return row;
+}
+
+function createPanelSection(labelText, content) {
+  const section = document.createElement("div");
+  section.className = "trutol-section";
+
+  const label = document.createElement("div");
+  label.className = "trutol-section-label";
+  label.textContent = labelText;
+
+  section.appendChild(label);
+  section.appendChild(content);
+  return section;
+}
+
+function createAutoResetPanelGrid() {
+  const wrapper = document.createElement("div");
+  wrapper.className = "trutol-auto-reset-panel";
+  const nodes = {};
+
+  const masterRow = document.createElement("div");
+  masterRow.className = "trutol-auto-reset-master";
+
+  const masterLabel = document.createElement("span");
+  masterLabel.textContent = "总开关";
+
+  const masterSwitch = createSwitch(() => {
+    const config = loadConfig();
+    updateConfig({ autoResetEnabled: !config.autoResetEnabled });
+  });
+
+  masterRow.appendChild(masterLabel);
+  masterRow.appendChild(masterSwitch);
+  wrapper.appendChild(masterRow);
+
+  for (const option of autoResetResourceOptions) {
+    const node = createAutoResetNode(option.key, { inline: false });
+    nodes[option.key] = node;
+    wrapper.appendChild(node);
+  }
+
+  return { wrapper, nodes, masterSwitch };
 }
 
 function createStatRow(labelText, valueText) {
@@ -454,10 +614,12 @@ function ensurePanel() {
     const config = loadConfig();
     updateConfig({ backgroundAutomation: !config.backgroundAutomation });
   });
+  const autoResetPanel = createAutoResetPanelGrid();
 
   panelBody.appendChild(createControlRow("开关", enabledSwitch));
   panelBody.appendChild(createControlRow("模式", modeControl.wrapper));
   panelBody.appendChild(createControlRow("速度", speedControl.wrapper));
+  panelBody.appendChild(createPanelSection("重置", autoResetPanel.wrapper));
   panelBody.appendChild(createControlRow("花费", spendControl.wrapper, { alignTop: true }));
   panelBody.appendChild(createControlRow("堆肥", compostSwitch));
   panelBody.appendChild(createControlRow("细胞", cellLabSwitch));
@@ -489,6 +651,8 @@ function ensurePanel() {
     compostSwitch,
     cellLabSwitch,
     backgroundSwitch,
+    autoResetMasterSwitch: autoResetPanel.masterSwitch,
+    autoResetNodes: autoResetPanel.nodes,
   };
 
   document.documentElement.appendChild(panel);
@@ -515,9 +679,13 @@ function renderPanel(config = loadConfig()) {
   setSwitchState(controlRefs.compostSwitch, config.autoCompost);
   setSwitchState(controlRefs.cellLabSwitch, config.autoCellLab);
   setSwitchState(controlRefs.backgroundSwitch, config.backgroundAutomation);
+  setSwitchState(controlRefs.autoResetMasterSwitch, config.autoResetEnabled);
   setSegmentedState(controlRefs.modeButtons, config.scanOnly ? "scan" : "buy");
   setSegmentedState(controlRefs.speedButtons, getSpeedMode(config));
   setResourceToggleState(controlRefs.spendButtons, config);
+  for (const node of Object.values(controlRefs.autoResetNodes || {})) {
+    updateAutoResetNode(node);
+  }
 
   controlRefs.badge.textContent = config.enabled ? "开" : "关";
   controlRefs.badge.style.color = config.enabled ? "#a7f3d0" : "#cbd5e1";
@@ -533,6 +701,7 @@ function renderPanel(config = loadConfig()) {
     createStatRow("堆肥", `${lastSummary.compost.candidates}/${lastSummary.compost.clicked}`),
     createStatRow("细胞", `${lastSummary.cellLab.candidates}/${lastSummary.cellLab.clicked}`),
     createStatRow("后台", `${lastSummary.background.candidates}/${lastSummary.background.clicked}`),
+    createStatRow("重置", `${lastSummary.autoReset.candidates}/${lastSummary.autoReset.clicked}`),
     createStatRow("速度", formatSpeedMode(config)),
     createStatRow("状态", formatReason(lastSummary.reason)),
   );

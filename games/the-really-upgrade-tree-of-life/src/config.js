@@ -4,6 +4,7 @@ const STYLE_ID = "trutol-helper-style";
 const LOG_PREFIX = "[TRUTOL Helper]";
 const RESET_HINT_CLASS = "trutol-inline-reset-hint";
 const LEAF_HINT_CLASS = "trutol-inline-leaf-hint";
+const AUTO_RESET_HINT_CLASS = "trutol-inline-auto-reset";
 
 const minBuyTickMs = 20;
 const minStatusTickMs = 250;
@@ -22,9 +23,53 @@ const spendResourceOptions = [
   { key: "other", label: "其他", defaultAllowed: false },
 ];
 
+const autoResetResourceOptions = [
+  {
+    key: "seeds",
+    label: "种子",
+    defaultMultiplierThreshold: "100",
+    defaultAmountThreshold: "1e6",
+    defaultTimeThresholdSeconds: 600,
+    defaultTimeMinMultiplierThreshold: "1",
+  },
+  {
+    key: "fruits",
+    label: "水果",
+    defaultMultiplierThreshold: "100",
+    defaultAmountThreshold: "1e5",
+    defaultTimeThresholdSeconds: 600,
+    defaultTimeMinMultiplierThreshold: "1",
+  },
+  {
+    key: "entropy",
+    label: "熵",
+    defaultMultiplierThreshold: "10",
+    defaultAmountThreshold: "1",
+    defaultTimeThresholdSeconds: 1800,
+    defaultTimeMinMultiplierThreshold: "1",
+  },
+];
+
 function createDefaultSpendResources() {
   return Object.fromEntries(
     spendResourceOptions.map((option) => [option.key, option.defaultAllowed]),
+  );
+}
+
+function createDefaultAutoResetConfig() {
+  return Object.fromEntries(
+    autoResetResourceOptions.map((option) => [option.key, {
+      enabled: false,
+      mode: "multiplier",
+      multiplierThreshold: option.defaultMultiplierThreshold,
+      amountThreshold: option.defaultAmountThreshold,
+      timeThresholdSeconds: option.defaultTimeThresholdSeconds,
+      timeThresholdUnit: "minutes",
+      timeMinMultiplierThreshold: option.defaultTimeMinMultiplierThreshold,
+      enabledAt: null,
+      lastResetAt: null,
+      lastAutoResetAt: null,
+    }]),
   );
 }
 
@@ -66,6 +111,10 @@ const defaultConfig = {
   maxBackgroundUpgradeClicksPerTick: 3,
   maxBackgroundCompostClicksPerTick: 4,
   maxBackgroundCellLabClicksPerTick: 3,
+  maxAutoResetsPerTick: 1,
+  autoResetEnabled: true,
+  autoResetCooldownMs: 500,
+  autoReset: createDefaultAutoResetConfig(),
   logScans: false,
   logClicks: true,
 };
@@ -122,6 +171,11 @@ let lastPurchaseSummary = {
     clicked: 0,
     skipped: 0,
   },
+  autoReset: {
+    candidates: 0,
+    clicked: 0,
+    skipped: 0,
+  },
   reason: "Starting",
 };
 let lastSummary = {
@@ -148,6 +202,11 @@ let lastSummary = {
     clicked: 0,
     skipped: 0,
   },
+  autoReset: {
+    candidates: 0,
+    clicked: 0,
+    skipped: 0,
+  },
   resetHints: [],
   reason: "Starting",
 };
@@ -163,11 +222,19 @@ const reasonLabels = {
 function loadConfig() {
   const storedConfig = gmGetValue(CONFIG_KEY, {});
   const config = Object.assign({}, defaultConfig, storedConfig);
+  const storedCooldownMs = Number(storedConfig.autoResetCooldownMs);
+  if (storedConfig.autoResetCooldownMs === undefined
+    || storedConfig.autoResetCooldownMs === null
+    || storedCooldownMs === 5000
+    || !Number.isFinite(storedCooldownMs)) {
+    config.autoResetCooldownMs = defaultConfig.autoResetCooldownMs;
+  }
   config.spendResources = Object.assign(
     {},
     defaultConfig.spendResources,
     storedConfig.spendResources || {},
   );
+  config.autoReset = mergeAutoResetConfig(storedConfig.autoReset);
   return config;
 }
 
@@ -177,6 +244,9 @@ function saveConfig(config) {
 
 function updateConfig(nextConfig) {
   const config = Object.assign({}, loadConfig(), nextConfig);
+  if (nextConfig.autoReset) {
+    config.autoReset = mergeAutoResetConfig(nextConfig.autoReset);
+  }
   saveConfig(config);
 
   if (typeof restartLoops === "function") {
@@ -197,6 +267,57 @@ function formatReason(reason) {
 
 function getSpendResourceConfig(config = loadConfig()) {
   return Object.assign({}, defaultConfig.spendResources, config.spendResources || {});
+}
+
+function mergeAutoResetConfig(storedAutoReset = {}) {
+  const defaults = createDefaultAutoResetConfig();
+  const merged = {};
+
+  for (const option of autoResetResourceOptions) {
+    const storedResource = storedAutoReset?.[option.key] || {};
+    merged[option.key] = Object.assign({}, defaults[option.key], storedResource);
+    if (!["multiplier", "amount", "time", "hybrid"].includes(merged[option.key].mode)) {
+      merged[option.key].mode = defaults[option.key].mode;
+    }
+  }
+
+  return merged;
+}
+
+function getAutoResetResourceOption(resourceKey) {
+  return autoResetResourceOptions.find((option) => option.key === resourceKey) || null;
+}
+
+function isAutoResetResourceSupported(resourceKey) {
+  return Boolean(getAutoResetResourceOption(resourceKey));
+}
+
+function getAutoResetConfig(config = loadConfig()) {
+  return mergeAutoResetConfig(config.autoReset);
+}
+
+function getAutoResetResourceConfig(resourceKey, config = loadConfig()) {
+  return getAutoResetConfig(config)[resourceKey] || null;
+}
+
+function updateAutoResetResourceConfig(resourceKey, patch) {
+  if (!isAutoResetResourceSupported(resourceKey)) {
+    return loadConfig();
+  }
+
+  const config = loadConfig();
+  const autoReset = getAutoResetConfig(config);
+  const current = autoReset[resourceKey];
+  const now = Date.now();
+  const next = Object.assign({}, current, patch);
+
+  if (patch.enabled === true && !current.enabled) {
+    next.enabledAt = now;
+    next.lastResetAt = current.lastResetAt || now;
+  }
+
+  autoReset[resourceKey] = next;
+  return updateConfig({ autoReset });
 }
 
 function getSpendResourceKey(resourceKey) {

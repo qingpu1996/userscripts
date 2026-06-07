@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         The Really Upgrade Tree of Life Helper
 // @namespace    local.incremental.userscripts
-// @version      0.12.1
+// @version      0.13.0
 // @description  Conservative automation helper for The Really Upgrade Tree of Life.
 // @match        https://the-really-upgrade-tree-of-life.g8hh.com.cn/*
 // @grant        GM_getValue
@@ -376,6 +376,7 @@
   const LOG_PREFIX = "[TRUTOL Helper]";
   const RESET_HINT_CLASS = "trutol-inline-reset-hint";
   const LEAF_HINT_CLASS = "trutol-inline-leaf-hint";
+  const AUTO_RESET_HINT_CLASS = "trutol-inline-auto-reset";
 
   const minBuyTickMs = 20;
   const minStatusTickMs = 250;
@@ -394,9 +395,53 @@
     { key: "other", label: "其他", defaultAllowed: false },
   ];
 
+  const autoResetResourceOptions = [
+    {
+      key: "seeds",
+      label: "种子",
+      defaultMultiplierThreshold: "100",
+      defaultAmountThreshold: "1e6",
+      defaultTimeThresholdSeconds: 600,
+      defaultTimeMinMultiplierThreshold: "1",
+    },
+    {
+      key: "fruits",
+      label: "水果",
+      defaultMultiplierThreshold: "100",
+      defaultAmountThreshold: "1e5",
+      defaultTimeThresholdSeconds: 600,
+      defaultTimeMinMultiplierThreshold: "1",
+    },
+    {
+      key: "entropy",
+      label: "熵",
+      defaultMultiplierThreshold: "10",
+      defaultAmountThreshold: "1",
+      defaultTimeThresholdSeconds: 1800,
+      defaultTimeMinMultiplierThreshold: "1",
+    },
+  ];
+
   function createDefaultSpendResources() {
     return Object.fromEntries(
       spendResourceOptions.map((option) => [option.key, option.defaultAllowed]),
+    );
+  }
+
+  function createDefaultAutoResetConfig() {
+    return Object.fromEntries(
+      autoResetResourceOptions.map((option) => [option.key, {
+        enabled: false,
+        mode: "multiplier",
+        multiplierThreshold: option.defaultMultiplierThreshold,
+        amountThreshold: option.defaultAmountThreshold,
+        timeThresholdSeconds: option.defaultTimeThresholdSeconds,
+        timeThresholdUnit: "minutes",
+        timeMinMultiplierThreshold: option.defaultTimeMinMultiplierThreshold,
+        enabledAt: null,
+        lastResetAt: null,
+        lastAutoResetAt: null,
+      }]),
     );
   }
 
@@ -438,6 +483,10 @@
     maxBackgroundUpgradeClicksPerTick: 3,
     maxBackgroundCompostClicksPerTick: 4,
     maxBackgroundCellLabClicksPerTick: 3,
+    maxAutoResetsPerTick: 1,
+    autoResetEnabled: true,
+    autoResetCooldownMs: 500,
+    autoReset: createDefaultAutoResetConfig(),
     logScans: false,
     logClicks: true,
   };
@@ -494,6 +543,11 @@
       clicked: 0,
       skipped: 0,
     },
+    autoReset: {
+      candidates: 0,
+      clicked: 0,
+      skipped: 0,
+    },
     reason: "Starting",
   };
   let lastSummary = {
@@ -520,6 +574,11 @@
       clicked: 0,
       skipped: 0,
     },
+    autoReset: {
+      candidates: 0,
+      clicked: 0,
+      skipped: 0,
+    },
     resetHints: [],
     reason: "Starting",
   };
@@ -535,11 +594,19 @@
   function loadConfig() {
     const storedConfig = gmGetValue(CONFIG_KEY, {});
     const config = Object.assign({}, defaultConfig, storedConfig);
+    const storedCooldownMs = Number(storedConfig.autoResetCooldownMs);
+    if (storedConfig.autoResetCooldownMs === undefined
+      || storedConfig.autoResetCooldownMs === null
+      || storedCooldownMs === 5000
+      || !Number.isFinite(storedCooldownMs)) {
+      config.autoResetCooldownMs = defaultConfig.autoResetCooldownMs;
+    }
     config.spendResources = Object.assign(
       {},
       defaultConfig.spendResources,
       storedConfig.spendResources || {},
     );
+    config.autoReset = mergeAutoResetConfig(storedConfig.autoReset);
     return config;
   }
 
@@ -549,6 +616,9 @@
 
   function updateConfig(nextConfig) {
     const config = Object.assign({}, loadConfig(), nextConfig);
+    if (nextConfig.autoReset) {
+      config.autoReset = mergeAutoResetConfig(nextConfig.autoReset);
+    }
     saveConfig(config);
 
     if (typeof restartLoops === "function") {
@@ -569,6 +639,57 @@
 
   function getSpendResourceConfig(config = loadConfig()) {
     return Object.assign({}, defaultConfig.spendResources, config.spendResources || {});
+  }
+
+  function mergeAutoResetConfig(storedAutoReset = {}) {
+    const defaults = createDefaultAutoResetConfig();
+    const merged = {};
+
+    for (const option of autoResetResourceOptions) {
+      const storedResource = storedAutoReset?.[option.key] || {};
+      merged[option.key] = Object.assign({}, defaults[option.key], storedResource);
+      if (!["multiplier", "amount", "time", "hybrid"].includes(merged[option.key].mode)) {
+        merged[option.key].mode = defaults[option.key].mode;
+      }
+    }
+
+    return merged;
+  }
+
+  function getAutoResetResourceOption(resourceKey) {
+    return autoResetResourceOptions.find((option) => option.key === resourceKey) || null;
+  }
+
+  function isAutoResetResourceSupported(resourceKey) {
+    return Boolean(getAutoResetResourceOption(resourceKey));
+  }
+
+  function getAutoResetConfig(config = loadConfig()) {
+    return mergeAutoResetConfig(config.autoReset);
+  }
+
+  function getAutoResetResourceConfig(resourceKey, config = loadConfig()) {
+    return getAutoResetConfig(config)[resourceKey] || null;
+  }
+
+  function updateAutoResetResourceConfig(resourceKey, patch) {
+    if (!isAutoResetResourceSupported(resourceKey)) {
+      return loadConfig();
+    }
+
+    const config = loadConfig();
+    const autoReset = getAutoResetConfig(config);
+    const current = autoReset[resourceKey];
+    const now = Date.now();
+    const next = Object.assign({}, current, patch);
+
+    if (patch.enabled === true && !current.enabled) {
+      next.enabledAt = now;
+      next.lastResetAt = current.lastResetAt || now;
+    }
+
+    autoReset[resourceKey] = next;
+    return updateConfig({ autoReset });
   }
 
   function getSpendResourceKey(resourceKey) {
@@ -897,7 +1018,65 @@
     };
   }
 
-  function parseResetGain(button) {
+  function getResetResourceFromButton(button) {
+    const resourceMap = {
+      seeds: { key: "seeds", label: "种子" },
+      fruits: { key: "fruits", label: "水果" },
+      entropy: { key: "entropy", label: "熵" },
+      roots: { key: "roots", label: "根" },
+    };
+    const dataResource = button.dataset.resetResource;
+
+    if (dataResource && resourceMap[dataResource]) {
+      return resourceMap[dataResource];
+    }
+
+    const classMap = [
+      ["upgrade-S", { key: "seeds", label: "种子" }],
+      ["upgrade-F", { key: "fruits", label: "水果" }],
+      ["upgrade-E", { key: "entropy", label: "熵" }],
+      ["upgrade-RO", { key: "roots", label: "根" }],
+    ];
+
+    for (const [className, resource] of classMap) {
+      if (button.classList.contains(className)) {
+        return resource;
+      }
+    }
+
+    return null;
+  }
+
+  function parseLastDisplayedAmountFromText(text) {
+    const normalized = normalizeText(text);
+    const matches = Array.from(normalized.matchAll(new RegExp(
+      `(∞|inf(?:inity)?|[+\\-]?${decimalNumberSource}(?:[eE][+\\-]?[\\d,.]+|\\s*[A-Za-z-]+)?)`,
+      "gi",
+    )))
+      .map((match) => normalizeText(match[1]))
+      .map((amountText) => ({
+        amountText,
+        amount: parseDisplayedNumber(amountText),
+      }))
+      .filter((entry) => entry.amount);
+
+    return matches[matches.length - 1] || null;
+  }
+
+  function parseResetGainAmountFromButton(button) {
+    const boldAmounts = Array.from(button.querySelectorAll("b"))
+      .map((element) => normalizeText(element.textContent))
+      .map((text) => ({
+        amountText: text,
+        amount: parseDisplayedNumber(text),
+      }))
+      .filter((entry) => entry.amount);
+
+    return boldAmounts[boldAmounts.length - 1]
+      || parseLastDisplayedAmountFromText(button.textContent);
+  }
+
+  function parseTextualResetGain(button) {
     const text = normalizeText(button.textContent);
     const match = text.match(/(?:获得|gain)\s+(.+)/i);
 
@@ -913,6 +1092,26 @@
 
     const resourceName = normalizeText(parsed.tail).replace(/[，。,.].*$/, "");
     const resource = normalizeResourceName(resourceName);
+
+    return {
+      amount: parsed.amount,
+      amountText: parsed.amountText,
+      resourceKey: resource.key,
+      resourceLabel: resource.label,
+    };
+  }
+
+  function parseResetGain(button) {
+    if (!button.classList.contains("layer-reset-button")) {
+      return parseTextualResetGain(button);
+    }
+
+    const resource = getResetResourceFromButton(button);
+    const parsed = parseResetGainAmountFromButton(button);
+
+    if (!resource || !parsed) {
+      return null;
+    }
 
     return {
       amount: parsed.amount,
@@ -1222,12 +1421,21 @@
         }
 
         const current = resources.get(gain.resourceKey);
+        const currentMissing = !current;
+        const currentWasZero = Boolean(current && current.amount.zero);
+        const ratioLog10 = currentMissing
+          ? null
+          : currentWasZero
+            ? gain.amount.log10
+            : gain.amount.log10 - current.amount.log10;
+        const ratio = ratioLog10 === null ? "无法计算" : formatRatio(ratioLog10);
         let ratioHint;
 
-        if (!current || current.amount.zero) {
-          ratioHint = `当前为 0，重置后可获得 ${gain.amountText} ${gain.resourceLabel}`;
+        if (currentMissing) {
+          ratioHint = `未显示当前${gain.resourceLabel}，无法计算倍率`;
+        } else if (currentWasZero) {
+          ratioHint = `当前为 0，按 1 计算，重置后可获得 ${ratio} 倍的${gain.resourceLabel}`;
         } else {
-          const ratio = formatRatio(gain.amount.log10 - current.amount.log10);
           ratioHint = `重置后可获得 ${ratio} 倍的${gain.resourceLabel}`;
         }
 
@@ -1238,9 +1446,17 @@
           button,
           text: normalizeText(button.textContent),
           classes: Array.from(button.classList),
+          resourceKey: gain.resourceKey,
           resource: gain.resourceLabel,
+          resourceLabel: gain.resourceLabel,
           gained: gain.amountText,
+          gainedLog10: gain.amount.log10,
           current: current?.display || "0",
+          currentLog10: currentMissing ? null : currentWasZero ? 0 : current.amount.log10,
+          currentMissing,
+          currentWasZero,
+          ratio,
+          ratioLog10,
           ratioHint,
           seedAffordabilityHint,
           hint,
@@ -1255,6 +1471,21 @@
     while (node && node.classList.contains(RESET_HINT_CLASS)) {
       if (node.dataset.trutolResetHint === type
         || (type === "ratio" && !node.dataset.trutolResetHint)) {
+        return node;
+      }
+
+      node = node.nextElementSibling;
+    }
+
+    return null;
+  }
+
+  function findAutoResetNode(button) {
+    let node = button.nextElementSibling;
+
+    while (node && (node.classList.contains(RESET_HINT_CLASS)
+      || node.classList.contains(AUTO_RESET_HINT_CLASS))) {
+      if (node.classList.contains(AUTO_RESET_HINT_CLASS)) {
         return node;
       }
 
@@ -1282,9 +1513,304 @@
     return hintNode;
   }
 
+  function getTimeUnitMultiplier(unit) {
+    if (unit === "hours") {
+      return 3600;
+    }
+
+    if (unit === "seconds") {
+      return 1;
+    }
+
+    return 60;
+  }
+
+  function formatSecondsForUnit(seconds, unit) {
+    const multiplier = getTimeUnitMultiplier(unit);
+    const value = Number(seconds) / multiplier;
+
+    if (!Number.isFinite(value) || value <= 0) {
+      return "";
+    }
+
+    return String(Number.isInteger(value) ? value : Number(value.toFixed(2)));
+  }
+
+  function createAutoResetModeButton(node, mode, label) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "trutol-auto-reset-mode";
+    button.textContent = label;
+    button.addEventListener("click", () => {
+      const resourceKey = node.dataset.resourceKey;
+      updateAutoResetResourceConfig(resourceKey, { mode });
+    });
+    return button;
+  }
+
+  function normalizeAutoResetMode(mode) {
+    return ["multiplier", "amount", "time", "hybrid"].includes(mode) ? mode : "multiplier";
+  }
+
+  function createAutoResetNode(resourceKey, options = {}) {
+    const node = document.createElement("div");
+    const inline = options.inline !== false;
+    node.className = inline
+      ? `${AUTO_RESET_HINT_CLASS} trutol-auto-reset-config`
+      : "trutol-auto-reset-config";
+    node.dataset.resourceKey = resourceKey;
+    node.dataset.trutolAutoResetPanel = inline ? "false" : "true";
+
+    const topRow = document.createElement("div");
+    topRow.className = "trutol-auto-reset-row";
+
+    const title = document.createElement("span");
+    title.className = "trutol-auto-reset-title";
+    title.textContent = "自动重置";
+
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "trutol-auto-reset-toggle";
+    toggle.addEventListener("click", () => {
+      const config = getAutoResetResourceConfig(resourceKey);
+      updateAutoResetResourceConfig(resourceKey, { enabled: !config.enabled });
+    });
+
+    topRow.appendChild(title);
+    topRow.appendChild(toggle);
+
+    const modeRow = document.createElement("div");
+    modeRow.className = "trutol-auto-reset-row";
+    const multiplierButton = createAutoResetModeButton(node, "multiplier", "倍率");
+    const amountButton = createAutoResetModeButton(node, "amount", "定额");
+    const timeButton = createAutoResetModeButton(node, "time", "时间");
+    const hybridButton = createAutoResetModeButton(node, "hybrid", "混合");
+    modeRow.appendChild(multiplierButton);
+    modeRow.appendChild(amountButton);
+    modeRow.appendChild(timeButton);
+    modeRow.appendChild(hybridButton);
+
+    const thresholdRow = document.createElement("div");
+    thresholdRow.className = "trutol-auto-reset-row";
+
+    const thresholdLabel = document.createElement("span");
+    thresholdLabel.className = "trutol-auto-reset-field";
+
+    const thresholdInput = document.createElement("input");
+    thresholdInput.className = "trutol-auto-reset-input";
+    thresholdInput.type = "text";
+    thresholdInput.inputMode = "decimal";
+    thresholdInput.addEventListener("change", () => {
+      const config = getAutoResetResourceConfig(resourceKey);
+      const mode = normalizeAutoResetMode(config.mode);
+
+      if (mode === "amount") {
+        updateAutoResetResourceConfig(resourceKey, {
+          amountThreshold: thresholdInput.value.trim() || "1",
+        });
+        return;
+      }
+
+      updateAutoResetResourceConfig(resourceKey, {
+        multiplierThreshold: thresholdInput.value.trim() || "1",
+      });
+    });
+
+    const thresholdSuffix = document.createElement("span");
+    thresholdSuffix.className = "trutol-auto-reset-suffix";
+
+    thresholdRow.appendChild(thresholdLabel);
+    thresholdRow.appendChild(thresholdInput);
+    thresholdRow.appendChild(thresholdSuffix);
+
+    const timeRow = document.createElement("div");
+    timeRow.className = "trutol-auto-reset-row";
+
+    const timeLabel = document.createElement("span");
+    timeLabel.className = "trutol-auto-reset-field";
+    timeLabel.textContent = "时间";
+
+    const timeInput = document.createElement("input");
+    timeInput.className = "trutol-auto-reset-input";
+    timeInput.type = "text";
+    timeInput.inputMode = "decimal";
+    timeInput.addEventListener("change", () => {
+      const config = getAutoResetResourceConfig(resourceKey);
+      const seconds = Number(timeInput.value) * getTimeUnitMultiplier(config.timeThresholdUnit);
+
+      if (Number.isFinite(seconds) && seconds > 0) {
+        updateAutoResetResourceConfig(resourceKey, { timeThresholdSeconds: seconds });
+      }
+    });
+
+    const unit = document.createElement("select");
+    unit.className = "trutol-auto-reset-unit";
+    [
+      ["seconds", "秒"],
+      ["minutes", "分"],
+      ["hours", "时"],
+    ].forEach(([value, label]) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      unit.appendChild(option);
+    });
+    unit.addEventListener("change", () => {
+      const config = getAutoResetResourceConfig(resourceKey);
+      const seconds = Number(timeInput.value) * getTimeUnitMultiplier(unit.value);
+      updateAutoResetResourceConfig(resourceKey, {
+        timeThresholdUnit: unit.value,
+        timeThresholdSeconds: Number.isFinite(seconds) && seconds > 0
+          ? seconds
+          : config.timeThresholdSeconds,
+      });
+    });
+
+    timeRow.appendChild(timeLabel);
+    timeRow.appendChild(timeInput);
+    timeRow.appendChild(unit);
+
+    const timeMinRow = document.createElement("div");
+    timeMinRow.className = "trutol-auto-reset-row";
+
+    const timeMinLabel = document.createElement("span");
+    timeMinLabel.className = "trutol-auto-reset-field";
+    timeMinLabel.textContent = "保底";
+
+    const timeMinInput = document.createElement("input");
+    timeMinInput.className = "trutol-auto-reset-input";
+    timeMinInput.type = "text";
+    timeMinInput.inputMode = "decimal";
+    timeMinInput.addEventListener("change", () => {
+      updateAutoResetResourceConfig(resourceKey, {
+        timeMinMultiplierThreshold: timeMinInput.value.trim() || "1",
+      });
+    });
+
+    const timeMinSuffix = document.createElement("span");
+    timeMinSuffix.className = "trutol-auto-reset-suffix";
+    timeMinSuffix.textContent = "倍";
+
+    timeMinRow.appendChild(timeMinLabel);
+    timeMinRow.appendChild(timeMinInput);
+    timeMinRow.appendChild(timeMinSuffix);
+
+    const status = document.createElement("div");
+    status.className = "trutol-auto-reset-status";
+
+    node.appendChild(topRow);
+    node.appendChild(modeRow);
+    node.appendChild(thresholdRow);
+    node.appendChild(timeRow);
+    node.appendChild(timeMinRow);
+    node.appendChild(status);
+
+    node._trutolAutoReset = {
+      title,
+      toggle,
+      multiplierButton,
+      amountButton,
+      timeButton,
+      hybridButton,
+      thresholdRow,
+      thresholdLabel,
+      thresholdInput,
+      thresholdSuffix,
+      timeRow,
+      timeInput,
+      unit,
+      timeMinRow,
+      timeMinInput,
+      timeMinSuffix,
+      status,
+    };
+
+    return node;
+  }
+
+  function updateAutoResetNode(node, hint = null) {
+    const refs = node._trutolAutoReset;
+    const resourceKey = hint?.resourceKey || node.dataset.resourceKey;
+    const config = getAutoResetResourceConfig(resourceKey);
+    const option = getAutoResetResourceOption(resourceKey);
+
+    if (!refs || !config || !option) {
+      return;
+    }
+
+    const mode = normalizeAutoResetMode(config.mode);
+    const isTimeMode = mode === "time";
+    const isAmountMode = mode === "amount";
+    const isHybridMode = mode === "hybrid";
+    refs.title.textContent = node.dataset.trutolAutoResetPanel === "true"
+      ? `${option.label}重置`
+      : "自动重置";
+    refs.toggle.textContent = config.enabled ? "开" : "关";
+    refs.toggle.classList.toggle("is-on", Boolean(config.enabled));
+    refs.multiplierButton.classList.toggle("is-active", mode === "multiplier");
+    refs.amountButton.classList.toggle("is-active", isAmountMode);
+    refs.timeButton.classList.toggle("is-active", isTimeMode);
+    refs.hybridButton.classList.toggle("is-active", isHybridMode);
+    refs.thresholdRow.style.display = isTimeMode ? "none" : "";
+    refs.timeRow.style.display = isTimeMode || isHybridMode ? "" : "none";
+    refs.timeMinRow.style.display = isTimeMode || isHybridMode ? "" : "none";
+    refs.thresholdLabel.textContent = isAmountMode ? "定额" : "倍率";
+    refs.thresholdSuffix.textContent = isAmountMode ? option.label : "倍";
+
+    if (document.activeElement !== refs.thresholdInput) {
+      refs.thresholdInput.value = isAmountMode
+          ? String(config.amountThreshold || "")
+          : String(config.multiplierThreshold || "");
+    }
+
+    if (document.activeElement !== refs.timeInput) {
+      refs.timeInput.value = formatSecondsForUnit(
+        config.timeThresholdSeconds,
+        config.timeThresholdUnit,
+      );
+    }
+
+    if (refs.unit.value !== config.timeThresholdUnit) {
+      refs.unit.value = config.timeThresholdUnit;
+    }
+
+    if (document.activeElement !== refs.timeMinInput) {
+      refs.timeMinInput.value = String(config.timeMinMultiplierThreshold || "1");
+    }
+
+    const status = hint && typeof getAutoResetDecisionForHint === "function"
+      ? getAutoResetDecisionForHint(hint, loadConfig())
+      : typeof getAutoResetDecisionForResource === "function"
+        ? getAutoResetDecisionForResource(resourceKey, loadConfig())
+        : null;
+    refs.status.textContent = status?.statusText || "状态：等待判断";
+  }
+
+  function upsertAutoResetNode(button, hint, afterElement) {
+    if (!isAutoResetResourceSupported(hint.resourceKey)) {
+      return null;
+    }
+
+    let node = findAutoResetNode(button);
+
+    if (!node) {
+      node = createAutoResetNode(hint.resourceKey, { inline: true });
+    }
+
+    node.dataset.resourceKey = hint.resourceKey;
+    updateAutoResetNode(node, hint);
+
+    if (node.previousElementSibling !== afterElement) {
+      afterElement.insertAdjacentElement("afterend", node);
+    }
+
+    return node;
+  }
+
   function updateInlineResetHints() {
     const hints = getResetRatioHints();
     const activeHints = new Set();
+    const activeAutoResetNodes = new Set();
 
     for (const hint of hints) {
       let afterElement = hint.button;
@@ -1298,9 +1824,17 @@
         activeHints.add(hintNode);
         afterElement = hintNode;
       }
+
+      const autoResetNode = upsertAutoResetNode(hint.button, hint, afterElement);
+
+      if (autoResetNode) {
+        activeAutoResetNodes.add(autoResetNode);
+        afterElement = autoResetNode;
+      }
     }
 
     removeInactiveHintNodes(RESET_HINT_CLASS, activeHints);
+    removeInactiveHintNodes(AUTO_RESET_HINT_CLASS, activeAutoResetNodes);
 
     return hints.map(({ button, ...hint }) => hint);
   }
@@ -1308,6 +1842,7 @@
   // Source: games/the-really-upgrade-tree-of-life/src/automation.js
 
   const learnedAutomationActions = new Map();
+  const learnedResetActions = new Map();
   const learnedAutomationCursors = {
     upgrade: 0,
     compost: 0,
@@ -1427,13 +1962,38 @@
     return null;
   }
 
+  function getVueClickHandlerSnapshot(invoker) {
+    const handler = invoker?.value || invoker;
+
+    if (Array.isArray(handler)) {
+      const handlers = handler.filter((item) => typeof item === "function");
+      return handlers.length > 0 ? handlers.slice() : null;
+    }
+
+    return typeof handler === "function" ? handler : null;
+  }
+
+  function runVueClickHandlerSnapshot(button, handler) {
+    const event = createSyntheticClickEvent(button);
+
+    if (Array.isArray(handler)) {
+      for (const item of handler) {
+        item.call(button, event);
+      }
+      return;
+    }
+
+    handler.call(button, event);
+  }
+
   function createButtonActionRunner(button) {
     const vueInvoker = getVueClickInvoker(button);
+    const vueHandler = vueInvoker ? getVueClickHandlerSnapshot(vueInvoker) : null;
 
-    if (vueInvoker) {
+    if (vueHandler) {
       return {
         source: "vue",
-        run: () => vueInvoker.call(button, createSyntheticClickEvent(button)),
+        run: () => runVueClickHandlerSnapshot(button, vueHandler),
       };
     }
 
@@ -1445,6 +2005,71 @@
     }
 
     return null;
+  }
+
+  function serializeResetHint(hint) {
+    return {
+      text: hint.text,
+      classes: hint.classes,
+      resourceKey: hint.resourceKey,
+      resourceLabel: hint.resourceLabel,
+      gained: hint.gained,
+      gainedLog10: hint.gainedLog10,
+      current: hint.current,
+      currentLog10: hint.currentLog10,
+      currentMissing: hint.currentMissing,
+      currentWasZero: hint.currentWasZero,
+      ratio: hint.ratio,
+      ratioLog10: hint.ratioLog10,
+      ratioHint: hint.ratioHint,
+      seedAffordabilityHint: hint.seedAffordabilityHint,
+      hint: hint.hint,
+    };
+  }
+
+  function getResetAutomationId(hint) {
+    if (!hint || !isAutoResetResourceSupported(hint.resourceKey)) {
+      return null;
+    }
+
+    return `reset:${hint.resourceKey}`;
+  }
+
+  function learnResetAction(hint) {
+    const id = getResetAutomationId(hint);
+
+    if (!id || !hint.button) {
+      return null;
+    }
+
+    const runner = createButtonActionRunner(hint.button);
+
+    if (!runner) {
+      return null;
+    }
+
+    const existing = learnedResetActions.get(id) || {};
+    const action = Object.assign({}, existing, {
+      id,
+      kind: "reset",
+      resourceKey: hint.resourceKey,
+      resourceLabel: hint.resourceLabel,
+      label: normalizeActionLabel(hint.text),
+      hint: serializeResetHint(hint),
+      element: hint.button,
+      runner,
+      source: runner.source,
+      lastSeenAt: Date.now(),
+    });
+
+    learnedResetActions.set(id, action);
+    return action;
+  }
+
+  function learnResetActions(hints) {
+    for (const hint of hints) {
+      learnResetAction(hint);
+    }
   }
 
   function getVisibleAutomationButtons() {
@@ -1462,13 +2087,14 @@
       return null;
     }
 
-    const runner = createButtonActionRunner(button);
+    const existing = learnedAutomationActions.get(id) || {};
+    const freshRunner = isClickablePrimary(button) ? createButtonActionRunner(button) : null;
+    const runner = freshRunner || existing.runner;
 
     if (!runner) {
       return null;
     }
 
-    const existing = learnedAutomationActions.get(id) || {};
     const cost = parseButtonCost(button) || existing.cost || null;
     const action = Object.assign({}, existing, {
       id,
@@ -1478,7 +2104,7 @@
       cost,
       element: button,
       runner,
-      source: runner.source,
+      source: freshRunner ? freshRunner.source : existing.source || runner.source,
       lastSeenAt: Date.now(),
     });
 
@@ -1558,6 +2184,328 @@
     };
   }
 
+  function isLearnedResetActionVisible(action) {
+    return action.element && document.contains(action.element) && isVisible(action.element);
+  }
+
+  function getAutoResetThresholdLog10(value) {
+    const parsed = parseDisplayedNumber(value);
+
+    if (!parsed || parsed.zero || !Number.isFinite(parsed.log10)) {
+      return null;
+    }
+
+    return parsed.log10;
+  }
+
+  function getAutoResetTimeThresholdSeconds(config) {
+    const seconds = Number(config.timeThresholdSeconds);
+    return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+  }
+
+  function getAutoResetTriggerValue(resourceConfig) {
+    if (resourceConfig.mode === "time") {
+      return `${resourceConfig.timeThresholdSeconds}s / >= ${resourceConfig.timeMinMultiplierThreshold}x`;
+    }
+
+    if (resourceConfig.mode === "amount") {
+      return String(resourceConfig.amountThreshold);
+    }
+
+    if (resourceConfig.mode === "hybrid") {
+      return `${resourceConfig.multiplierThreshold}x / ${resourceConfig.timeThresholdSeconds}s >= ${resourceConfig.timeMinMultiplierThreshold}x`;
+    }
+
+    return String(resourceConfig.multiplierThreshold);
+  }
+
+  function removeStatusPrefix(statusText) {
+    return String(statusText || "").replace(/^状态：/, "");
+  }
+
+  function getAutoResetTimeMinMultiplierDecision(hint, resourceConfig) {
+    const thresholdLog10 = getAutoResetThresholdLog10(resourceConfig.timeMinMultiplierThreshold);
+
+    if (thresholdLog10 === null) {
+      return { ready: false, reason: "invalid-time-min-multiplier", statusText: "状态：时间保底倍率无效" };
+    }
+
+    if (!Number.isFinite(hint.ratioLog10)) {
+      return { ready: false, reason: "invalid-ratio", statusText: "状态：倍率无法计算" };
+    }
+
+    if (hint.ratioLog10 >= thresholdLog10) {
+      return {
+        ready: true,
+        reason: "time-min-multiplier",
+        statusText: `状态：当前 ${hint.ratio} 倍，满足保底 ${resourceConfig.timeMinMultiplierThreshold} 倍`,
+      };
+    }
+
+    return {
+      ready: false,
+      reason: "time-min-multiplier-wait",
+      statusText: `状态：时间已到，当前 ${hint.ratio} 倍 / 保底 ${resourceConfig.timeMinMultiplierThreshold} 倍`,
+    };
+  }
+
+  function getAutoResetTimeDecision(hint, resourceConfig, now) {
+    const thresholdSeconds = getAutoResetTimeThresholdSeconds(resourceConfig);
+    const lastResetAt = Number(resourceConfig.lastResetAt);
+
+    if (!thresholdSeconds) {
+      return { ready: false, reason: "invalid-time", statusText: "状态：时间阈值无效" };
+    }
+
+    if (!Number.isFinite(lastResetAt)) {
+      return { ready: false, reason: "missing-time-base", statusText: "状态：等待计时基准" };
+    }
+
+    const elapsedSeconds = Math.max(0, (now - lastResetAt) / 1000);
+    const remainingSeconds = thresholdSeconds - elapsedSeconds;
+
+    if (remainingSeconds <= 0) {
+      const minDecision = getAutoResetTimeMinMultiplierDecision(hint, resourceConfig);
+
+      if (!minDecision.ready) {
+        return minDecision;
+      }
+
+      return {
+        ready: true,
+        reason: "time",
+        statusText: `状态：已满 ${formatDuration(Math.log10(Math.max(thresholdSeconds, 1e-9)))}，${removeStatusPrefix(minDecision.statusText)}`,
+      };
+    }
+
+    return {
+      ready: false,
+      reason: "time-wait",
+      statusText: `状态：还需 ${formatDuration(Math.log10(Math.max(remainingSeconds, 1e-9)))}`,
+    };
+  }
+
+  function getAutoResetAmountDecision(hint, resourceConfig, resourceLabel) {
+    const thresholdLog10 = getAutoResetThresholdLog10(resourceConfig.amountThreshold);
+
+    if (thresholdLog10 === null) {
+      return { ready: false, reason: "invalid-amount", statusText: "状态：定额阈值无效" };
+    }
+
+    if (hint.gainedLog10 >= thresholdLog10) {
+      return {
+        ready: true,
+        reason: "amount",
+        statusText: `状态：可获 ${hint.gained} ${resourceLabel}，已达标`,
+      };
+    }
+
+    return {
+      ready: false,
+      reason: "amount-wait",
+      statusText: `状态：可获 ${hint.gained} ${resourceLabel} / 目标 ${resourceConfig.amountThreshold} ${resourceLabel}`,
+    };
+  }
+
+  function getAutoResetMultiplierDecision(hint, resourceConfig) {
+    const thresholdLog10 = getAutoResetThresholdLog10(resourceConfig.multiplierThreshold);
+
+    if (thresholdLog10 === null) {
+      return { ready: false, reason: "invalid-threshold", statusText: "状态：倍率阈值无效" };
+    }
+
+    if (!Number.isFinite(hint.ratioLog10)) {
+      return { ready: false, reason: "invalid-ratio", statusText: "状态：倍率无法计算" };
+    }
+
+    if (hint.ratioLog10 >= thresholdLog10) {
+      return {
+        ready: true,
+        reason: "multiplier",
+        statusText: `状态：当前 ${hint.ratio} 倍，已达标`,
+      };
+    }
+
+    return {
+      ready: false,
+      reason: "multiplier-wait",
+      statusText: `状态：当前 ${hint.ratio} 倍 / 目标 ${resourceConfig.multiplierThreshold} 倍`,
+    };
+  }
+
+  function getAutoResetHybridDecision(hint, resourceConfig, now) {
+    const multiplierDecision = getAutoResetMultiplierDecision(hint, resourceConfig);
+    const timeDecision = getAutoResetTimeDecision(hint, resourceConfig, now);
+
+    if (multiplierDecision.ready) {
+      return {
+        ready: true,
+        reason: "hybrid-multiplier",
+        statusText: `状态：混合触发，${removeStatusPrefix(multiplierDecision.statusText)}`,
+      };
+    }
+
+    if (timeDecision.ready) {
+      return {
+        ready: true,
+        reason: "hybrid-time",
+        statusText: `状态：混合触发，${removeStatusPrefix(timeDecision.statusText)}`,
+      };
+    }
+
+    if (multiplierDecision.reason === "invalid-threshold"
+      && (timeDecision.reason === "invalid-time"
+        || timeDecision.reason === "invalid-time-min-multiplier")) {
+      return { ready: false, reason: "invalid-hybrid", statusText: "状态：倍率或时间条件无效" };
+    }
+
+    return {
+      ready: false,
+      reason: "hybrid-wait",
+      statusText: `状态：${removeStatusPrefix(multiplierDecision.statusText)}；${removeStatusPrefix(timeDecision.statusText)}`,
+    };
+  }
+
+  function getAutoResetDecision(action, config = loadConfig(), now = Date.now()) {
+    const resourceConfig = getAutoResetResourceConfig(action.resourceKey, config);
+    const hint = action.hint;
+    const resourceLabel = action.resourceLabel || hint?.resourceLabel || action.resourceKey;
+
+    if (!resourceConfig) {
+      return { ready: false, reason: "unsupported", statusText: "状态：不支持该资源" };
+    }
+
+    if (!config.autoResetEnabled) {
+      return { ready: false, reason: "global-disabled", statusText: "状态：总开关关闭" };
+    }
+
+    if (!resourceConfig.enabled) {
+      return { ready: false, reason: "disabled", statusText: "状态：未开启" };
+    }
+
+    if (!hint || !Number.isFinite(hint.gainedLog10)) {
+      return { ready: false, reason: "missing-gain", statusText: "状态：无法判断收益" };
+    }
+
+    if (hint.gainedLog10 === Number.NEGATIVE_INFINITY) {
+      return { ready: false, reason: "zero-gain", statusText: "状态：收益为 0" };
+    }
+
+    const autoResetConfig = getAutoResetConfig(config);
+    const lastAutoResetAt = Math.max(
+      ...Object.values(autoResetConfig)
+        .map((resource) => Number(resource.lastAutoResetAt))
+        .filter((value) => Number.isFinite(value)),
+      Number.NEGATIVE_INFINITY,
+    );
+    const configuredCooldownMs = Number(config.autoResetCooldownMs);
+    const cooldownMs = Number.isFinite(configuredCooldownMs) && configuredCooldownMs >= 0
+      ? configuredCooldownMs
+      : defaultConfig.autoResetCooldownMs;
+
+    if (cooldownMs > 0 && Number.isFinite(lastAutoResetAt) && now - lastAutoResetAt < cooldownMs) {
+      const remainingSeconds = Math.max((cooldownMs - (now - lastAutoResetAt)) / 1000, 1e-9);
+      return {
+        ready: false,
+        reason: "cooldown",
+        statusText: `状态：防重复冷却 ${formatDuration(Math.log10(remainingSeconds))}`,
+      };
+    }
+
+    if (isLearnedResetActionVisible(action) && action.element && !isClickablePrimary(action.element)) {
+      return { ready: false, reason: "disabled-button", statusText: "状态：按钮不可用" };
+    }
+
+    if (resourceConfig.mode === "time") {
+      return getAutoResetTimeDecision(hint, resourceConfig, now);
+    }
+
+    if (resourceConfig.mode === "amount") {
+      return getAutoResetAmountDecision(hint, resourceConfig, resourceLabel);
+    }
+
+    if (resourceConfig.mode === "hybrid") {
+      return getAutoResetHybridDecision(hint, resourceConfig, now);
+    }
+
+    return getAutoResetMultiplierDecision(hint, resourceConfig);
+  }
+
+  function getAutoResetDecisionForHint(hint, config = loadConfig()) {
+    return getAutoResetDecision({
+      resourceKey: hint.resourceKey,
+      resourceLabel: hint.resourceLabel,
+      hint: serializeResetHint(hint),
+      element: hint.button,
+    }, config);
+  }
+
+  function getAutoResetDecisionForResource(resourceKey, config = loadConfig()) {
+    const resourceConfig = getAutoResetResourceConfig(resourceKey, config);
+    const option = getAutoResetResourceOption(resourceKey);
+
+    if (!resourceConfig || !option) {
+      return { ready: false, reason: "unsupported", statusText: "状态：不支持该资源" };
+    }
+
+    if (!config.autoResetEnabled) {
+      return { ready: false, reason: "global-disabled", statusText: "状态：总开关关闭" };
+    }
+
+    const action = learnedResetActions.get(`reset:${resourceKey}`);
+
+    if (action) {
+      return getAutoResetDecision(action, config);
+    }
+
+    if (!resourceConfig.enabled) {
+      return { ready: false, reason: "disabled", statusText: "状态：未开启" };
+    }
+
+    return { ready: false, reason: "missing-action", statusText: "状态：等待识别重置按钮" };
+  }
+
+  function getAutoResetActions(config = loadConfig()) {
+    if (!config.autoResetEnabled) {
+      return [];
+    }
+
+    return Array.from(learnedResetActions.values())
+      .filter((action) => action.runner && typeof action.runner.run === "function")
+      .filter((action) => isAutoResetResourceSupported(action.resourceKey))
+      .map((action) => ({
+        action,
+        decision: getAutoResetDecision(action, config),
+      }))
+      .filter((entry) => entry.decision.ready);
+  }
+
+  function getAutoResetSummary(config = loadConfig()) {
+    const all = Array.from(learnedResetActions.values());
+    const ready = getAutoResetActions(config);
+    const autoResetConfig = getAutoResetConfig(config);
+
+    return {
+      total: all.length,
+      ready: ready.length,
+      enabled: Object.values(autoResetConfig).filter((resource) => resource.enabled).length,
+      actions: all.map((action) => {
+        const decision = getAutoResetDecision(action, config);
+        return {
+          id: action.id,
+          resourceKey: action.resourceKey,
+          resourceLabel: action.resourceLabel,
+          source: action.source,
+          visible: isLearnedResetActionVisible(action),
+          ready: decision.ready,
+          reason: decision.reason,
+          statusText: decision.statusText,
+          hint: action.hint,
+        };
+      }),
+    };
+  }
+
   function isAutoSpendAllowed(button, config = loadConfig()) {
     const cost = parseButtonCost(button);
     return !cost || isSpendResourceAllowed(cost.resourceKey, config);
@@ -1579,6 +2527,7 @@
     const rawBuyableCompost = getBuyableCompostButtons();
     const buyableCompost = filterAutoSpendAllowed(rawBuyableCompost, config);
     const resetHints = getResetRatioHints();
+    learnResetActions(resetHints);
     const leafTimeHint = getLeafTimeHint();
 
     return {
@@ -1610,6 +2559,7 @@
         ? (({ element, ...hint }) => hint)(leafTimeHint)
         : null,
       background: getLearnedAutomationSummary(config),
+      autoReset: getAutoResetSummary(config),
     };
   }
 
@@ -1621,15 +2571,19 @@
     };
   }
 
-  function createClickSummary(upgrades, compost, cellLab, background, resetHints, reason) {
+  function createClickSummary(upgrades, compost, cellLab, background, autoReset, resetHints, reason) {
     return {
-      candidates: upgrades.candidates + compost.candidates + cellLab.candidates + background.candidates,
-      clicked: upgrades.clicked + compost.clicked + cellLab.clicked + background.clicked,
-      skipped: upgrades.skipped + compost.skipped + cellLab.skipped + background.skipped,
+      candidates: upgrades.candidates + compost.candidates + cellLab.candidates
+        + background.candidates + autoReset.candidates,
+      clicked: upgrades.clicked + compost.clicked + cellLab.clicked + background.clicked
+        + autoReset.clicked,
+      skipped: upgrades.skipped + compost.skipped + cellLab.skipped + background.skipped
+        + autoReset.skipped,
       upgrades,
       compost,
       cellLab,
       background,
+      autoReset,
       resetHints,
       reason,
     };
@@ -1637,6 +2591,7 @@
 
   function createIdleClickSummary(reason) {
     return createClickSummary(
+      emptyClickSummary(),
       emptyClickSummary(),
       emptyClickSummary(),
       emptyClickSummary(),
@@ -1751,6 +2706,65 @@
     };
   }
 
+  function markAutoResetTriggered(action, decision) {
+    const config = loadConfig();
+    const autoReset = getAutoResetConfig(config);
+    const resource = autoReset[action.resourceKey];
+
+    if (!resource) {
+      return;
+    }
+
+    const now = Date.now();
+    autoReset[action.resourceKey] = Object.assign({}, autoReset[action.resourceKey], {
+      lastResetAt: now,
+      lastAutoResetAt: now,
+      lastTrigger: {
+        at: now,
+        mode: resource.mode,
+        reason: decision.reason,
+        value: getAutoResetTriggerValue(resource),
+        ratio: action.hint?.ratio || null,
+        gained: action.hint?.gained || null,
+      },
+    });
+    updateConfig({ autoReset });
+  }
+
+  function clickAutoResetActions(config) {
+    const initialCandidates = getAutoResetActions(config);
+    const limit = readLimit(config.maxAutoResetsPerTick, defaultConfig.maxAutoResetsPerTick);
+    const clickedIds = new Set();
+    let clicked = 0;
+
+    for (let i = 0; i < limit; i += 1) {
+      const candidates = getAutoResetActions(loadConfig())
+        .filter(({ action }) => !clickedIds.has(action.id));
+      const entry = candidates[0];
+
+      if (!entry) {
+        break;
+      }
+
+      const { action, decision } = entry;
+
+      if (config.logClicks) {
+        log("auto-reset", action.resourceKey, decision.reason, action.hint);
+      }
+
+      action.runner.run();
+      markAutoResetTriggered(action, decision);
+      clickedIds.add(action.id);
+      clicked += 1;
+    }
+
+    return {
+      candidates: initialCandidates.length,
+      clicked,
+      skipped: Math.max(0, initialCandidates.length - clicked),
+    };
+  }
+
   function runPurchaseTick(config = loadConfig()) {
     if (!document.querySelector("#app")) {
       lastPurchaseSummary = createIdleClickSummary("Waiting for app");
@@ -1768,13 +2782,16 @@
     }
 
     learnVisibleAutomationActions();
+    const resetHints = getResetRatioHints();
+    learnResetActions(resetHints);
 
     const upgrades = config.autoUpgrades ? clickBuyableUpgrades(config) : emptyClickSummary();
     const compost = config.autoCompost ? clickBuyableCompost(config) : emptyClickSummary();
     const cellLab = config.autoCellLab ? clickBuyableCellLab(config) : emptyClickSummary();
     const background = config.backgroundAutomation ? clickBackgroundActions(config) : emptyClickSummary();
+    const autoReset = clickAutoResetActions(config);
 
-    lastPurchaseSummary = createClickSummary(upgrades, compost, cellLab, background, [], "Buy mode");
+    lastPurchaseSummary = createClickSummary(upgrades, compost, cellLab, background, autoReset, [], "Buy mode");
     return lastPurchaseSummary;
   }
 
@@ -1782,11 +2799,12 @@
     const upgradeCandidates = scanResult.upgrades.buyable.length;
     const compostCandidates = scanResult.compost.buyable.length;
     const cellLabCandidates = scanResult.cellLab.buyable.length;
+    const autoResetCandidates = scanResult.autoReset.ready;
 
     return {
-      candidates: upgradeCandidates + compostCandidates + cellLabCandidates,
+      candidates: upgradeCandidates + compostCandidates + cellLabCandidates + autoResetCandidates,
       clicked: 0,
-      skipped: upgradeCandidates + compostCandidates + cellLabCandidates,
+      skipped: upgradeCandidates + compostCandidates + cellLabCandidates + autoResetCandidates,
       upgrades: {
         candidates: upgradeCandidates,
         clicked: 0,
@@ -1803,6 +2821,11 @@
         skipped: cellLabCandidates,
       },
       background: emptyClickSummary(),
+      autoReset: {
+        candidates: autoResetCandidates,
+        clicked: 0,
+        skipped: autoResetCandidates,
+      },
       resetHints: scanResult.resetHints,
       reason,
     };
@@ -1817,6 +2840,7 @@
 
   function createWaitingSummary() {
     return createClickSummary(
+      emptyClickSummary(),
       emptyClickSummary(),
       emptyClickSummary(),
       emptyClickSummary(),
@@ -1889,9 +2913,10 @@
     const compost = config.autoCompost ? clickBuyableCompost(config) : emptyClickSummary();
     const cellLab = config.autoCellLab ? clickBuyableCellLab(config) : emptyClickSummary();
     const background = config.backgroundAutomation ? clickBackgroundActions(config) : emptyClickSummary();
+    const autoReset = clickAutoResetActions(config);
 
-    lastPurchaseSummary = createClickSummary(upgrades, compost, cellLab, background, [], "Buy mode");
-    lastSummary = createClickSummary(upgrades, compost, cellLab, background, scanResult.resetHints, "Buy mode");
+    lastPurchaseSummary = createClickSummary(upgrades, compost, cellLab, background, autoReset, [], "Buy mode");
+    lastSummary = createClickSummary(upgrades, compost, cellLab, background, autoReset, scanResult.resetHints, "Buy mode");
     renderPanel(config);
     return lastSummary;
   }
@@ -1911,7 +2936,9 @@
         right: 12px;
         top: 12px;
         z-index: 999999;
-        width: 236px;
+        width: 278px;
+        max-height: calc(100vh - 24px);
+        overflow-y: auto;
         box-sizing: border-box;
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         font-size: 12px;
@@ -2111,6 +3138,44 @@
         font-size: 11px;
         line-height: 1.35;
       }
+      #${PANEL_ID} .trutol-section {
+        display: grid;
+        gap: 6px;
+        margin-top: 10px;
+        padding-top: 9px;
+        border-top: 1px solid rgba(148, 163, 184, 0.18);
+      }
+      #${PANEL_ID} .trutol-section-label {
+        color: #cbd5e1;
+        font-weight: 700;
+      }
+      #${PANEL_ID} .trutol-auto-reset-panel {
+        display: grid;
+        gap: 6px;
+        min-width: 0;
+      }
+      #${PANEL_ID} .trutol-auto-reset-master {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 5px 7px;
+        border-radius: 6px;
+        color: #14532d;
+        background: rgba(187, 247, 208, 0.46);
+        border: 1px solid rgba(34, 197, 94, 0.28);
+        font-size: 11px;
+        font-weight: 700;
+      }
+      #${PANEL_ID} .trutol-auto-reset-panel .trutol-auto-reset-config {
+        width: 100%;
+        min-width: 0;
+        max-width: none;
+        margin: 0;
+      }
+      #${PANEL_ID} .trutol-auto-reset-panel .trutol-auto-reset-row {
+        justify-content: space-between;
+      }
       .${RESET_HINT_CLASS},
       .${LEAF_HINT_CLASS} {
         width: fit-content;
@@ -2129,6 +3194,84 @@
       }
       .${RESET_HINT_CLASS} + .${RESET_HINT_CLASS} {
         margin-top: -2px;
+      }
+      .${AUTO_RESET_HINT_CLASS} {
+        margin: 3px auto 7px;
+      }
+      .trutol-auto-reset-config {
+        display: grid;
+        gap: 4px;
+        width: fit-content;
+        min-width: 226px;
+        max-width: min(360px, 92vw);
+        padding: 5px 7px;
+        border-radius: 6px;
+        color: #14532d;
+        background: rgba(187, 247, 208, 0.58);
+        border: 1px solid rgba(34, 197, 94, 0.32);
+        font-size: 11px;
+        line-height: 1.2;
+      }
+      .trutol-auto-reset-config .trutol-auto-reset-row {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 5px;
+      }
+      .trutol-auto-reset-config .trutol-auto-reset-title {
+        min-width: 54px;
+        font-weight: 700;
+        text-align: left;
+      }
+      .trutol-auto-reset-config .trutol-auto-reset-field {
+        min-width: 28px;
+        font-weight: 700;
+        text-align: left;
+      }
+      .trutol-auto-reset-config button,
+      .trutol-auto-reset-config input,
+      .trutol-auto-reset-config select {
+        height: 22px;
+        border: 1px solid rgba(21, 128, 61, 0.34);
+        border-radius: 5px;
+        font: inherit;
+        font-size: 11px;
+      }
+      .trutol-auto-reset-config button {
+        min-width: 34px;
+        padding: 0 7px;
+        color: #166534;
+        background: rgba(240, 253, 244, 0.74);
+        cursor: pointer;
+        font-weight: 700;
+      }
+      .trutol-auto-reset-config button.is-on,
+      .trutol-auto-reset-config button.is-active {
+        color: #052e16;
+        background: #86efac;
+        border-color: rgba(22, 101, 52, 0.45);
+      }
+      .trutol-auto-reset-config .trutol-auto-reset-input {
+        width: 76px;
+        min-width: 0;
+        padding: 0 5px;
+        color: #052e16;
+        background: rgba(240, 253, 244, 0.82);
+      }
+      .trutol-auto-reset-config .trutol-auto-reset-unit {
+        width: 48px;
+        padding: 0 3px;
+        color: #052e16;
+        background: rgba(240, 253, 244, 0.82);
+      }
+      .trutol-auto-reset-config .trutol-auto-reset-suffix {
+        width: 30px;
+        text-align: left;
+        font-weight: 700;
+      }
+      .trutol-auto-reset-config .trutol-auto-reset-status {
+        text-align: center;
+        color: #166534;
       }
       .${LEAF_HINT_CLASS} {
         position: absolute !important;
@@ -2228,6 +3371,48 @@
     row.appendChild(control);
 
     return row;
+  }
+
+  function createPanelSection(labelText, content) {
+    const section = document.createElement("div");
+    section.className = "trutol-section";
+
+    const label = document.createElement("div");
+    label.className = "trutol-section-label";
+    label.textContent = labelText;
+
+    section.appendChild(label);
+    section.appendChild(content);
+    return section;
+  }
+
+  function createAutoResetPanelGrid() {
+    const wrapper = document.createElement("div");
+    wrapper.className = "trutol-auto-reset-panel";
+    const nodes = {};
+
+    const masterRow = document.createElement("div");
+    masterRow.className = "trutol-auto-reset-master";
+
+    const masterLabel = document.createElement("span");
+    masterLabel.textContent = "总开关";
+
+    const masterSwitch = createSwitch(() => {
+      const config = loadConfig();
+      updateConfig({ autoResetEnabled: !config.autoResetEnabled });
+    });
+
+    masterRow.appendChild(masterLabel);
+    masterRow.appendChild(masterSwitch);
+    wrapper.appendChild(masterRow);
+
+    for (const option of autoResetResourceOptions) {
+      const node = createAutoResetNode(option.key, { inline: false });
+      nodes[option.key] = node;
+      wrapper.appendChild(node);
+    }
+
+    return { wrapper, nodes, masterSwitch };
   }
 
   function createStatRow(labelText, valueText) {
@@ -2354,10 +3539,12 @@
       const config = loadConfig();
       updateConfig({ backgroundAutomation: !config.backgroundAutomation });
     });
+    const autoResetPanel = createAutoResetPanelGrid();
 
     panelBody.appendChild(createControlRow("开关", enabledSwitch));
     panelBody.appendChild(createControlRow("模式", modeControl.wrapper));
     panelBody.appendChild(createControlRow("速度", speedControl.wrapper));
+    panelBody.appendChild(createPanelSection("重置", autoResetPanel.wrapper));
     panelBody.appendChild(createControlRow("花费", spendControl.wrapper, { alignTop: true }));
     panelBody.appendChild(createControlRow("堆肥", compostSwitch));
     panelBody.appendChild(createControlRow("细胞", cellLabSwitch));
@@ -2389,6 +3576,8 @@
       compostSwitch,
       cellLabSwitch,
       backgroundSwitch,
+      autoResetMasterSwitch: autoResetPanel.masterSwitch,
+      autoResetNodes: autoResetPanel.nodes,
     };
 
     document.documentElement.appendChild(panel);
@@ -2415,9 +3604,13 @@
     setSwitchState(controlRefs.compostSwitch, config.autoCompost);
     setSwitchState(controlRefs.cellLabSwitch, config.autoCellLab);
     setSwitchState(controlRefs.backgroundSwitch, config.backgroundAutomation);
+    setSwitchState(controlRefs.autoResetMasterSwitch, config.autoResetEnabled);
     setSegmentedState(controlRefs.modeButtons, config.scanOnly ? "scan" : "buy");
     setSegmentedState(controlRefs.speedButtons, getSpeedMode(config));
     setResourceToggleState(controlRefs.spendButtons, config);
+    for (const node of Object.values(controlRefs.autoResetNodes || {})) {
+      updateAutoResetNode(node);
+    }
 
     controlRefs.badge.textContent = config.enabled ? "开" : "关";
     controlRefs.badge.style.color = config.enabled ? "#a7f3d0" : "#cbd5e1";
@@ -2433,6 +3626,7 @@
       createStatRow("堆肥", `${lastSummary.compost.candidates}/${lastSummary.compost.clicked}`),
       createStatRow("细胞", `${lastSummary.cellLab.candidates}/${lastSummary.cellLab.clicked}`),
       createStatRow("后台", `${lastSummary.background.candidates}/${lastSummary.background.clicked}`),
+      createStatRow("重置", `${lastSummary.autoReset.candidates}/${lastSummary.autoReset.clicked}`),
       createStatRow("速度", formatSpeedMode(config)),
       createStatRow("状态", formatReason(lastSummary.reason)),
     );
@@ -2480,7 +3674,9 @@
       setConfig: updateConfig,
       timings: () => getAutomationTimings(loadConfig()),
       spendResources: () => getSpendResourceConfig(loadConfig()),
+      autoReset: () => getAutoResetConfig(loadConfig()),
       learnedActions: () => getLearnedAutomationSummary(loadConfig()),
+      learnedResets: () => getAutoResetSummary(loadConfig()),
       scan,
       leafTimeHint: () => scan().leafTimeHint,
       resetHints: () => scan().resetHints,
