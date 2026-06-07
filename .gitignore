@@ -18,3 +18,5 @@ pnpm-debug.log*
 tmp/
 temp/
 .tmp/
+
+games/*/docs/
