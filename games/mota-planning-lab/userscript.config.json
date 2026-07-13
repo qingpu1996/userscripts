@@ -1,0 +1,41 @@
+{
+  "slug": "mota-planning-lab",
+  "output": "dist/mota-planning-lab.user.js",
+  "metadata": {
+    "name": "魔塔规划实验室运行态代理",
+    "namespace": "local.mota-planning-lab.userscripts",
+    "version": "0.1.0",
+    "description": "严格盲玩边界内的 H5 魔塔当前运行态代理。",
+    "match": [
+      "https://h5mota.com/games/24/*"
+    ],
+    "grant": [
+      "unsafeWindow",
+      "GM_getValue",
+      "GM_setValue",
+      "GM_registerMenuCommand",
+      "GM_xmlhttpRequest"
+    ],
+    "run-at": "document-idle",
+    "connect": "127.0.0.1"
+  },
+  "sources": [
+    "games/mota-planning-lab/src/constants.js",
+    "games/mota-planning-lab/src/engine-adapter.js",
+    "games/mota-planning-lab/src/observer.js",
+    "games/mota-planning-lab/src/block-registry.js",
+    "games/mota-planning-lab/src/protocol.js",
+    "games/mota-planning-lab/src/fingerprint.js",
+    "games/mota-planning-lab/src/guard.js",
+    "games/mota-planning-lab/src/delta.js",
+    "games/mota-planning-lab/src/stability.js",
+    "games/mota-planning-lab/src/executor.js",
+    "games/mota-planning-lab/src/journal.js",
+    "games/mota-planning-lab/src/recovery.js",
+    "games/mota-planning-lab/src/localhost-client.js",
+    "games/mota-planning-lab/src/panel.js",
+    "games/mota-planning-lab/src/menus.js",
+    "games/mota-planning-lab/src/controller.js",
+    "games/mota-planning-lab/src/main.js"
+  ]
+}

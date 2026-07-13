@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/mota-planning-lab/observation.schema.json",
+  "title": "Mota Planning Lab current-floor observation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol",
+    "page",
+    "floor_id",
+    "floor_name",
+    "floor_number",
+    "dimensions",
+    "hero",
+    "keys",
+    "busy",
+    "blocks",
+    "captured_at"
+  ],
+  "properties": {
+    "protocol": {"const": 1},
+    "page": {"const": "/games/24/"},
+    "floor_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "floor_name": {"type": ["string", "null"], "maxLength": 128},
+    "floor_number": {"type": ["integer", "null"]},
+    "dimensions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height"],
+      "properties": {
+        "width": {"const": 11},
+        "height": {"const": 11}
+      }
+    },
+    "hero": {"$ref": "#/$defs/hero"},
+    "keys": {"$ref": "#/$defs/keys"},
+    "busy": {"type": "boolean"},
+    "blocks": {
+      "type": "array",
+      "maxItems": 121,
+      "items": {"$ref": "#/$defs/block"}
+    },
+    "captured_at": {"type": "integer", "minimum": 0}
+  },
+  "$defs": {
+    "coordinate": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10
+    },
+    "keys": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["yellow", "blue", "red"],
+      "properties": {
+        "yellow": {"type": "integer", "minimum": 0},
+        "blue": {"type": "integer", "minimum": 0},
+        "red": {"type": "integer", "minimum": 0}
+      }
+    },
+    "hero": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hp", "attack", "defense", "gold", "experience", "loc"],
+      "properties": {
+        "hp": {"type": "integer", "minimum": 0},
+        "attack": {"type": "integer", "minimum": 0},
+        "defense": {"type": "integer", "minimum": 0},
+        "gold": {"type": "integer", "minimum": 0},
+        "experience": {"type": "integer", "minimum": 0},
+        "loc": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["x", "y", "direction"],
+          "properties": {
+            "x": {"$ref": "#/$defs/coordinate"},
+            "y": {"$ref": "#/$defs/coordinate"},
+            "direction": {"enum": ["up", "down", "left", "right"]}
+          }
+        }
+      }
+    },
+    "enemy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hp", "attack", "defense", "gold", "experience", "special"],
+      "properties": {
+        "hp": {"type": "integer", "minimum": 0},
+        "attack": {"type": ["integer", "null"], "minimum": 0},
+        "defense": {"type": ["integer", "null"], "minimum": 0},
+        "gold": {"type": "integer", "minimum": 0},
+        "experience": {"type": "integer", "minimum": 0},
+        "special": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"type": ["integer", "string"]}
+        }
+      }
+    },
+    "block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "numeric_id", "id", "cls", "trigger", "no_pass", "damage", "enemy"],
+      "properties": {
+        "x": {"$ref": "#/$defs/coordinate"},
+        "y": {"$ref": "#/$defs/coordinate"},
+        "numeric_id": {"type": "integer", "minimum": 0},
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "cls": {"type": "string", "minLength": 1, "maxLength": 256},
+        "trigger": {"type": ["string", "null"], "maxLength": 128},
+        "no_pass": {"type": "boolean"},
+        "damage": {
+          "anyOf": [
+            {"type": "integer"},
+            {"const": "???"},
+            {"type": "null"}
+          ]
+        },
+        "enemy": {
+          "anyOf": [
+            {"$ref": "#/$defs/enemy"},
+            {"type": "null"}
+          ]
+        }
+      }
+    }
+  }
+}

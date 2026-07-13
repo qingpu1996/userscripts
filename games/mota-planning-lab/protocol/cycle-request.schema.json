@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/mota-planning-lab/cycle-request.schema.json",
+  "title": "Mota Planning Lab cycle request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["source", "completed_action_id", "observation"],
+  "properties": {
+    "source": {"const": "mota-planning-lab-userscript"},
+    "completed_action_id": {
+      "anyOf": [
+        {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"},
+        {"type": "null"}
+      ]
+    },
+    "observation": {"$ref": "observation.schema.json"},
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "pending_action_id", "pre_fingerprint", "current_fingerprint"],
+      "properties": {
+        "phase": {
+          "enum": ["none", "pending", "not_executed", "completed", "mismatch"]
+        },
+        "pending_action_id": {
+          "anyOf": [
+            {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"},
+            {"type": "null"}
+          ]
+        },
+        "pre_fingerprint": {
+          "anyOf": [
+            {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+            {"type": "null"}
+          ]
+        },
+        "current_fingerprint": {
+          "anyOf": [
+            {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+            {"type": "null"}
+          ]
+        },
+        "detail_code": {
+          "anyOf": [
+            {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,95}$"},
+            {"type": "null"}
+          ]
+        }
+      }
+    }
+  }
+}

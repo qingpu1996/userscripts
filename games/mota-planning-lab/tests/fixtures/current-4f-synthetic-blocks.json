@@ -1,0 +1,121 @@
+{
+  "fixture_metadata": {
+    "kind": "synthetic-current-floor",
+    "synthetic": true,
+    "live_capture": false,
+    "warning": "All floor IDs, block IDs and coordinates below are invented for tests and do not describe the real 4F map."
+  },
+  "fake_runtime": {
+    "floor_id": "synthetic-floor-4",
+    "floor_name": "Synthetic 4F",
+    "width": 11,
+    "height": 11,
+    "hero": {
+      "hp": 208,
+      "attack": 23,
+      "defense": 21,
+      "gold": 16,
+      "experience": 63,
+      "loc": {
+        "x": 8,
+        "y": 3,
+        "direction": "down"
+      },
+      "items": {
+        "keys": {
+          "yellowKey": 4,
+          "blueKey": 1,
+          "redKey": 0
+        }
+      }
+    },
+    "blocks": [
+      {
+        "x": 0,
+        "y": 0,
+        "id": "syntheticWall",
+        "numeric_id": 9001,
+        "cls": "terrains",
+        "trigger": null,
+        "no_pass": true,
+        "disable": false
+      },
+      {
+        "x": 4,
+        "y": 3,
+        "id": "syntheticYellowDoor",
+        "numeric_id": 9002,
+        "cls": "animates",
+        "trigger": "openDoor",
+        "no_pass": true,
+        "disable": false
+      },
+      {
+        "x": 5,
+        "y": 3,
+        "id": "syntheticEnemy",
+        "numeric_id": 9003,
+        "cls": "enemy48",
+        "trigger": "battle",
+        "no_pass": true,
+        "disable": false,
+        "damage": 24,
+        "enemy": {
+          "hp": 100,
+          "attack": 30,
+          "defense": 10,
+          "gold": 5,
+          "experience": 4,
+          "special": []
+        }
+      },
+      {
+        "x": 6,
+        "y": 3,
+        "id": "syntheticRedPotion",
+        "numeric_id": 9004,
+        "cls": "items",
+        "trigger": "getItem",
+        "no_pass": false,
+        "disable": false
+      },
+      {
+        "x": 7,
+        "y": 3,
+        "id": "syntheticUpFloor",
+        "numeric_id": 9005,
+        "cls": "terrains",
+        "trigger": "changeFloor",
+        "no_pass": false,
+        "disable": false
+      },
+      {
+        "x": 8,
+        "y": 8,
+        "id": "syntheticDisabledObject",
+        "numeric_id": 9006,
+        "cls": "items",
+        "trigger": "getItem",
+        "no_pass": false,
+        "disable": true
+      },
+      {
+        "x": 9,
+        "y": 9,
+        "id": "syntheticUnknownMechanism",
+        "numeric_id": 9007,
+        "cls": "syntheticMechanism",
+        "trigger": "syntheticTrigger",
+        "no_pass": true,
+        "disable": false
+      }
+    ]
+  },
+  "expected_visible_block_count": 6,
+  "expected_enemy_coordinates": [
+    {
+      "x": 5,
+      "y": 3
+    }
+  ]
+}
