@@ -1,5 +1,5 @@
 MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
-  const scope = pageScope || (typeof unsafeWindow !== "undefined" ? unsafeWindow : null);
+  const scope = pageScope || (typeof unsafeWindow !== "undefined" ? unsafeWindow : globalThis);
 
   function currentCore() {
     return scope && scope.core;
@@ -49,7 +49,10 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
       attack: readNumber(hero.atk !== undefined ? hero.atk : hero.attack, "hero.attack"),
       defense: readNumber(hero.def !== undefined ? hero.def : hero.defense, "hero.defense"),
       gold: readNumber(hero.money !== undefined ? hero.money : hero.gold, "hero.gold"),
-      experience: readNumber(hero.experience, "hero.experience"),
+      experience: readNumber(
+        hero.exp !== undefined ? hero.exp : hero.experience,
+        "hero.experience",
+      ),
       loc: {
         x: readNumber(loc.x, "hero.loc.x"),
         y: readNumber(loc.y, "hero.loc.y"),
@@ -57,15 +60,15 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
       },
       keys: {
         yellow: readNumber(
-          keys.yellowKey !== undefined ? keys.yellowKey : keys.yellow,
+          keys.yellowKey !== undefined ? keys.yellowKey : keys.yellow !== undefined ? keys.yellow : 0,
           "hero.keys.yellow",
         ),
         blue: readNumber(
-          keys.blueKey !== undefined ? keys.blueKey : keys.blue,
+          keys.blueKey !== undefined ? keys.blueKey : keys.blue !== undefined ? keys.blue : 0,
           "hero.keys.blue",
         ),
         red: readNumber(
-          keys.redKey !== undefined ? keys.redKey : keys.red,
+          keys.redKey !== undefined ? keys.redKey : keys.red !== undefined ? keys.red : 0,
           "hero.keys.red",
         ),
       },
@@ -87,10 +90,83 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
     }
     const title = typeof currentMap.title === "string" ? currentMap.title : null;
     const name = typeof currentMap.name === "string" ? currentMap.name : null;
+    const declaredWidth = currentMap.width;
+    const declaredHeight = currentMap.height;
+    const dynamicGrid = Array.isArray(currentMap.map) ? currentMap.map : null;
+    const declaredValidCells = Array.isArray(currentMap.valid_cells)
+      ? currentMap.valid_cells.map((cell) => ({ x: cell.x, y: cell.y })) : null;
+    let width = declaredWidth;
+    let height = declaredHeight;
+    let validCells = null;
+    let topologySource = "engine_current_map";
+    let topologyConfidence = "confirmed";
+    if (dynamicGrid) {
+      if (dynamicGrid.some((row) => !Array.isArray(row))) {
+        throw MotaLab.createPauseError(
+          "ENGINE_API_INCOMPATIBLE", "UNRELIABLE_TOPOLOGY",
+          { reason: "dynamic grid contains a non-array row" },
+        );
+      }
+      if (!MotaLab.isFiniteInteger(height)) height = dynamicGrid.length;
+      if (!MotaLab.isFiniteInteger(width)) {
+        width = dynamicGrid.reduce((maximum, row) => Math.max(maximum, row.length), 0);
+      }
+      if (dynamicGrid.length > height || dynamicGrid.some((row) => row.length > width)) {
+        throw MotaLab.createPauseError(
+          "ENGINE_API_INCOMPATIBLE", "TOPOLOGY_SOURCE_CONFLICT",
+          { declared_width: width, declared_height: height },
+        );
+      }
+      const gridCells = [];
+      dynamicGrid.forEach((row, y) => {
+        for (let x = 0; x < row.length; x += 1) {
+          if (Object.prototype.hasOwnProperty.call(row, x)) gridCells.push({ x, y });
+        }
+      });
+      if (declaredValidCells) {
+        const key = (cell) => `${cell.x},${cell.y}`;
+        const gridSet = new Set(gridCells.map(key));
+        const declaredSet = new Set(declaredValidCells.map(key));
+        if (gridSet.size !== declaredSet.size
+          || [...gridSet].some((cell) => !declaredSet.has(cell))) {
+          throw MotaLab.createPauseError(
+            "ENGINE_API_INCOMPATIBLE", "TOPOLOGY_SOURCE_CONFLICT",
+            { grid_cells: gridSet.size, declared_valid_cells: declaredSet.size },
+          );
+        }
+        validCells = declaredValidCells;
+        topologySource = "engine_current_map";
+        topologyConfidence = "confirmed";
+      } else if (gridCells.length === width * height
+        && dynamicGrid.length === height
+        && dynamicGrid.every((row) => row.length === width)) {
+        validCells = null;
+        topologySource = "engine_current_map";
+        topologyConfidence = "confirmed";
+      } else {
+        validCells = gridCells;
+        topologySource = "runtime_observed";
+        topologyConfidence = "inferred";
+      }
+    } else if (declaredValidCells) {
+      validCells = declaredValidCells;
+      topologySource = "engine_current_map";
+      topologyConfidence = "confirmed";
+    }
+    if (!MotaLab.isFiniteInteger(width) || !MotaLab.isFiniteInteger(height)) {
+      throw MotaLab.createPauseError(
+        "ENGINE_API_INCOMPATIBLE",
+        "MISSING_MAP_DIMENSIONS",
+        { floor_id: String(currentFloorId) },
+      );
+    }
     return {
       floor_name: title || name,
-      width: MotaLab.MAP_WIDTH,
-      height: MotaLab.MAP_HEIGHT,
+      width,
+      height,
+      valid_cells: validCells,
+      topology_source: topologySource,
+      topology_confidence: topologyConfidence,
     };
   }
 
@@ -227,14 +303,13 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
       moving_state: typeof runtime.isMoving === "function",
       physical_save_load_present: typeof runtime.doSL === "function",
       physical_save_load_enabled: false,
-      protected_slot: MotaLab.PROTECTED_SAVE_SLOT,
     };
   }
 
   function assertRequiredCapabilities() {
     const report = capabilities();
     const missing = Object.entries(report)
-      .filter(([key, value]) => !["physical_save_load_present", "physical_save_load_enabled", "protected_slot"].includes(key) && value !== true)
+      .filter(([key, value]) => !["physical_save_load_present", "physical_save_load_enabled"].includes(key) && value !== true)
       .map(([key]) => key);
     if (missing.length) {
       throw MotaLab.createPauseError("ENGINE_API_INCOMPATIBLE", "MISSING_API", { missing });
@@ -271,11 +346,7 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
   }
 
   function physicalSaveLoad() {
-    return {
-      executed: false,
-      reason: "PHYSICAL_SAVE_LOAD_DISABLED",
-      protected_slot: MotaLab.PROTECTED_SAVE_SLOT,
-    };
+    return { executed: false, reason: "PHYSICAL_SAVE_LOAD_DISABLED" };
   }
 
   return Object.freeze({

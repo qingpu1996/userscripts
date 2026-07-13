@@ -181,7 +181,7 @@ test("fake core → localhost service → atomic execution → settled report is
   ];
   const fake = makePoisonCore({
     floorId: "synthetic-floor-4",
-    currentMap: { title: "Synthetic 4F" },
+    currentMap: { title: "Synthetic 4F", width: 11, height: 11 },
     blocks: rawBlocks,
     enemyInfo: {
       syntheticEnemy: {
@@ -216,8 +216,10 @@ test("fake core → localhost service → atomic execution → settled report is
   const client = MotaLab.createLocalhostClient(gmRequest, { timeoutMs: 3000 });
 
   const firstObservation = MotaLab.collectObservation(adapter, () => 1234567890);
+  firstObservation.session_id = "SESSION-INTEGRATION-0001";
   const firstRequest = MotaLab.createCycleRequest({
     observation: firstObservation,
+    session: { mode: "new_game", command: "observe" },
     recovery: {
       phase: "none",
       pending_action_id: null,
@@ -226,13 +228,65 @@ test("fake core → localhost service → atomic execution → settled report is
       detail_code: null,
     },
   });
-  const unknownFloor = await client.postCycle(firstRequest);
+  const confirmationRequired = await client.postCycle(firstRequest);
+  assert.equal(confirmationRequired.status, "pause");
+  assert.equal(confirmationRequired.pause_kind, "SESSION_CONFIRMATION_REQUIRED");
+  const unknownFloor = await client.postCycle(MotaLab.createCycleRequest({
+    observation: firstObservation,
+    session: { mode: "new_game", command: "confirm" },
+    recovery: firstRequest.recovery,
+  }));
   assert.equal(unknownFloor.status, "pause");
   assert.equal(unknownFloor.pause_kind, "UNKNOWN_FLOOR");
 
   writeKnowledge(knowledgeDir);
 
+  const issuedBeforeRefresh = await client.postCycle(MotaLab.createCycleRequest({
+    observation: firstObservation,
+    session: { mode: "resume_existing_ledger", command: "observe" },
+    recovery: firstRequest.recovery,
+  }));
+  assert.equal(issuedBeforeRefresh.status, "execute");
+  const firstFingerprint = MotaLab.fingerprintObservation(firstObservation);
+  const unexplainedObservation = JSON.parse(JSON.stringify(firstObservation));
+  unexplainedObservation.hero.loc.x -= 1;
+  unexplainedObservation.captured_at += 1;
+  const unexplainedFingerprint = MotaLab.fingerprintObservation(unexplainedObservation);
+  const unresolvedConflict = await client.postCycle(MotaLab.createCycleRequest({
+    observation: unexplainedObservation,
+    session: { mode: "resume_existing_ledger", command: "observe" },
+    recovery: {
+      phase: "none",
+      pending_action_id: null,
+      pre_fingerprint: null,
+      current_fingerprint: unexplainedFingerprint,
+      detail_code: null,
+    },
+  }));
+  assert.equal(unresolvedConflict.status, "pause");
+  assert.equal(unresolvedConflict.detail_code, "RECOVERY_JOURNAL_LEDGER_MISMATCH");
+
   const journal = MotaLab.createJournal(MotaLab.createMemoryStorage());
+  journal.establishSession({
+    session_id: firstObservation.session_id,
+    mode: "new_game",
+    baseline: MotaLab.baselineSummary(firstObservation),
+  });
+  journal.markServiceSessionConfirmed();
+  journal.setPending({
+    action_id: issuedBeforeRefresh.action_id,
+    pre_fingerprint: firstFingerprint,
+    pre_observation: firstObservation,
+    guard: issuedBeforeRefresh.guard,
+    expected_delta: issuedBeforeRefresh.expected_delta,
+    requires_non_position_change: true,
+    allow_unknown_floor: false,
+    allow_unknown_map_instance: false,
+    operations: issuedBeforeRefresh.operations,
+    operation_index: 0,
+    phase: "prepared",
+    started_at: 1234567890,
+  });
   const panelUpdates = [];
   const controller = MotaLab.createController({
     adapter,
@@ -257,12 +311,17 @@ test("fake core → localhost service → atomic execution → settled report is
   assert.equal(fake.calls.direct.length + fake.calls.route.length, 0);
 
   const resource = await controller.start();
-  assert.equal(resource.completed, true);
+  assert.equal(resource.completed, true, JSON.stringify(resource));
+  assert.equal(resource.action_id, issuedBeforeRefresh.action_id,
+    "refresh recovery must retain the one unresolved action id");
   assert.equal(fake.calls.direct.length, 1, "safe empty approach must use moveDirectly");
   assert.equal(fake.calls.route.length, 1, "resource is one state boundary");
   assert.equal(fake.hero.hp, 408);
   assert.equal(rawBlocks.length, 1);
 
+  const resourceAck = await controller.runSingleCycle();
+  assert.equal(resourceAck.idle, true);
+  assert.equal(journal.snapshot().last_acknowledged_action_id, resource.action_id);
   const enemy = await controller.runSingleCycle();
   assert.equal(enemy.completed, true);
   assert.equal(fake.calls.route.length, 2, "enemy is a separate next-cycle boundary");
@@ -271,6 +330,9 @@ test("fake core → localhost service → atomic execution → settled report is
   assert.equal(fake.hero.experience, 67);
   assert.equal(rawBlocks.length, 0);
 
+  const enemyAck = await controller.runSingleCycle();
+  assert.equal(enemyAck.idle, true);
+  assert.equal(journal.snapshot().last_acknowledged_action_id, enemy.action_id);
   const reported = await controller.runSingleCycle();
   assert.equal(reported.idle, true);
   assert.equal(journal.snapshot().pending_action, null);
@@ -280,7 +342,13 @@ test("fake core → localhost service → atomic execution → settled report is
   assert.deepEqual(fake.calls.forbidden, []);
   assert.ok(panelUpdates.length > 0);
 
-  assert.ok(fs.existsSync(path.join(stateDir, "mota-lab.sqlite3")));
+  const manifestPath = path.join(stateDir, ".mota-lab.sqlite3.manifest.json");
+  assert.ok(fs.existsSync(manifestPath));
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  assert.equal(manifest.protocol, 2);
+  assert.ok(fs.existsSync(path.join(
+    stateDir, ".mota-lab.sqlite3.generations", manifest.generation, manifest.database,
+  )));
   assert.ok(fs.existsSync(path.join(stateDir, "decisions.jsonl")));
   const pauseRoot = path.join(stateDir, "pauses");
   assert.ok(fs.readdirSync(pauseRoot, { withFileTypes: true }).some((entry) => (

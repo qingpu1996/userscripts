@@ -1,12 +1,17 @@
 const MotaLab = Object.create(null);
 
-MotaLab.PROTOCOL_VERSION = 1;
+MotaLab.PROTOCOL_VERSION = 2;
 MotaLab.SOURCE = "mota-planning-lab-userscript";
 MotaLab.PAGE = "/games/24/";
 MotaLab.CYCLE_ENDPOINT = "http://127.0.0.1:18724/cycle";
-MotaLab.MAP_WIDTH = 11;
-MotaLab.MAP_HEIGHT = 11;
-MotaLab.PROTECTED_SAVE_SLOT = 8;
+MotaLab.MAX_MAP_AXIS = 256;
+MotaLab.MAX_MAP_CELLS = 65536;
+MotaLab.MAX_BLOCKS = 8192;
+MotaLab.SESSION_MODES = Object.freeze([
+  "new_game",
+  "handoff_expected_guard",
+  "resume_existing_ledger",
+]);
 
 MotaLab.PAUSE_KINDS = Object.freeze([
   "NEW_OBJECT_OR_MECHANISM",
@@ -17,6 +22,8 @@ MotaLab.PAUSE_KINDS = Object.freeze([
   "UNSUPPORTED_INTERACTION",
   "DECISION_SERVICE_UNAVAILABLE",
   "ENGINE_API_INCOMPATIBLE",
+  "SESSION_CONFIRMATION_REQUIRED",
+  "PLANNING_BUDGET_EXHAUSTED",
 ]);
 
 MotaLab.PAUSE_KIND_SET = new Set(MotaLab.PAUSE_KINDS);
@@ -42,20 +49,12 @@ MotaLab.BOUNDARY_CATEGORIES = new Set([
   "stair",
 ]);
 
-MotaLab.INITIAL_BASELINE = Object.freeze({
-  floor_number: 4,
-  hero: Object.freeze({
-    hp: 208,
-    attack: 23,
-    defense: 21,
-    gold: 16,
-    experience: 63,
-    loc: Object.freeze({ x: 8, y: 3 }),
-  }),
-  keys: Object.freeze({ yellow: 4, blue: 1, red: 0 }),
-});
-
-MotaLab.JOURNAL_KEY = "mota-planning-lab:journal:v1";
+MotaLab.JOURNAL_KEY = "mota-planning-lab:journal:v2";
+MotaLab.JOURNAL_SLOT_KEYS = Object.freeze([
+  "mota-planning-lab:journal:v2:slot:a",
+  "mota-planning-lab:journal:v2:slot:b",
+]);
+MotaLab.LEGACY_JOURNAL_KEYS = Object.freeze(["mota-planning-lab:journal:v1"]);
 MotaLab.PANEL_ID = "mota-planning-lab-panel";
 MotaLab.STYLE_ID = "mota-planning-lab-style";
 

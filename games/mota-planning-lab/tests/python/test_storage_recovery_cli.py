@@ -72,6 +72,49 @@ class StorageAndRecoveryTests(unittest.TestCase):
         finally:
             second_coordinator.store.close()
 
+    def test_session_wide_unresolved_action_blocks_new_fingerprint_and_replays_same_id(self) -> None:
+        first_coordinator = CycleCoordinator(self.settings)
+        first = self.issue(first_coordinator)
+        first_fp = observation_fingerprint(Observation.model_validate(self.pre))
+        changed = copy.deepcopy(self.pre)
+        changed["hero"]["loc"]["x"] = 1
+        changed_fp = observation_fingerprint(Observation.model_validate(changed))
+        ambiguous = make_request(changed)
+        ambiguous["session"] = {"mode": "resume_existing_ledger", "command": "observe"}
+        ambiguous["recovery"] = {
+            "phase": "none",
+            "pending_action_id": None,
+            "pre_fingerprint": None,
+            "current_fingerprint": changed_fp,
+            "detail_code": None,
+        }
+        response = first_coordinator.cycle(CycleRequest.model_validate(ambiguous))
+        self.assertEqual(response["status"], "pause")
+        self.assertEqual(response["detail_code"], "RECOVERY_JOURNAL_LEDGER_MISMATCH")
+        self.assertEqual(first_coordinator.store.unresolved_action_count(self.pre["session_id"]), 1)
+        first_coordinator.store.close()
+
+        restarted = CycleCoordinator(self.settings)
+        try:
+            retry = make_request(self.pre)
+            retry["session"] = {"mode": "resume_existing_ledger", "command": "observe"}
+            retry["recovery"] = {
+                "phase": "not_executed",
+                "pending_action_id": first["action_id"],
+                "pre_fingerprint": first_fp,
+                "current_fingerprint": first_fp,
+                "detail_code": None,
+            }
+            replayed = restarted.cycle(CycleRequest.model_validate(retry))
+            self.assertEqual(replayed, first)
+            self.assertEqual(restarted.store.unresolved_action_count(self.pre["session_id"]), 1)
+            self.assertEqual(
+                restarted.store._connection.execute("SELECT COUNT(*) FROM actions").fetchone()[0],
+                1,
+            )
+        finally:
+            restarted.store.close()
+
     def test_action_id_sequence_skips_collision_and_never_reuses_reserved_gap(self) -> None:
         coordinator = CycleCoordinator(self.settings)
         first = self.issue(coordinator)
@@ -252,7 +295,7 @@ class StorageAndRecoveryTests(unittest.TestCase):
         finally:
             coordinator.store.close()
 
-    def test_not_executed_recovery_replaces_id_and_is_restart_idempotent(self) -> None:
+    def test_not_executed_recovery_replays_same_id_and_is_restart_idempotent(self) -> None:
         coordinator = CycleCoordinator(self.settings)
         first = self.issue(coordinator)
         pre_fp = observation_fingerprint(Observation.model_validate(self.pre))
@@ -267,22 +310,21 @@ class StorageAndRecoveryTests(unittest.TestCase):
             },
         )
         replacement = coordinator.cycle(CycleRequest.model_validate(recovery_request))
-        self.assertNotEqual(replacement["action_id"], first["action_id"])
-        self.assertEqual(replacement["supersedes_action_id"], first["action_id"])
-        self.assertEqual(coordinator.store.get_action(first["action_id"]).status, "superseded")
+        self.assertEqual(replacement, first)
+        self.assertEqual(coordinator.store.get_action(first["action_id"]).status, "issued")
         coordinator.store.close()
 
         restarted = CycleCoordinator(self.settings)
         try:
             repeated = restarted.cycle(CycleRequest.model_validate(recovery_request))
             self.assertEqual(repeated, replacement)
-            self.assertEqual(restarted.store.get_action(replacement["action_id"]).status, "issued")
+            self.assertEqual(restarted.store.get_action(first["action_id"]).status, "issued")
             normal_retry = self.issue(restarted)
-            self.assertEqual(normal_retry["action_id"], replacement["action_id"])
+            self.assertEqual(normal_retry["action_id"], first["action_id"])
         finally:
             restarted.store.close()
 
-    def test_replacement_chain_never_returns_a_superseded_id(self) -> None:
+    def test_not_executed_retries_never_create_a_replacement_chain(self) -> None:
         coordinator = CycleCoordinator(self.settings)
         try:
             first = self.issue(coordinator)
@@ -303,9 +345,15 @@ class StorageAndRecoveryTests(unittest.TestCase):
 
             second = resign(first["action_id"])
             third = resign(second["action_id"])
-            self.assertNotIn(third["action_id"], {first["action_id"], second["action_id"]})
-            self.assertEqual(self.issue(coordinator)["action_id"], third["action_id"])
-            self.assertEqual(resign(first["action_id"])["action_id"], third["action_id"])
+            self.assertEqual(second, first)
+            self.assertEqual(third, first)
+            self.assertEqual(self.issue(coordinator), first)
+            self.assertEqual(resign(first["action_id"]), first)
+            self.assertEqual(
+                coordinator.store._connection.execute("SELECT COUNT(*) FROM actions").fetchone()[0],
+                1,
+            )
+            self.assertEqual(coordinator.store.get_action(first["action_id"]).status, "issued")
         finally:
             coordinator.store.close()
 

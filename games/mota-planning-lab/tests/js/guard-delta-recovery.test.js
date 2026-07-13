@@ -8,25 +8,17 @@ const {
 
 const lab = loadRuntime();
 
-test("首次 4F 基线精确匹配且任何面板差异失败", () => {
-  const baseline = makeObservation();
-  assert.equal(lab.compareInitialBaseline(baseline).ok, true);
-  for (const mutate of [
-    (value) => { value.floor_number = 5; },
-    (value) => { value.hero.loc.x = 7; },
-    (value) => { value.hero.hp = 209; },
-    (value) => { value.hero.attack = 24; },
-    (value) => { value.hero.defense = 20; },
-    (value) => { value.hero.gold = 15; },
-    (value) => { value.hero.experience = 62; },
-    (value) => { value.keys.yellow = 3; },
-    (value) => { value.keys.blue = 0; },
-    (value) => { value.keys.red = 1; },
-  ]) {
-    const value = makeObservation();
-    mutate(value);
-    assert.equal(lab.compareInitialBaseline(value).ok, false);
-  }
+test("会话 baseline 由当前 observation 动态生成，不含编译期现场", () => {
+  const first = lab.baselineSummary(makeObservation());
+  const second = lab.baselineSummary(makeObservation({
+    floor_id: "another-runtime-map",
+    dimensions: { width: 7, height: 19 },
+    hero: { hp: 999, loc: { x: 6, y: 18 } },
+  }));
+  assert.notEqual(first.fingerprint, second.fingerprint);
+  assert.equal(second.floor_id, "another-runtime-map");
+  assert.deepEqual(JSON.parse(JSON.stringify(second.dimensions)), { width: 7, height: 19 });
+  assert.equal(second.hero.hp, 999);
 });
 
 test("guard 要求楼层、位置、完整面板和三种钥匙", () => {
@@ -109,7 +101,10 @@ test("floor_id=null 只在楼梯上下文允许且必须实际换层", () => {
     { allowUnknownFloor: true },
   ));
   const before = makeObservation();
-  const changed = makeObservation({ floor_id: "synthetic-floor-new", floor_name: null, floor_number: null });
+  const changed = makeObservation({
+    floor_id: "synthetic-floor-new", floor_name: null, floor_number: null,
+    map_instance_id: "map:synthetic-floor-new:topology-a",
+  });
   assert.equal(lab.compareExpectedDelta(before, changed, { floor_id: null }, {
     allowUnknownFloor: true,
     allowPositionChange: true,

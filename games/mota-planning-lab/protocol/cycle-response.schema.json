@@ -18,7 +18,9 @@
         "GUARD_MISMATCH",
         "UNSUPPORTED_INTERACTION",
         "DECISION_SERVICE_UNAVAILABLE",
-        "ENGINE_API_INCOMPATIBLE"
+        "ENGINE_API_INCOMPATIBLE",
+        "SESSION_CONFIRMATION_REQUIRED",
+        "PLANNING_BUDGET_EXHAUSTED"
       ]
     },
     "position": {
@@ -26,8 +28,8 @@
       "additionalProperties": false,
       "required": ["x", "y"],
       "properties": {
-        "x": {"type": "integer", "minimum": 0, "maximum": 10},
-        "y": {"type": "integer", "minimum": 0, "maximum": 10}
+        "x": {"type": "integer", "minimum": 0, "maximum": 255},
+        "y": {"type": "integer", "minimum": 0, "maximum": 255}
       }
     },
     "location": {
@@ -35,8 +37,8 @@
       "additionalProperties": false,
       "required": ["x", "y", "direction"],
       "properties": {
-        "x": {"type": "integer", "minimum": 0, "maximum": 10},
-        "y": {"type": "integer", "minimum": 0, "maximum": 10},
+        "x": {"type": "integer", "minimum": 0, "maximum": 255},
+        "y": {"type": "integer", "minimum": 0, "maximum": 255},
         "direction": {"enum": ["up", "down", "left", "right"]}
       }
     },
@@ -53,8 +55,15 @@
     "guard": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["floor_id", "floor", "position", "hp", "attack", "defense", "gold", "experience", "keys"],
+      "required": ["session_id", "map_instance_id", "dimensions", "topology_fingerprint", "floor_id", "floor", "position", "hp", "attack", "defense", "gold", "experience", "keys"],
       "properties": {
+        "session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "map_instance_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "dimensions": {
+          "type": "object", "additionalProperties": false, "required": ["width", "height"],
+          "properties": {"width": {"type": "integer", "minimum": 1, "maximum": 256}, "height": {"type": "integer", "minimum": 1, "maximum": 256}}
+        },
+        "topology_fingerprint": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
         "floor_id": {"type": "string", "minLength": 1, "maxLength": 256},
         "floor": {"type": ["integer", "null"]},
         "position": {"$ref": "#/$defs/location"},
@@ -72,8 +81,8 @@
       "required": ["type", "x", "y"],
       "properties": {
         "type": {"const": "grid"},
-        "x": {"type": "integer", "minimum": 0, "maximum": 10},
-        "y": {"type": "integer", "minimum": 0, "maximum": 10}
+        "x": {"type": "integer", "minimum": 0, "maximum": 255},
+        "y": {"type": "integer", "minimum": 0, "maximum": 255}
       }
     },
     "blockRef": {
@@ -81,8 +90,8 @@
       "additionalProperties": false,
       "required": ["x", "y", "id"],
       "properties": {
-        "x": {"type": "integer", "minimum": 0, "maximum": 10},
-        "y": {"type": "integer", "minimum": 0, "maximum": 10},
+        "x": {"type": "integer", "minimum": 0, "maximum": 255},
+        "y": {"type": "integer", "minimum": 0, "maximum": 255},
         "id": {"type": "string", "minLength": 1, "maxLength": 256},
         "cls": {"type": "string", "minLength": 1, "maxLength": 256},
         "trigger": {"type": ["string", "null"], "maxLength": 128},
@@ -93,6 +102,19 @@
       "type": "object",
       "additionalProperties": false,
       "minProperties": 1,
+      "allOf": [
+        {
+          "if": {"required": ["map_instance_id"]},
+          "then": {
+            "not": {
+              "anyOf": [
+                {"required": ["removed_blocks"]},
+                {"required": ["added_blocks"]}
+              ]
+            }
+          }
+        }
+      ],
       "properties": {
         "hp": {"type": "integer"},
         "attack": {"type": "integer"},
@@ -115,8 +137,14 @@
             {"type": "null"}
           ]
         },
-        "removed_blocks": {"type": "array", "maxItems": 121, "items": {"$ref": "#/$defs/blockRef"}},
-        "added_blocks": {"type": "array", "maxItems": 121, "items": {"$ref": "#/$defs/blockRef"}}
+        "map_instance_id": {
+          "anyOf": [
+            {"type": "string", "minLength": 1, "maxLength": 256},
+            {"type": "null"}
+          ]
+        },
+        "removed_blocks": {"type": "array", "maxItems": 8192, "items": {"$ref": "#/$defs/blockRef"}},
+        "added_blocks": {"type": "array", "maxItems": 8192, "items": {"$ref": "#/$defs/blockRef"}}
       }
     },
     "registryEntry": {
@@ -136,8 +164,30 @@
     },
     "registryEntries": {
       "type": "array",
-      "maxItems": 121,
+      "maxItems": 8192,
       "items": {"$ref": "#/$defs/registryEntry"}
+    },
+    "scanState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase", "anchor_map_instance_id", "current_map_instance_id",
+        "scanned_map_instance_ids", "pending_transition_count",
+        "traversed_transition_count", "frontier_count", "reason"
+      ],
+      "properties": {
+        "phase": {"enum": ["anchor", "discover", "sweep", "complete", "paused"]},
+        "anchor_map_instance_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "current_map_instance_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "scanned_map_instance_ids": {
+          "type": "array", "maxItems": 65536, "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 256}
+        },
+        "pending_transition_count": {"type": "integer", "minimum": 0},
+        "traversed_transition_count": {"type": "integer", "minimum": 0},
+        "frontier_count": {"type": "integer", "minimum": 0},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 512}
+      }
     },
     "execute": {
       "type": "object",
@@ -157,7 +207,9 @@
             {"type": "null"}
           ]
         },
-        "registry_entries": {"$ref": "#/$defs/registryEntries"}
+        "registry_entries": {"$ref": "#/$defs/registryEntries"},
+        "scan_state": {"$ref": "#/$defs/scanState"},
+        "acknowledged_action_id": {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"}
       }
     },
     "pause": {
@@ -171,7 +223,9 @@
         "reason": {"type": "string", "minLength": 1, "maxLength": 512},
         "details": {"type": "object"},
         "evidence_path": {"type": "string"},
-        "registry_entries": {"$ref": "#/$defs/registryEntries"}
+        "registry_entries": {"$ref": "#/$defs/registryEntries"},
+        "scan_state": {"$ref": "#/$defs/scanState"},
+        "acknowledged_action_id": {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"}
       }
     },
     "idle": {
@@ -181,7 +235,9 @@
       "properties": {
         "status": {"const": "idle"},
         "reason": {"type": "string", "minLength": 1, "maxLength": 512},
-        "registry_entries": {"$ref": "#/$defs/registryEntries"}
+        "registry_entries": {"$ref": "#/$defs/registryEntries"},
+        "scan_state": {"$ref": "#/$defs/scanState"},
+        "acknowledged_action_id": {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"}
       }
     },
     "error": {
@@ -192,7 +248,8 @@
         "status": {"const": "error"},
         "error_code": {"type": "string", "minLength": 1, "maxLength": 128},
         "reason": {"type": "string", "maxLength": 1000},
-        "errors": {"type": "array", "items": {"type": "object"}}
+        "errors": {"type": "array", "items": {"type": "object"}},
+        "acknowledged_action_id": {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"}
       }
     }
   }

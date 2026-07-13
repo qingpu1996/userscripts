@@ -11,18 +11,6 @@ function read(relativePath) {
   return JSON.parse(fs.readFileSync(path.join(projectDir, relativePath), "utf8"));
 }
 
-const baseline = read("tests/fixtures/current-4f-baseline.json");
-assert.equal(baseline.fixture_metadata.kind, "user-provided-baseline");
-assert.equal(baseline.fixture_metadata.live_capture, false);
-assert.equal(baseline.baseline.floor_display, "4F");
-assert.deepEqual(baseline.baseline.hero.loc, { x: 8, y: 3 });
-assert.equal(Object.hasOwn(baseline.baseline, "floor_id"), false,
-  "The unknown engine floorId must not be guessed");
-assert.equal(Object.hasOwn(baseline.baseline, "blocks"), false,
-  "The user baseline must not pretend to contain a map");
-assert.equal(baseline.history_consistency.rollback_slot, 8);
-assert.equal(baseline.history_consistency.rollback_is_protected, true);
-
 const synthetic = read("tests/fixtures/current-4f-synthetic-blocks.json");
 assert.equal(synthetic.fixture_metadata.synthetic, true);
 assert.equal(synthetic.fixture_metadata.live_capture, false);
@@ -46,6 +34,14 @@ assert.equal(observation.fixture_metadata.synthetic, true);
 assert.match(observation.observation.floor_id, /^synthetic-/u);
 assert.equal(observation.observation.dimensions.width, 11);
 assert.equal(observation.observation.dimensions.height, 11);
+assert.equal(observation.observation.protocol, 2);
+
+const topologies = read("tests/fixtures/runtime-topologies-v2.json");
+assert.equal(topologies.fixture_metadata.synthetic, true);
+assert.deepEqual(topologies.cases.map((entry) => [
+  entry.dimensions.width, entry.dimensions.height,
+]), [[11, 11], [13, 13], [7, 19], [5, 4]]);
+assert.ok(topologies.cases.at(-1).valid_cells.length < 20);
 
 for (const schemaName of [
   "observation.schema.json",
@@ -56,4 +52,4 @@ for (const schemaName of [
   assert.equal(schema.$schema, "https://json-schema.org/draft/2020-12/schema");
 }
 
-console.log("Fixture and schema provenance: PASS (7 JSON files)");
+console.log("Fixture and schema provenance: PASS (7 active JSON fixtures; v0.1 handoff archived)");

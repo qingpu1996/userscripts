@@ -200,7 +200,7 @@ test("共享 synthetic current-floor fixture 完整采集且不把 disabled bloc
   const enemyBlock = runtime.blocks.find((block) => block.id === "syntheticEnemy");
   const fake = makePoisonCore({
     floorId: runtime.floor_id,
-    currentMap: { title: runtime.floor_name },
+    currentMap: { title: runtime.floor_name, width: runtime.width, height: runtime.height },
     hero: runtime.hero,
     blocks: runtime.blocks,
     damage: { syntheticEnemy: enemyBlock.damage },
@@ -327,11 +327,11 @@ test("fingerprint 与 localhost service 共享固定向量", () => {
   });
   assert.equal(
     lab.canonicalize(lab.fingerprintProjection(observation)),
-    "{\"blocks\":[],\"floor_id\":\"F1\",\"hero\":{\"attack\":23,\"defense\":21,\"experience\":63,\"gold\":16,\"hp\":208,\"loc\":{\"direction\":\"down\",\"x\":0,\"y\":0}},\"keys\":{\"blue\":1,\"red\":0,\"yellow\":4}}",
+    "{\"blocks\":[],\"dimensions\":{\"height\":11,\"width\":11},\"floor_id\":\"F1\",\"hero\":{\"attack\":23,\"defense\":21,\"experience\":63,\"gold\":16,\"hp\":208,\"loc\":{\"direction\":\"down\",\"x\":0,\"y\":0}},\"keys\":{\"blue\":1,\"red\":0,\"yellow\":4},\"map_instance_id\":\"map:synthetic-floor-4:topology-a\",\"session_id\":\"SESSION-SYNTHETIC-0001\",\"topology\":{\"confidence\":\"confirmed\",\"kind\":\"rectangle\",\"source\":\"engine_current_map\"},\"topology_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
   );
   assert.equal(
     lab.fingerprintObservation(observation),
-    "sha256:6d36f36fa69506b2738c9725c7a12b45e2b8ef468cf24ff3f9efc861d98cdfa3",
+    "sha256:f7384ebc53ac8742a87f918317e868c53060601f4424867b551799002117ca54",
   );
 });
 
@@ -344,7 +344,8 @@ test("观察 wire clone 只保留协议白名单", () => {
   assert.equal(wire.hero.extra, undefined);
   assert.deepEqual(Object.keys(wire).sort(), [
     "blocks", "busy", "captured_at", "dimensions", "floor_id", "floor_name",
-    "floor_number", "hero", "keys", "page", "protocol",
+    "floor_number", "hero", "keys", "map_instance_id", "page", "protocol", "session_id",
+    "topology", "topology_fingerprint",
   ]);
 });
 
@@ -379,8 +380,32 @@ test("静态禁区、唯一页面运行时入口与 metadata 均满足约束", (
   assert.equal(config.metadata.downloadURL, undefined);
   assert.deepEqual(config.metadata.match, ["https://h5mota.com/games/24/*"]);
   assert.deepEqual(config.metadata.grant, [
-    "unsafeWindow", "GM_getValue", "GM_setValue", "GM_registerMenuCommand", "GM_xmlhttpRequest",
+    "unsafeWindow", "GM_getValue", "GM_setValue", "GM_deleteValue", "GM_listValues",
+    "GM_registerMenuCommand", "GM_xmlhttpRequest",
   ]);
   assert.equal(config.metadata["run-at"], "document-idle");
   assert.equal(config.metadata.connect, "127.0.0.1");
+});
+
+test("双构建物均包含 A/B generation、canonical 写后验证与底层删除门禁", () => {
+  const repoDir = path.resolve(projectDir, "../..");
+  for (const name of [
+    "mota-planning-lab.user.js",
+    "mota-planning-lab.direct-mount.js",
+  ]) {
+    const artifact = fs.readFileSync(path.join(repoDir, "dist", name), "utf8");
+    for (const marker of [
+      "JOURNAL_STORAGE_UNSTABLE",
+      "GM_setValue-readback-1",
+      "GM_setValue-readback-2",
+      "GM_deleteValue-readback",
+      "localStorage.setItem-readback",
+      "localStorage.removeItem-readback",
+      "JOURNAL_SLOT_KEYS",
+      "previous_commit_hash",
+      "journal-generation-write",
+      "candidate-readback-invalid",
+      "complete_candidate_observed",
+    ]) assert.match(artifact, new RegExp(marker.replaceAll(".", "\\."), "u"), `${name}: ${marker}`);
+  }
 });

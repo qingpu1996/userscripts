@@ -1,77 +1,40 @@
-# 严格盲玩合规说明
+# 严格盲玩合规
 
-## 合规结论
+## 读取边界
 
-v0.1.0 的浏览器运行代码以 `engine-adapter.js` 为唯一 H5 引擎访问点；网络层只能序列化白名单 observation 并发往固定 localhost。决策服务不包含《魔塔24层》地图、攻略、标准路线或隐藏知识，只能根据收到的当前层观察及以前合法收到的观察建立模型。
+浏览器唯一运行态入口是 `src/engine-adapter.js`。每轮先读取当前 floorId，之后只读取 hero 白名单、`status.maps[currentFloorId]`、`getMapBlocksObj(currentFloorId,true)` 和当前可见怪物坐标的 enemy info/damage。dimensions 与 valid cells 只从这一个当前动态 map 获得。
 
-本轮 QA 完全离线，使用 fake core 与明确标记为 synthetic 的 fixtures。没有访问真实游戏页面、真实运行态或存档，因此本文不声称已经验证真实引擎版本兼容性。
+禁止读取 floor catalogue、非 current map、完整 maps、全量素材、工程地图源码、存档原文、攻略或路线资料。出口后的布局保持 opaque，只有英雄正常转移进入后才采集。
 
-## 允许读取
+不使用图像输入、像素提取或识别；网络只向固定 localhost 发送当前 observation。adapter 逐字段复制，不传 core/status/map 原对象。
 
-| 数据 | 限制 |
-| --- | --- |
-| 当前 `floorId` | 每次先读取，作为唯一允许的 map 键 |
-| hero | 只复制生命、攻防、金币、经验、位置、方向、三色钥匙 |
-| 当前动态 map | 只读取 `maps[currentFloorId]` 的尺寸/当前显示信息，不展开 maps |
-| 当前 blocks | 只用当前 floorId 调用动态 block 查询，并过滤 disable |
-| 当前可见怪物 | 只按当前 observation 中的怪物坐标查敌人信息和 damage |
-| 稳定性 | 只读移动、控制锁和“是否存在活动事件”的布尔结果，不发送事件内容 |
+## 写入边界
 
-## 永久禁止
+不直接赋值 hero、map、block、enemy 或 event。只 capability-probe 并调用 `moveDirectly`、`setAutomaticRoute`、`stopAutomaticRoute`。物理 save/load 默认禁用且没有内置槽位，不调用 `doSL`。
 
-- `core.floors`、任意未到达楼层、非 current floor 的 `status.maps`。
-- `floors.min.js`、游戏工程地图源码、完整初始地图或全量素材对象。
-- 存档原文以及存档中尚未到达楼层的信息。
-- 针对《魔塔24层》的攻略、路线、录像、地图或其他针对性资料。
-- screenshot、Canvas 图像提取、OCR 或图像识别输入。
-- 递归或通用序列化完整 `core`、`status`、`maps` 或页面对象。
-- 直接赋值 hero、block、enemy、event 或 `core.status`。
-- 鼠标逐格模拟、键盘伪造或私有写入兜底。
+接管扫描只允许安全空走廊和一个已登记楼梯/传送边界；扫描未 complete 前硬排除怪物、门、资源、NPC 和机关。opaque 出口执行后必须重新观察，不能在旧地图上继续推演。每次最多一个状态边界；行动后完整重读、稳定两轮并核对真实差分。
 
-## 代码边界
+## 世界模型来源
 
-1. `src/engine-adapter.js` 是唯一允许拿到页面 core 的文件。
-2. adapter 逐字段创建普通对象，不把 core、status、hero 原对象或 map 原对象传给其他模块。
-3. observer 再次白名单复制网络字段；采集期异常只保留安全标量证据和完整当前层 observation，通信层不接受任意 payload。
-4. engine 行动只开放 capability-probed `moveDirectly`、`setAutomaticRoute`、`stopAutomaticRoute`。
-5. save/load 默认完全禁用；slot 8 永久保护。v0.1.0 自动循环不调用真实 `doSL`。
-6. 服务 models 使用 `extra=forbid`；SQLite 和 JSONL 只写合法 observation 摘要、fingerprint、决定及幂等账本。
+SQLite 的 map instances、snapshots、frontiers、scan state/audit 和 transitions 全部来自历史上合法收到的 observation。transition 只从实际 completed change-map 的 pre/post 建立，不预测未走过出口目标。显示楼层数字不作为身份；同 floorId 的不同 map instance 独立建模。可逆性要求精确端点反向观察。
 
-## 网络数据流
+浏览器 v1 journal 必须先专用归档并显式处置，普通控制不能绕过。构建 marker 明确区分 userscript/direct；userscript 缺 GM API 不会读取 direct namespace。A/B generation envelope 无单点 pointer，物理写永远落到非当前最高槽；旧完整槽在 candidate 截断/变形/no-op/throw 时仍可恢复，完整 candidate 则携带 pending 或 completed/ack 证据成为新最高。旧单 key 只读 witness 的任何改写都会重新 quarantine。pending 未验证持久前行动 API 调用数必须为零。
 
-```text
-当前页面 core
-  -> engine-adapter 显式字段复制
-  -> observer 当前 11x11 observation
-  -> protocol 再白名单复制
-  -> GM_xmlhttpRequest
-  -> http://127.0.0.1:18724/cycle
-```
+服务在接受前不以任何 SQLite URI/连接模式打开导入 path。main/WAL/SHM 经过成对检查、WAL framing、SHM size、双读 identity/stat/hash 与分类后复核，只复制到私有 candidate generation 进行 schema/行为 probe；通过后以原子 manifest 发布，并且只连接该已分类 generation。导入 witness 和 generation 在发布、connect 后都再次核对；拒绝时被换入的 legacy/future/unknown main 与 sidecar 不被 DDL/WAL 改写。
 
-没有其他远端 URL。userscript metadata 不包含 `rawBaseUrl`、`updateURL` 或 `downloadURL`，不会自动发布或更新。
+行动恢复同样 fail closed：服务按 session 而非当前 fingerprint 查唯一 unresolved action，同 pre 只重发原 ID；completed 通过独立显式 ack 结算后，下一轮才签下一 ID。`intent=reconnect_only` 是 no-issue 路径，不进入 planner 或 issuance；错误 execute 在浏览器被持久隔离并零执行。
 
-## 执行完整性
+## Direct mount
 
-- guard 在行动前重新采集并逐字段精确比较。
-- 纯空走廊同时要求当前观察路径证明与 `canMoveDirectly` 明确允许。
-- 门、怪物、资源、楼梯、NPC 和机关是状态变化边界，每轮最多处理一个。
-- 服务与浏览器双重要求边界具有可验证非位置 postcondition；怪物/门/资源必须声明目标 block 移除，楼梯必须声明 floor 变化。
-- 行动后等待移动、控制锁和事件全部结束，fingerprint 改变后连续两次一致。
-- expected_delta 不符时停止，不用宽松容差掩盖未知机制。
-- action_id 先入持久 journal，再调用游戏接口；刷新和丢包不会触发盲目重放。
+direct mount 构建物与 userscript 使用相同采集和执行模块。它只使用项目 namespace 内的旧 witness、v1 quarantine 与两个 A/B slot，不枚举其他 localStorage；CORS 默认关闭，显式模式也只允许精确目标 origin 和必要 headers/method。没有外网 URL或自动更新入口。
 
 ## 自动化证明
 
-自动化检查包括：
+- Proxy fake core 对未知 status/map/runtime 读取和所有写入投毒。
+- 静态扫描覆盖 src、service、userscript 和 direct-mount 构建物。
+- 固定 vendored Acorn 8.16.0 AST 扫描先校验 parser、MIT LICENSE 与 provenance hash，再按词法 scope/binding identity 做传播。只有未 shadow 的真实 global root，或可静态解析的 IIFE/简单本地函数调用实参，才传播为 runtime；函数参数不会因名称恰好是 `core/runtime` 而升级。规则覆盖 Parenthesized/Sequence/Chain/Member、声明与赋值 destructure/default/rest/computed pattern、assignment/update/delete、常量 `+`/template、global root，以及 Object/Reflect `call/apply/bind`；真实 global runtime 被禁止，局部参数/变量 shadow、Object-like 与 detached copy 正例必须通过。
+- 11×11、13×13、7×19 和异形空洞走同一通用代码。
+- v1 journal/协议、legacy/future SQLite、dimensions/grid 冲突、未知 topology、未知伤害、guard/delta mismatch 全部 fail closed。
+- localhost + fake core 集成只使用 synthetic fixtures。
 
-- 源码与生成 userscript 的静态禁区扫描。
-- Proxy fake core：未白名单属性、其他 map 键和素材访问会立即抛错。
-- poisoned maps/material 值不进入 observation/request 的测试。
-- guard mismatch 零行动调用、direct/route 分流、单边界停止测试。
-- action_id 重复、刷新、丢包、服务重启和 ambiguous recovery 测试。
-- completed 后返回同 fingerprint 的持久 A→B→C action_id 重签、碰撞跳过与 cache 行数测试。
-- `null/???/NaN` 采集暂停的完整观察证据、空边界差分、仅位移 post-state 和旧 journal 恢复测试。
-- 响应的必填可空 `trigger/floor`、action_id、registry version 以及根/registry/operation/guard/expected_delta 额外字段拒绝测试；真实 FastAPI JSON 同时过 Pydantic、checked-in JSON Schema 与浏览器 parser。
-- metadata、固定 localhost 地址、八类 pause 枚举、slot 8 保护检查。
-
-具体命令和结果记录在 [`qa/`](../qa/README.md)。真实页面只读核对与用户授权后的分级行动仍保持未完成。
+本轮没有访问真实游戏、存档或外网，也没有执行真实行动；离线 QA 不能替代后续用户授权的现场验证。

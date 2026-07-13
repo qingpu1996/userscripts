@@ -1,76 +1,49 @@
 # QA Runbook
 
-## 离线自动化
+## Offline
 
-在已安装 `service/requirements.lock` 的 Python 3.11+ 项目环境中，从仓库根目录执行：
+运行 `scripts/run-offline-qa.sh`，必须通过：
 
-```bash
-MOTA_LAB_PYTHON="$PWD/games/mota-planning-lab/.venv/bin/python" \
-  bash games/mota-planning-lab/scripts/run-offline-qa.sh
-```
+- fixtures 与三个 JSON Schema；
+- 全部 JS、Python unittest、localhost fake-core integration；
+- Pydantic/Schema/browser response fixture；
+- Python compileall 和所有 JS syntax；
+- userscript/direct-mount 双次确定性构建；
+- src/service/dist 静态盲玩扫描；
+- Markdown local links、JSON parse、whitespace；
+- 临时 Git index prospective staged diff check。
 
-该脚本依次验证：
+重点 fixture：11×11 回归、13×13、7×19、valid_cells 空洞、多图同显示层、同 floorId revision、单/双向 transition、frontier 不越界、边界移除重算、hero.exp、缺 keys、v1 fail closed、三种 session、CORS、direct mount。
 
-1. baseline/synthetic fixtures 的来源标记与 protocol JSON 可解析性；
-2. Node `node:test` 浏览器侧单元测试；
-3. Python `unittest` 兼容测试（同一批 `TestCase` 也可由 pytest 收集）；
-4. shared synthetic wire fixtures 同时通过 Python service models、无第三方依赖的 checked-in JSON Schema validator 和浏览器 validator；
-5. 真正启动 `127.0.0.1:18724` 的 fake-core 集成测试；
-6. Python compileall 与每个 JS 源文件的 `node --check`；
-7. 使用仓库构建器生成 `dist/mota-planning-lab.user.js`；
-8. 生成产物语法检查和静态盲玩禁区扫描；
-9. `git diff --check`。
+首轮验收整改还必须覆盖：既有 v2 journal 不能掩盖 v1 key；普通确认/启动/重连零请求零行动；legacy/future SQLite 拒绝前后文件字节、user_version 与 schema 不变；同 floorId A→B；scan restart/idempotency/audit/单向 paused；opaque 出口分支终止；dimensions 与 ragged/缺行/短行 grid 联合校验；同 map pair 的不同 portal 不误标 reversible；Protocol v2 错误文案和 scan_state 三层 wire 对齐。
 
-如果希望显式使用 pytest：
+第二轮整改还必须覆盖：legacy disposition 不清除任何已有 v2 recovery evidence，archive 后 legacy 改写重新 quarantine；伪同列 v2、缺 PK/UNIQUE/CHECK/FK/index、错 type/default/NOT NULL、partial scan tables 和 future version 均在 WAL/DDL 前原态拒绝；同 session 换 fingerprint 不签第二个 issued，同 pre 重连/服务重启重发原 action ID，完成后才签下一 ID；reconnectOnly 携带真实 recovery identity 且零执行；静态 fixture 拦截 core/runtime/alias 的 dot/bracket/optional floors 与 hero write，合法 current map/hero read 通过。
 
-```bash
-cd games/mota-planning-lab
-PYTHONPATH=service:tests/python .venv/bin/python -m pytest tests/python -q
-```
+第三轮整改还必须覆盖：malformed v1/v2、JSON primitive/array、wrong protocol/shape、storage read exception 和内容改写重新 quarantine；注释/string 伪 CHECK、hidden/generated column 与合法库 INVALID 行为 probe；reconnect pause/error/malformed/network 保留 completed recovery，明确同 ID ack 后才清；ordinary/scan 的 A→B 精确目标、A→C mismatch、同 floorId 与歧义 target；括号 alias、常量 bracket、nested destructure、`**=`/delete/Object mutation APIs 的静态正反 fixture。
 
-## 自动化故障注入矩阵
+第四轮整改还必须覆盖：Tampermonkey 两 key 全缺/单缺、旧 sentinel、present `undefined/null`、object clone、read/list throw 与 GM delete 后 absent；`intent=reconnect_only` 无 pending 时 action/decision 零新增、有 unresolved 时同 identity 暂停、错误 execute 零执行且持久留证；合法活动 WAL 可重开、非法 WAL/无 SHM/截断 sidecar/复制不稳定在拒绝时原 main/WAL/SHM hash+mtime 不变且私有临时目录清理；`window.core["floors"]`、`unsafeWindow.core["floors"]`、status ancestor mutation 与 `Reflect.deleteProperty` 全拦，局部对象正例通过。
 
-| 范围 | 覆盖 |
-| --- | --- |
-| observation | 当前 hero/keys/floor/坐标、disable 过滤、可见怪物调用、11×11、非法方向/身份、采集期未知战损的完整 pause observation |
-| blind-play | Proxy poison、唯一 core 入口、其他 maps/material 毒值、wire 最小字段、静态扫描 |
-| guard/executor | 任一 guard mismatch 零调用、纯走廊 direct、单边界 route、多边界拒绝、状态变化即停 |
-| stability/delta | moving/lock/event、fingerprint 两次稳定、资源/怪物/block/floor 差分、边界非位置 postcondition、不符暂停 |
-| idempotency | pending/completed 去重、pre/post/ambiguous 三分法、旧空 delta 边界不误 completed、response loss、service restart、replacement chain、completed 后同 fingerprint 的 A→B→C 重签 |
-| localhost | header、media type、body limit、rate limit、500/超时/非法 JSON/重复 callback、四种 status 严格字段、必填可空 `trigger/floor`、Pydantic/JSON Schema/浏览器三侧 wire 矩阵 |
-| service | strict Pydantic、field-aware knowledge/wire serialization、observation store、SQLite issuance sequence/ledger/cache、碰撞与重启、JSONL 摘要、graph/search/dominance |
-| integration | unknown floor evidence → synthetic labels → corridor direct → resource boundary → enemy boundary → report idle |
+第五轮整改还必须覆盖：双构建物显式且互斥的 runtime marker；缺 `GM_getValue/GM_setValue/GM_deleteValue/GM_listValues/GM_xmlhttpRequest` 任一项零降级，stale list omission/inclusion、stored undefined、两次 get/list 变化、读写删/request throw；SQLite 在分类前、复制中、发布时和 generation connect 时的 inode swap，对 future 99 替换库 main/sidecar bytes+mtime+user_version 零写，合法 v2/active WAL/服务重启保留，manifest 与 crash candidate 恢复；bare global/nested/computed destructure 和 Object/Reflect 函数别名全拦，合法局部 alias mutation 通过。详见 [storage](storage.md)。
 
-## QA 证据规则
+第六轮整改还必须覆盖：GM `setValue` silent no-op/旧值/截断/clone 变形、delete no-op、read→write witness 变化、写后两次读取变化/throw；direct mount `setItem/removeItem` no-op 与读回变化/throw；正常 structured clone canonical 等价通过；pending 写失败引擎 API 为零，completed/ack 写失败保留上一 identity 且下一响应不执行；双 dist 必须包含同一门禁。静态 fixture 必须拦截二级 Object/Reflect alias、global destructure root、`'flo'+'ors'`、无插值 template 和 `call/apply/bind`，并保留 Object-like/local plain object/current runtime read 正例。
 
-- 记录实际命令、解释器版本、测试计数、退出码和构建产物校验。
-- 自动化运行目录写入 `qa/runs/<date>-offline/`；不得把 `/tmp` 数据冒充真实页面证据。
-- 测试地图必须明确 `synthetic=true`；用户 4F baseline fixture 不得包含猜测的 floorId 或 blocks。
-- 自动化 QA 不使用 screenshot、OCR 或 Canvas。
-- 真实页面 QA 必须单独标记为 `not-run`、`pass` 或 `fail`，不能由 fake core 代替。
+第七轮整改还必须覆盖：A/B 连续多代交替、同 generation 冲突、previous hash 断裂、rollback/gap/unexpected higher；GM/direct no-op、截断、变形、throw、complete-then-throw；pending candidate 失败时引擎零调用且刷新保留旧或完整新 identity，completed/ack candidate 失败仍保留 recovery 链；旧单 key v2/v1/corrupt 安全导入且不覆盖，内容变化重新 quarantine；备份文档包含所有 slots。静态门禁必须离线校验 Acorn 8.16.0 parser/LICENSE/provenance hash，拦截 `(core).floors`、`(globalThis.core).floors`、`(runtime.status).hero.hp=1`、立即 `bind` 调用、`(0,globalThis).core.floors`，并通过局部 `core/runtime/globalThis` shadow 正例。
 
-## T73：首次真实页面只读核对（本轮未执行）
+第八轮整改还必须覆盖：generation 1 的完整 base invariant、generation 2/previous 1 合法、单槽 generation 100/previous 1 gap 拒绝、单槽 generation 100/previous 99 可恢复、安全整数上界与下一次写入溢出拒绝、双槽连续链。AST 必须拦截 assignment object/array/default/rest/computed destructure、IIFE/简单本地函数实参传播，并通过参数名为 `core/runtime` 的 local shadow；两项核心攻击要分别注入实际 src、userscript 和 direct-mount 源文本做内存扫描。文档必须明确无外部高水位时浏览器单槽不能检测完整历史回放。
 
-只有用户明确授权后才能进行：
+## 后续现场门禁
 
-1. 确保 userscript 初始 journal 为空，服务是否运行均不会触发行动。
-2. 打开目标页，确认面板为 `STOPPED`。
-3. 导出当前层 observation，核对 4F、`x=8,y=3`、HP/ATK/DEF `208/23/21`、Gold/EXP `16/63`、钥匙 `4/1/0`。
-4. 确认行动 API、save/load 调用数为零，slot 8 未读取。
-5. 确认导出只有当前 11×11 动态 blocks，无其他 floor/maps/material。
-6. 保存白名单 observation 摘要与结构化控制台日志；不把截图作为输入。
+现场 QA 必须由用户另行授权：
 
-任一字段不符就停在 `INITIAL_BASELINE_MISMATCH`，不得继续。
+1. 只读当前首次 observation，不确认、不行动。
+2. 核对动态 dimensions、topology 来源、hero.exp/keys、map instance。
+3. 用户显式确认 session baseline，仍不启动。
+4. 分别授权空走廊、单资源、单门、单怪、单次换图。
+5. 换图只检查实际 pre/post transition，不检查未到达目标布局。
+6. 验证刷新、服务重启、响应丢失恢复。
 
-## T74：用户授权后的分级现场验证（本轮未执行）
+任一 API、事件时序、topology 或差分不可靠立即暂停。不得用现场截图作为规划输入，不得用真实游戏结果修改 synthetic 预期以掩盖问题。
 
-必须按以下顺序逐项授权、逐项复位和检查录像/触发器一致性：
+## 证据
 
-1. 纯空走廊 `moveDirectly`；
-2. 单个已知资源；
-3. 单扇已知门；
-4. 单个 damage 已知怪物；
-5. 一次楼层切换；
-6. 刷新、服务重启和响应丢失恢复。
-
-每项只允许一个状态变化边界。真实 API 签名或稳定判断不兼容时归入 `ENGINE_API_INCOMPATIBLE`，不得私有写入兜底。
+每轮 QA 在 `qa/runs/<date>-<name>/` 保存 commands、summary、机器可读 results、构建 hash、工作区状态和明确未覆盖风险。prospective staged 检查必须使用临时 index 与隔离 object directory，且记录真实 index 检查前后哈希。真实页面未跑时必须写 `not-run`。

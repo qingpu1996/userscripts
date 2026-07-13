@@ -5,6 +5,18 @@ MotaLab.compareGuard = function compareGuard(observation, guard) {
     if (expected !== actual) differences.push({ field, expected, actual });
   }
 
+  if (guard.session_id !== undefined) {
+    compare("session_id", guard.session_id, observation.session_id || guard.session_id);
+  }
+  compare("map_instance_id", guard.map_instance_id, observation.map_instance_id,
+    guard.map_instance_id !== undefined);
+  compare("topology_fingerprint", guard.topology_fingerprint, observation.topology_fingerprint,
+    guard.topology_fingerprint !== undefined);
+  if (guard.dimensions) {
+    compare("dimensions.width", guard.dimensions.width, observation.dimensions.width);
+    compare("dimensions.height", guard.dimensions.height, observation.dimensions.height);
+  }
+
   if (guard.floor_id !== undefined) compare("floor_id", String(guard.floor_id), observation.floor_id);
   else if (guard.floor !== undefined) {
     if (typeof guard.floor === "number") compare("floor", guard.floor, observation.floor_number);
@@ -39,17 +51,14 @@ MotaLab.compareGuard = function compareGuard(observation, guard) {
   return { ok: differences.length === 0, differences };
 };
 
-MotaLab.compareInitialBaseline = function compareInitialBaseline(observation) {
-  const baseline = MotaLab.INITIAL_BASELINE;
-  const guard = {
-    floor: baseline.floor_number,
-    position: baseline.hero.loc,
-    hp: baseline.hero.hp,
-    attack: baseline.hero.attack,
-    defense: baseline.hero.defense,
-    gold: baseline.hero.gold,
-    experience: baseline.hero.experience,
-    keys: baseline.keys,
+MotaLab.baselineSummary = function baselineSummary(observation) {
+  return {
+    fingerprint: MotaLab.fingerprintObservation(observation),
+    floor_id: observation.floor_id,
+    map_instance_id: observation.map_instance_id,
+    dimensions: Object.assign({}, observation.dimensions),
+    topology_fingerprint: observation.topology_fingerprint,
+    hero: MotaLab.cloneJsonValue(observation.hero),
+    keys: MotaLab.cloneJsonValue(observation.keys),
   };
-  return MotaLab.compareGuard(observation, guard);
 };

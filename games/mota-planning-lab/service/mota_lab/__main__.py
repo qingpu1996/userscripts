@@ -36,6 +36,11 @@ def _parser() -> argparse.ArgumentParser:
     serve = subcommands.add_parser("serve", help="run the localhost decision service")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=18724)
+    serve.add_argument(
+        "--allow-direct-mount-origin",
+        choices=["https://h5mota.com"],
+        help="explicitly enable exact-origin CORS for the in-app direct-mount bridge",
+    )
 
     labels = subcommands.add_parser("labels", help="inspect or apply human labels")
     label_commands = labels.add_subparsers(dest="labels_command", required=True)
@@ -96,6 +101,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
             from .api import create_app
 
+            settings = replace(settings, direct_mount_origin=args.allow_direct_mount_origin)
             uvicorn.run(create_app(settings), host="127.0.0.1", port=18724)
             return 0
 

@@ -41,9 +41,11 @@ def classify_recovery(
     if recovery.pre_fingerprint is not None and recovery.pre_fingerprint != action.pre_fingerprint:
         raise ActionConflict("recovery pre_fingerprint does not match action ledger")
     if recovery.phase == "not_executed":
+        if action.status != "issued":
+            raise ActionConflict(f"action in status {action.status} cannot be retried")
         if current_fingerprint != action.pre_fingerprint:
             return RecoveryDirective("mismatch", action, "RECOVERY_STATE_AMBIGUOUS")
-        return RecoveryDirective("resign", action)
+        return RecoveryDirective("replay", action)
     if recovery.phase == "pending":
         if current_fingerprint == action.pre_fingerprint:
             return RecoveryDirective("pending", action)

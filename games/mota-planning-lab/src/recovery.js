@@ -44,6 +44,7 @@ MotaLab.classifyPendingRecovery = function classifyPendingRecovery(pending, obse
       {
         allowPositionChange: true,
         allowUnknownFloor: pending.allow_unknown_floor === true,
+        allowUnknownMapInstance: pending.allow_unknown_map_instance === true,
       },
     );
   } catch (error) {

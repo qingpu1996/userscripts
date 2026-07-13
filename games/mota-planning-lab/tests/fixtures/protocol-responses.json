@@ -17,8 +17,12 @@
       }
     ],
     "guard": {
+      "session_id": "SESSION-SYNTHETIC-0001",
       "floor_id": "synthetic-floor-4",
       "floor": null,
+      "map_instance_id": "map:synthetic-floor-4:topology-a",
+      "dimensions": {"width": 11, "height": 11},
+      "topology_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "position": {
         "x": 8,
         "y": 3,
@@ -78,6 +82,11 @@
         "version": 1
       }
     ]
+  },
+  "recovery_ack": {
+    "status": "idle",
+    "reason": "Synthetic fixture: completed recovery was explicitly acknowledged.",
+    "acknowledged_action_id": "AUTO-DEADBEEFDEADBEEF"
   },
   "error": {
     "status": "error",

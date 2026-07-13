@@ -1,17 +1,20 @@
 # 暂停分类与取证
 
-顶层 `pause_kind` 是封闭集合，只允许以下八类。更细原因放在 `detail_code`，不得新增顶层类型把普通路线判断推给人工。
+顶层 `pause_kind` 是封闭集合。Protocol v2 保留原有八类并增加两个安全控制类；更细原因放在 `detail_code`，不得把普通路线判断推给人工。
+
+- `SESSION_CONFIRMATION_REQUIRED`：首次 observation 尚未由用户和服务显式确认，不签发行动。
+- `PLANNING_BUDGET_EXHAUSTED`：世界状态搜索达到节点/时间预算，保留审计上下文后停止。
 
 | pause_kind | 使用条件 | 典型 detail_code |
 | --- | --- | --- |
 | `NEW_OBJECT_OR_MECHANISM` | 新 block identity、trigger、NPC/机关，或边界标签缺少可验证 postcondition | `UNKNOWN_BLOCK`、`UNKNOWN_TRIGGER`、`UNKNOWN_NPC`、`UNKNOWN_MECHANISM`、`INCOMPLETE_LABEL` |
 | `UNKNOWN_DAMAGE` | 当前可见怪物 damage 为 null、`???`、非有限、负数或无法解释 | `DAMAGE_NULL`、`DAMAGE_UNEXPLAINED` |
 | `UNKNOWN_FLOOR` | 当前 floorId 尚无合法模型 | `FLOOR_MODEL_MISSING` |
-| `EXPECTED_DELTA_MISMATCH` | 实际资源/block/floor 差分不符，或恢复状态无法解释 | `RESOURCE_DELTA_MISMATCH`、`RECOVERY_STATE_AMBIGUOUS` |
+| `EXPECTED_DELTA_MISMATCH` | 实际资源/block/floor 差分不符，或恢复/ledger identity 无法安全解释 | `RESOURCE_DELTA_MISMATCH`、`RECOVERY_STATE_AMBIGUOUS`、`RECOVERY_JOURNAL_LEDGER_MISMATCH`、`RECONNECT_UNRESOLVED_ACTION` |
 | `GUARD_MISMATCH` | 行动前现场与 guard 不同；首次现场与用户基线不同 | `PRE_ACTION_GUARD_MISMATCH`、`INITIAL_BASELINE_MISMATCH` |
 | `UNSUPPORTED_INTERACTION` | 剧情、选择菜单、商店等尚未实现的交互 | `STORY_EVENT`、`CHOICE_MENU`、`SHOP` |
-| `DECISION_SERVICE_UNAVAILABLE` | localhost 不可达、响应非法或持续返回不安全计划 | `CONNECTION_FAILED`、`INVALID_RESPONSE`、`UNSAFE_MULTI_BOUNDARY_RESPONSE` |
-| `ENGINE_API_INCOMPATIBLE` | 必需公开 API 缺失、签名不兼容或稳定状态无法可靠判断 | `MISSING_API`、`SIGNATURE_MISMATCH`、`STABILITY_TIMEOUT` |
+| `DECISION_SERVICE_UNAVAILABLE` | localhost 不可达、响应非法、仅重连错误签发 execute 或持续返回不安全计划 | `CONNECTION_FAILED`、`INVALID_RESPONSE`、`RECONNECT_UNEXPECTED_EXECUTE`、`UNSAFE_MULTI_BOUNDARY_RESPONSE` |
+| `ENGINE_API_INCOMPATIBLE` | 必需公开 API/GM API 缺失、journal storage 不稳定、签名不兼容或稳定状态无法可靠判断 | `MISSING_API`、`USERSCRIPT_API_UNAVAILABLE`、`JOURNAL_STORAGE_UNSTABLE`、`SIGNATURE_MISMATCH`、`STABILITY_TIMEOUT` |
 
 ## 不允许人工暂停的情况
 

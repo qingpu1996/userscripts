@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict
 
@@ -59,6 +60,10 @@ def assert_json_schema_instance(
         "title",
         "oneOf",
         "anyOf",
+        "allOf",
+        "if",
+        "then",
+        "not",
         "const",
         "enum",
         "type",
@@ -74,6 +79,7 @@ def assert_json_schema_instance(
         "pattern",
         "minimum",
         "maximum",
+        "uniqueItems",
     }
     unsupported = set(schema) - supported_keywords
     if unsupported:
@@ -83,6 +89,25 @@ def assert_json_schema_instance(
     if "$ref" in schema:
         assert_json_schema_instance(value, _resolve(root, schema["$ref"]), root=root, path=path)
         return
+
+    for branch in schema.get("allOf", []):
+        assert_json_schema_instance(value, branch, root=root, path=path)
+
+    if "if" in schema and "then" in schema:
+        try:
+            assert_json_schema_instance(value, schema["if"], root=root, path=path)
+        except JsonSchemaAssertionError:
+            pass
+        else:
+            assert_json_schema_instance(value, schema["then"], root=root, path=path)
+
+    if "not" in schema:
+        try:
+            assert_json_schema_instance(value, schema["not"], root=root, path=path)
+        except JsonSchemaAssertionError:
+            pass
+        else:
+            raise JsonSchemaAssertionError(f"{path}: forbidden schema matched")
 
     if "oneOf" in schema:
         matches = 0
@@ -148,6 +173,10 @@ def assert_json_schema_instance(
             raise JsonSchemaAssertionError(f"{path}: too few items")
         if "maxItems" in schema and len(value) > schema["maxItems"]:
             raise JsonSchemaAssertionError(f"{path}: too many items")
+        if schema.get("uniqueItems") is True:
+            normalized = [json.dumps(item, sort_keys=True, separators=(",", ":")) for item in value]
+            if len(normalized) != len(set(normalized)):
+                raise JsonSchemaAssertionError(f"{path}: array items are not unique")
         if "items" in schema:
             for index, item in enumerate(value):
                 assert_json_schema_instance(

@@ -4,9 +4,10 @@
   "title": "Mota Planning Lab cycle request",
   "type": "object",
   "additionalProperties": false,
-  "required": ["source", "completed_action_id", "observation"],
+  "required": ["source", "intent", "completed_action_id", "observation", "session"],
   "properties": {
     "source": {"const": "mota-planning-lab-userscript"},
+    "intent": {"enum": ["cycle", "reconnect_only"]},
     "completed_action_id": {
       "anyOf": [
         {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"},
@@ -14,6 +15,20 @@
       ]
     },
     "observation": {"$ref": "observation.schema.json"},
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {"enum": ["new_game", "handoff_expected_guard", "resume_existing_ledger"]},
+        "command": {"enum": ["observe", "confirm"], "default": "observe"},
+        "expected_guard": {"$ref": "cycle-response.schema.json#/$defs/guard"}
+      },
+      "allOf": [
+        {"if": {"properties": {"mode": {"const": "handoff_expected_guard"}}}, "then": {"required": ["expected_guard"]}},
+        {"if": {"properties": {"mode": {"enum": ["new_game", "resume_existing_ledger"]}}}, "then": {"not": {"required": ["expected_guard"]}}}
+      ]
+    },
     "recovery": {
       "type": "object",
       "additionalProperties": false,

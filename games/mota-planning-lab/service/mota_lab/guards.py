@@ -10,6 +10,10 @@ from .models import Guard, Observation
 def guard_from_observation(observation: Observation) -> Guard:
     hero = observation.hero
     return Guard(
+        session_id=observation.session_id,
+        map_instance_id=observation.map_instance_id,
+        dimensions=observation.dimensions,
+        topology_fingerprint=observation.topology_fingerprint,
         floor_id=observation.floor_id,
         floor=observation.floor_number,
         position=hero.loc,

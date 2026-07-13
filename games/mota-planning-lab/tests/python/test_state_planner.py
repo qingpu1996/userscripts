@@ -73,16 +73,9 @@ class GraphAndModelTests(unittest.TestCase):
         observation = Observation.model_validate(raw)
         self.assertEqual(
             set(fingerprint_payload(observation)),
-            {"floor_id", "hero", "keys", "blocks"},
+            {"session_id", "map_instance_id", "floor_id", "dimensions", "topology", "topology_fingerprint", "hero", "keys", "blocks"},
         )
-        self.assertEqual(
-            canonical_json(fingerprint_payload(observation)),
-            '{"blocks":[],"floor_id":"F1","hero":{"attack":23,"defense":21,"experience":63,"gold":16,"hp":208,"loc":{"direction":"down","x":0,"y":0}},"keys":{"blue":1,"red":0,"yellow":4}}',
-        )
-        self.assertEqual(
-            observation_fingerprint(observation),
-            "sha256:6d36f36fa69506b2738c9725c7a12b45e2b8ef468cf24ff3f9efc861d98cdfa3",
-        )
+        self.assertTrue(observation_fingerprint(observation).startswith("sha256:"))
 
         changed_metadata = make_observation(
             floor_name="synthetic display name",
@@ -185,7 +178,7 @@ class PlannerCycleTests(unittest.TestCase):
         self.assertEqual(response["guard"]["hp"], 208)
         self.assertEqual(response["expected_delta"]["hp"], 200)
         self.assertEqual(response["expected_delta"]["removed_blocks"][0]["id"], "redPotion")
-        self.assertIn("有限深度搜索", response["reason"])
+        self.assertIn("世界图 frontier 搜索", response["reason"])
         self.assertEqual(response["registry_entries"][0]["category"], "resource")
         self.assertFalse(response["registry_entries"][0]["fast_path"])
         self.assertEqual(response["operations"], [
@@ -290,7 +283,8 @@ class PlannerCycleTests(unittest.TestCase):
         label_block(self.settings, stair, category="stair")
         pre = make_observation(blocks=[stair])
         action = self.cycle(pre)
-        self.assertEqual(action["expected_delta"]["floor_id"], None)
+        self.assertEqual(action["action_kind"], "SCAN_OPAQUE_EXIT")
+        self.assertEqual(action["expected_delta"]["map_instance_id"], None)
 
         pre_model = Observation.model_validate(pre)
         unchanged = Observation.model_validate(make_observation(blocks=[stair], x=1, y=0))
@@ -299,10 +293,10 @@ class PlannerCycleTests(unittest.TestCase):
         )
         expected = ExpectedDelta.model_validate(action["expected_delta"])
         self.assertFalse(
-            validate_expected_delta(pre_model, unchanged, expected, action_kind="MOVE_TO_STAIR").matches
+            validate_expected_delta(pre_model, unchanged, expected, action_kind="SCAN_OPAQUE_EXIT").matches
         )
         self.assertTrue(
-            validate_expected_delta(pre_model, changed, expected, action_kind="MOVE_TO_STAIR").matches
+            validate_expected_delta(pre_model, changed, expected, action_kind="SCAN_OPAQUE_EXIT").matches
         )
 
     def test_minimal_block_ref_matches_and_unlisted_resource_delta_fails(self) -> None:

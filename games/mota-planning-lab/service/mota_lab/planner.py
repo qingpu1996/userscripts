@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Mapping, Optional
+from collections import deque
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 from .combat import UnknownDamage, combat_outcome
 from .guards import guard_from_observation
@@ -18,12 +19,13 @@ from .models import (
     PauseKind,
     PauseResponse,
     RegistryEntry,
+    ScanStateWire,
     block_label_execution_error,
     expected_delta_has_verifiable_non_position_postcondition,
 )
-from .search import SearchCandidate, limited_depth_search
-from .state import Boundary, CurrentFloorGraph
-from .valuation import ResourceState
+from .search import SearchCandidate
+from .state import Boundary, CurrentFloorGraph, canonical_json
+from .valuation import ResourceState, apply_delta, value_delta
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,14 @@ class PlannedBoundary:
     boundary: Boundary
     expected_delta: ExpectedDelta
     search_candidate: SearchCandidate
+
+
+@dataclass(frozen=True)
+class WorldSearchResult:
+    first: PlannedBoundary
+    score: float
+    explored_nodes: int
+    path_length: int
 
 
 ACTION_KINDS = {
@@ -65,8 +75,10 @@ CATEGORY_NAMES = {
 
 
 class Planner:
-    def __init__(self, *, search_depth: int = 3) -> None:
-        self.search_depth = search_depth
+    def __init__(self, *, planning_budget: int = 4096) -> None:
+        if planning_budget < 1:
+            raise ValueError("planning_budget must be positive")
+        self.planning_budget = planning_budget
 
     @staticmethod
     def _pause(
@@ -125,6 +137,530 @@ class Planner:
             raise ValueError("INCOMPLETE_LABEL")
         return expected
 
+    @staticmethod
+    def _transition_key(edge: Mapping[str, Any]) -> tuple:
+        return (
+            str(edge.get("from_map_instance_id")), int(edge.get("from_x")),
+            int(edge.get("from_y")), str(edge.get("to_map_instance_id")),
+            int(edge.get("to_x")), int(edge.get("to_y")),
+        )
+
+    @staticmethod
+    def _stair_is_scan_safe(label: BlockLabel) -> bool:
+        if label.category != "stair" or not label.supported:
+            return False
+        if label.expected_delta is None:
+            return True
+        payload = label.expected_delta.model_dump(mode="json", exclude_unset=True)
+        if any(payload.get(field, 0) != 0 for field in ("hp", "attack", "defense", "gold", "experience")):
+            return False
+        key_deltas = payload.get("keys") or {}
+        if any(key_deltas.get(color, 0) != 0 for color in ("yellow", "blue", "red")):
+            return False
+        return not payload.get("removed_blocks") and not payload.get("added_blocks")
+
+    @staticmethod
+    def _scan_wire(state: Mapping[str, Any], frontier_count: int) -> ScanStateWire:
+        return ScanStateWire(
+            phase=state["phase"],
+            anchor_map_instance_id=state["anchor_map_instance_id"],
+            current_map_instance_id=state["current_map_instance_id"],
+            scanned_map_instance_ids=sorted(set(state["scanned_map_instance_ids"])),
+            pending_transition_count=len(state.get("pending_exits", [])),
+            traversed_transition_count=len(state.get("traversed_transitions", [])),
+            frontier_count=frontier_count,
+            reason=state["reason"],
+        )
+
+    @staticmethod
+    def _world_bases(
+        observation: Observation, world_context: Mapping[str, object]
+    ) -> Dict[str, Observation]:
+        bases: Dict[str, Observation] = {}
+        for payload in world_context.get("observations", []):
+            try:
+                item = Observation.model_validate(payload)
+            except Exception:
+                continue
+            if item.session_id == observation.session_id and not item.busy:
+                bases[item.map_instance_id] = item
+        bases[observation.map_instance_id] = observation
+        instance_rows = {
+            str(row.get("map_instance_id")): row
+            for row in world_context.get("map_instances", [])
+            if isinstance(row, Mapping)
+        }
+        if instance_rows:
+            bases = {
+                map_id: item for map_id, item in bases.items()
+                if map_id in instance_rows and (
+                    instance_rows[map_id].get("floor_id") == item.floor_id
+                    and instance_rows[map_id].get("topology_fingerprint")
+                    == item.topology_fingerprint
+                    and instance_rows[map_id].get("dimensions_json")
+                    == canonical_json(item.dimensions.model_dump(mode="json"))
+                )
+            }
+        return bases
+
+    @staticmethod
+    def _valid_position(observation: Observation, x: object, y: object) -> bool:
+        if not isinstance(x, int) or isinstance(x, bool) or not isinstance(y, int) or isinstance(y, bool):
+            return False
+        if x < 0 or y < 0 or x >= observation.dimensions.width or y >= observation.dimensions.height:
+            return False
+        if observation.topology.valid_cells is None:
+            return True
+        return (x, y) in {(cell.x, cell.y) for cell in observation.topology.valid_cells}
+
+    def _resolved_exit_target(
+        self,
+        observation: Observation,
+        block: object,
+        world_context: Mapping[str, object],
+    ) -> tuple[str, Optional[Dict[str, Any]]]:
+        """Return opaque, exact, or ambiguous for one observed exit endpoint."""
+        bases = self._world_bases(observation, world_context)
+        candidates: Dict[tuple[str, str, int, int], Dict[str, Any]] = {}
+        for edge in world_context.get("transitions", []):
+            if not isinstance(edge, Mapping) \
+                    or edge.get("from_map_instance_id") != observation.map_instance_id \
+                    or edge.get("from_x") != getattr(block, "x", None) \
+                    or edge.get("from_y") != getattr(block, "y", None):
+                continue
+            target_id = edge.get("to_map_instance_id")
+            target = bases.get(str(target_id))
+            if target is None or not self._valid_position(target, edge.get("to_x"), edge.get("to_y")):
+                continue
+            key = (target.map_instance_id, target.floor_id, int(edge["to_x"]), int(edge["to_y"]))
+            candidates[key] = {
+                "map_instance_id": target.map_instance_id,
+                "floor_id": target.floor_id,
+                "to_x": key[2], "to_y": key[3],
+            }
+        if not candidates:
+            return "opaque", None
+        if len(candidates) != 1:
+            return "ambiguous", None
+        return "exact", next(iter(candidates.values()))
+
+    def refresh_scan_state(
+        self,
+        observation: Observation,
+        labels: Mapping[tuple, BlockLabel],
+        world_context: Mapping[str, object],
+        scan_state: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Rebuild the auditable scan frontier from legally observed snapshots."""
+
+        bases = self._world_bases(observation, world_context)
+        scanned = set(str(item) for item in scan_state.get("scanned_map_instance_ids", []))
+        scanned.add(observation.map_instance_id)
+        traversed = list(scan_state.get("traversed_transitions", []))
+        traversed_keys = {
+            self._transition_key(item) for item in traversed if isinstance(item, Mapping)
+        }
+        transitions = [
+            item for item in world_context.get("transitions", []) if isinstance(item, Mapping)
+        ]
+        pending: List[Dict[str, Any]] = []
+        for map_id in sorted(scanned):
+            base = bases.get(map_id)
+            if base is None:
+                continue
+            try:
+                graph = CurrentFloorGraph(base, labels)
+                boundaries = graph.reachable_boundaries()
+            except (KeyError, ValueError):
+                continue
+            for boundary in boundaries:
+                label = boundary.label
+                if not self._stair_is_scan_safe(label):
+                    continue
+                matching = [
+                    edge for edge in transitions
+                    if edge.get("from_map_instance_id") == map_id
+                    and edge.get("from_x") == boundary.block.x
+                    and edge.get("from_y") == boundary.block.y
+                ]
+                if not matching:
+                    pending.append({
+                        "kind": "opaque",
+                        "from_map_instance_id": map_id,
+                        "from_x": boundary.block.x,
+                        "from_y": boundary.block.y,
+                        "block_id": boundary.block.id,
+                        "target_floor_number_hint": None,
+                    })
+                    continue
+                valid_targets = []
+                for edge in matching:
+                    target_id = str(edge.get("to_map_instance_id"))
+                    target = bases.get(target_id)
+                    if target is None:
+                        continue
+                    try:
+                        key = self._transition_key(edge)
+                    except (TypeError, ValueError):
+                        continue
+                    if not self._valid_position(target, key[4], key[5]):
+                        continue
+                    valid_targets.append((edge, target, key))
+                if not valid_targets:
+                    pending.append({
+                        "kind": "opaque", "from_map_instance_id": map_id,
+                        "from_x": boundary.block.x, "from_y": boundary.block.y,
+                        "block_id": boundary.block.id, "target_floor_number_hint": None,
+                    })
+                    continue
+                identities = {
+                    (str(target.map_instance_id), str(target.floor_id), key[4], key[5])
+                    for _edge, target, key in valid_targets
+                }
+                if len(identities) > 1:
+                    pending.append({
+                        "kind": "ambiguous", "from_map_instance_id": map_id,
+                        "from_x": boundary.block.x, "from_y": boundary.block.y,
+                        "block_id": boundary.block.id, "target_floor_number_hint": None,
+                    })
+                    continue
+                valid_targets = [item for item in valid_targets if item[2] not in traversed_keys]
+                if not valid_targets:
+                    continue
+                for edge, target, key in valid_targets:
+                    pending.append({
+                        "kind": "verified",
+                        "from_map_instance_id": map_id,
+                        "from_x": boundary.block.x,
+                        "from_y": boundary.block.y,
+                        "block_id": boundary.block.id,
+                        "to_map_instance_id": target.map_instance_id,
+                        "to_x": key[4],
+                        "to_y": key[5],
+                        "target_floor_id": target.floor_id,
+                        "target_floor_number_hint": target.floor_number,
+                    })
+        phase = "complete" if not pending else ("discover" if len(scanned) == 1 else "sweep")
+        hints = sorted(
+            item["target_floor_number_hint"] for item in pending
+            if isinstance(item.get("target_floor_number_hint"), int)
+        )
+        hint_text = "none" if not hints else f"{hints[0]}..{hints[-1]}"
+        reason = (
+            f"scan {phase}: {len(scanned)} map instances observed; "
+            f"{len(pending)} safe exits pending; display-floor hint {hint_text}"
+        )
+        return {
+            "phase": phase,
+            "anchor_map_instance_id": scan_state["anchor_map_instance_id"],
+            "current_map_instance_id": observation.map_instance_id,
+            "scanned_map_instance_ids": sorted(scanned),
+            "pending_exits": pending,
+            "traversed_transitions": traversed,
+            "reason": reason,
+        }
+
+    def _plan_scan(
+        self,
+        observation: Observation,
+        labels: Mapping[tuple, BlockLabel],
+        *,
+        action_id_factory: Callable[[], str],
+        registry_entries: List[RegistryEntry],
+        supersedes_action_id: Optional[str],
+        world_context: Mapping[str, object],
+        scan_state: Mapping[str, Any],
+    ):
+        refreshed = self.refresh_scan_state(observation, labels, world_context, scan_state)
+        frontier_count = len(world_context.get("frontiers", []))
+        wire = self._scan_wire(refreshed, frontier_count)
+        if refreshed["phase"] == "complete":
+            return IdleResponse(
+                status="idle",
+                reason="[scan:complete] 当前安全可达地图实例已完成物理遍历；下一轮进入资源规划。",
+                registry_entries=registry_entries,
+                scan_state=wire,
+            )
+
+        bases = self._world_bases(observation, world_context)
+        transitions = [
+            item for item in world_context.get("transitions", []) if isinstance(item, Mapping)
+        ]
+
+        def boundaries_for(map_id: str) -> Dict[Tuple[int, int], Boundary]:
+            base = bases.get(map_id)
+            if base is None:
+                return {}
+            try:
+                return {
+                    (item.block.x, item.block.y): item
+                    for item in CurrentFloorGraph(base, labels).reachable_boundaries()
+                    if self._stair_is_scan_safe(item.label)
+                }
+            except (KeyError, ValueError):
+                return {}
+
+        pending = list(refreshed["pending_exits"])
+        local = [
+            item for item in pending
+            if item["from_map_instance_id"] == observation.map_instance_id
+        ]
+        selected: Optional[Mapping[str, Any]] = None
+        if local:
+            selected = min(
+                local,
+                key=lambda item: (
+                    item.get("target_floor_number_hint") is None,
+                    item.get("target_floor_number_hint") or 0,
+                    item["from_y"], item["from_x"], item["kind"],
+                ),
+            )
+        else:
+            # Reposition only along already observed, non-consuming transition
+            # edges.  BFS identity is map_instance_id; floor_number is merely a
+            # deterministic target-order hint.
+            targets = {item["from_map_instance_id"] for item in pending}
+            queue = deque([(observation.map_instance_id, None)])
+            visited = {observation.map_instance_id}
+            while queue and selected is None:
+                map_id, first_edge = queue.popleft()
+                if map_id in targets and first_edge is not None:
+                    selected = first_edge
+                    break
+                reachable = boundaries_for(map_id)
+                for edge in transitions:
+                    if edge.get("from_map_instance_id") != map_id:
+                        continue
+                    coordinate = (edge.get("from_x"), edge.get("from_y"))
+                    target_id = str(edge.get("to_map_instance_id"))
+                    if coordinate not in reachable or target_id not in bases or target_id in visited:
+                        continue
+                    if not self._valid_position(
+                        bases[target_id], edge.get("to_x"), edge.get("to_y")
+                    ):
+                        continue
+                    visited.add(target_id)
+                    edge_choice = {
+                        "kind": "verified",
+                        "from_map_instance_id": map_id,
+                        "from_x": coordinate[0], "from_y": coordinate[1],
+                        "block_id": reachable[coordinate].block.id,
+                        "to_map_instance_id": target_id,
+                        "to_x": edge.get("to_x"), "to_y": edge.get("to_y"),
+                        "target_floor_id": bases[target_id].floor_id,
+                        "target_floor_number_hint": bases[target_id].floor_number,
+                    }
+                    queue.append((target_id, first_edge or edge_choice))
+        if selected is None or selected["from_map_instance_id"] != observation.map_instance_id:
+            paused = dict(refreshed)
+            paused["phase"] = "paused"
+            paused["reason"] = "scan paused: pending safe exits are not reachable from the current directed world graph"
+            return IdleResponse(
+                status="idle",
+                reason="[scan:paused] 仍有安全出口，但当前单向世界图无法返回其起点；不消耗资源扩图。",
+                registry_entries=registry_entries,
+                scan_state=self._scan_wire(paused, frontier_count),
+            )
+
+        if selected["kind"] == "ambiguous":
+            return self._pause(
+                PauseKind.EXPECTED_DELTA_MISMATCH,
+                "TRANSITION_TARGET_AMBIGUOUS",
+                "同一出口存在多个冲突的已观察目标，不能签发精确换图行动。",
+                registry_entries,
+                map_instance_id=observation.map_instance_id,
+                x=selected["from_x"], y=selected["from_y"],
+            )
+
+        graph = CurrentFloorGraph(observation, labels)
+        boundary = next(
+            (
+                item for item in graph.reachable_boundaries()
+                if item.block.x == selected["from_x"] and item.block.y == selected["from_y"]
+                and item.label.category == "stair"
+            ),
+            None,
+        )
+        if boundary is None:
+            paused = dict(refreshed)
+            paused["phase"] = "paused"
+            paused["reason"] = "scan paused: selected transition exit is not currently reachable"
+            return IdleResponse(
+                status="idle", reason="[scan:paused] 当前无法安全接近待遍历出口。",
+                registry_entries=registry_entries,
+                scan_state=self._scan_wire(paused, frontier_count),
+            )
+        expected_payload: Dict[str, Any]
+        if selected["kind"] == "opaque":
+            expected_payload = {"map_instance_id": None}
+            action_kind = "SCAN_OPAQUE_EXIT"
+        else:
+            expected_payload = {
+                "map_instance_id": selected["to_map_instance_id"],
+                "floor_id": selected["target_floor_id"],
+            }
+            action_kind = "SCAN_VERIFIED_TRANSITION"
+        operations: List[GridOperation] = []
+        start = (observation.hero.loc.x, observation.hero.loc.y)
+        approach_path = graph.reachable().path_to(boundary.approach)
+        if boundary.approach != start and approach_path:
+            operations.append(GridOperation(type="grid", x=boundary.approach[0], y=boundary.approach[1]))
+        operations.append(GridOperation(type="grid", x=boundary.block.x, y=boundary.block.y))
+        return ExecuteResponse(
+            status="execute",
+            action_id=action_id_factory(),
+            action_kind=action_kind,
+            operations=operations,
+            guard=guard_from_observation(observation),
+            expected_delta=ExpectedDelta.model_validate(expected_payload),
+            reason=(
+                f"[scan:{refreshed['phase']}] traverse {selected['kind']} exit "
+                f"{observation.map_instance_id}@{boundary.block.x},{boundary.block.y}; "
+                "no enemy, door, resource, NPC or mechanism may be consumed during takeover scan."
+            ),
+            supersedes_action_id=supersedes_action_id,
+            registry_entries=registry_entries,
+            scan_state=wire,
+        )
+
+    @staticmethod
+    def _state_observation(
+        base: Observation,
+        resources: ResourceState,
+        position: Tuple[int, int],
+        removed: FrozenSet[Tuple[str, int, int, str]],
+    ) -> Observation:
+        payload = base.model_dump(mode="json", exclude_unset=True)
+        payload["blocks"] = [
+            block for block in payload["blocks"]
+            if (base.map_instance_id, block["x"], block["y"], block["id"]) not in removed
+        ]
+        payload["hero"].update(
+            hp=resources.hp,
+            attack=resources.attack,
+            defense=resources.defense,
+            gold=resources.gold,
+            experience=resources.experience,
+        )
+        payload["hero"]["loc"].update(x=position[0], y=position[1])
+        payload["keys"] = {
+            "yellow": resources.yellow,
+            "blue": resources.blue,
+            "red": resources.red,
+        }
+        return Observation.model_validate(payload)
+
+    def _world_search(
+        self,
+        observation: Observation,
+        labels: Mapping[tuple, BlockLabel],
+        world_context: Mapping[str, object],
+    ) -> Tuple[Optional[WorldSearchResult], bool]:
+        """Search the already-observed map-instance graph with topology updates.
+
+        Each simulated boundary is consumed before reachability is rebuilt.  A
+        cross-map step is possible only through a transition that was recorded
+        from a real completed action.  The returned action is still only the
+        first atomic boundary of the best audited path.
+        """
+        bases = self._world_bases(observation, world_context)
+        transitions: Dict[Tuple[str, int, int], List[Mapping[str, Any]]] = {}
+        for row in world_context.get("transitions", []):
+            if not isinstance(row, Mapping):
+                continue
+            key = (str(row.get("from_map_instance_id")), row.get("from_x"), row.get("from_y"))
+            transitions.setdefault(key, []).append(row)
+
+        initial_resources = ResourceState.from_observation(observation)
+        initial_position = (observation.hero.loc.x, observation.hero.loc.y)
+        queue = deque([(
+            observation.map_instance_id,
+            initial_position,
+            initial_resources,
+            frozenset(),
+            0.0,
+            None,
+            0,
+        )])
+        seen = set()
+        best: Optional[WorldSearchResult] = None
+        explored = 0
+        exhausted = False
+        while queue:
+            if explored >= self.planning_budget:
+                exhausted = True
+                break
+            map_id, position, resources, removed, score, first, depth = queue.popleft()
+            state_key = (map_id, position, resources, removed)
+            if state_key in seen:
+                continue
+            seen.add(state_key)
+            explored += 1
+            base = bases.get(map_id)
+            if base is None:
+                continue
+            simulated = self._state_observation(base, resources, position, removed)
+            graph = CurrentFloorGraph(simulated, labels)
+            for boundary in graph.reachable_boundaries():
+                label = boundary.label
+                if not label.supported or block_label_execution_error(label) is not None:
+                    continue
+                try:
+                    expected = self._expected_for(boundary)
+                except (ValueError, UnknownDamage):
+                    continue
+                delta = expected.model_dump(mode="json", exclude_unset=True)
+                next_resources = apply_delta(resources, delta)
+                if next_resources is None:
+                    continue
+                candidate = PlannedBoundary(
+                    boundary=boundary,
+                    expected_delta=expected,
+                    search_candidate=SearchCandidate(
+                        key=f"{map_id}:{boundary.block.x},{boundary.block.y}:{boundary.block.id}",
+                        delta=delta,
+                        distance=boundary.distance,
+                        progress_bonus=PROGRESS_BONUS.get(label.category, 0.0),
+                    ),
+                )
+                first_candidate = first or candidate
+                next_score = score + value_delta(
+                    delta,
+                    distance=boundary.distance,
+                    progress_bonus=PROGRESS_BONUS.get(label.category, 0.0),
+                )
+                path_length = depth + 1
+                if best is None or (next_score, -path_length) > (best.score, -best.path_length):
+                    best = WorldSearchResult(first_candidate, next_score, explored, path_length)
+
+                transition_rows = transitions.get(
+                    (map_id, boundary.block.x, boundary.block.y), []
+                ) if label.category == "stair" else []
+                if transition_rows:
+                    for edge in transition_rows:
+                        target_id = str(edge.get("to_map_instance_id"))
+                        if target_id not in bases:
+                            continue
+                        target_position = (int(edge.get("to_x")), int(edge.get("to_y")))
+                        if not self._valid_position(bases[target_id], *target_position):
+                            continue
+                        queue.append((target_id, target_position, next_resources, removed,
+                                      next_score + 25.0, first_candidate, path_length))
+                    continue
+                if label.category == "stair":
+                    # Unknown destination is opaque.  The branch ends at the
+                    # physical traversal itself; no remote/current-map future
+                    # may be fabricated beyond this point.
+                    continue
+                consumed = removed | frozenset({(
+                    map_id, boundary.block.x, boundary.block.y, boundary.block.id,
+                )})
+                queue.append((map_id, (boundary.block.x, boundary.block.y), next_resources,
+                              consumed, next_score, first_candidate, path_length))
+        if best is not None:
+            best = WorldSearchResult(best.first, best.score, explored, best.path_length)
+        return best, exhausted
+
     def plan(
         self,
         observation: Observation,
@@ -133,6 +669,8 @@ class Planner:
         action_id_factory: Callable[[], str],
         registry_entries: List[RegistryEntry],
         supersedes_action_id: Optional[str] = None,
+        world_context: Optional[Mapping[str, object]] = None,
+        scan_state: Optional[Mapping[str, Any]] = None,
     ):
         if observation.busy:
             return self._pause(
@@ -166,6 +704,17 @@ class Planner:
                         "damage": block.damage,
                     },
                 )
+
+        if scan_state is not None and scan_state.get("phase") != "complete":
+            return self._plan_scan(
+                observation,
+                labels,
+                action_id_factory=action_id_factory,
+                registry_entries=registry_entries,
+                supersedes_action_id=supersedes_action_id,
+                world_context=world_context or {},
+                scan_state=scan_state,
+            )
 
         graph = CurrentFloorGraph(observation, labels)
         boundaries = graph.reachable_boundaries()
@@ -238,28 +787,115 @@ class Planner:
                 registry_entries=registry_entries,
             )
 
-        choice = limited_depth_search(
-            ResourceState.from_observation(observation),
-            [item.search_candidate for item in planned],
-            max_depth=self.search_depth,
-        )
-        if choice is None:
+        # Protocol v2 intentionally does not permute a fixed depth of current
+        # candidates.  Every cycle rebuilds reachability from the complete
+        # observed topology; world_context supplies persisted map/transition
+        # facts and the bounded scoring pass considers each currently exposed
+        # frontier exactly once.
+        if len(planned) > self.planning_budget:
+            return self._pause(
+                PauseKind.PLANNING_BUDGET_EXHAUSTED,
+                "WORLD_SEARCH_BUDGET_EXHAUSTED",
+                "已探索世界的当前 frontier 超出规划预算，保持现场不行动。",
+                registry_entries,
+                planning_budget=self.planning_budget,
+                frontier_count=len(planned),
+            )
+        initial = ResourceState.from_observation(observation)
+        scored = []
+        transitions = [] if world_context is None else list(world_context.get("transitions", []))
+        known_transition_exits = {
+            (row.get("from_x"), row.get("from_y"))
+            for row in transitions
+            if row.get("from_map_instance_id") == observation.map_instance_id
+        }
+        for item in planned:
+            candidate = item.search_candidate
+            next_state = apply_delta(initial, candidate.delta)
+            if next_state is None:
+                continue
+            score = value_delta(
+                candidate.delta,
+                distance=candidate.distance,
+                progress_bonus=candidate.progress_bonus,
+            )
+            if (
+                item.boundary.label.category == "stair"
+                and (item.boundary.block.x, item.boundary.block.y) in known_transition_exits
+            ):
+                score += 25.0
+            scored.append((score, -candidate.distance, item))
+        if not scored:
             return IdleResponse(
                 status="idle",
                 reason="当前已知边界都会导致生命归零或资源不足，保持现场不行动。",
                 registry_entries=registry_entries,
             )
-        selected = next(
-            item for item in planned if item.search_candidate.key == choice.candidate_key
-        )
+        world_result = None
+        if world_context is not None and world_context.get("observations"):
+            world_result, exhausted = self._world_search(observation, labels, world_context)
+            if exhausted:
+                return self._pause(
+                    PauseKind.PLANNING_BUDGET_EXHAUSTED,
+                    "WORLD_SEARCH_BUDGET_EXHAUSTED",
+                    "已探索世界状态搜索达到规划预算，保持现场不行动。",
+                    registry_entries,
+                    planning_budget=self.planning_budget,
+                )
+        if world_result is not None:
+            selected = world_result.first
+            selected_score = world_result.score
+            explored_nodes = world_result.explored_nodes
+            path_length = world_result.path_length
+        else:
+            explored_nodes = len(scored)
+            selected_score, _, selected = max(
+                scored,
+                key=lambda row: (row[0], row[1], -row[2].boundary.block.y, -row[2].boundary.block.x),
+            )
+            path_length = 1
         block = selected.boundary.block
         label = selected.boundary.label
         action_kind = ACTION_KINDS.get(label.category, "MOVE_TO_BOUNDARY")
         category_name = CATEGORY_NAMES.get(label.category, "已知边界")
+        known_transition = (
+            label.category == "stair"
+            and (block.x, block.y) in known_transition_exits
+        )
+        if label.category == "stair":
+            target_kind, target = self._resolved_exit_target(
+                observation, block, world_context or {},
+            )
+            if target_kind == "ambiguous":
+                return self._pause(
+                    PauseKind.EXPECTED_DELTA_MISMATCH,
+                    "TRANSITION_TARGET_AMBIGUOUS",
+                    "同一出口存在多个冲突目标；保持 opaque 并暂停等待审计。",
+                    registry_entries,
+                    map_instance_id=observation.map_instance_id, x=block.x, y=block.y,
+                )
+            if target_kind == "exact" and target is not None:
+                selected = PlannedBoundary(
+                    boundary=selected.boundary,
+                    expected_delta=ExpectedDelta.model_validate({
+                        "map_instance_id": target["map_instance_id"],
+                        "floor_id": target["floor_id"],
+                    }),
+                    search_candidate=selected.search_candidate,
+                )
+                known_transition = True
+            else:
+                selected = PlannedBoundary(
+                    boundary=selected.boundary,
+                    expected_delta=ExpectedDelta.model_validate({"map_instance_id": None}),
+                    search_candidate=selected.search_candidate,
+                )
+                known_transition = False
         reason = (
-            f"有限深度搜索选择距离 {selected.boundary.distance} 的{category_name} "
-            f"({block.x},{block.y})；估值 {choice.utility:.1f}，"
-            f"搜索 {choice.explored_nodes} 个状态并剪枝 {choice.pruned_nodes} 个。"
+            f"世界图 frontier 搜索选择距离 {selected.boundary.distance} 的{category_name} "
+            f"({block.x},{block.y})；估值 {selected_score:.1f}，"
+            f"检查 {explored_nodes} 个世界状态，最佳已知路径 {path_length} 个原子边界。"
+            + (" 该出口是已验证的跨图返回边。" if known_transition else "")
         )
         operations = []
         approach = selected.boundary.approach

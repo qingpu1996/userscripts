@@ -272,6 +272,7 @@ test("只有已登记 stair 可用 floor_id=null 执行未知目的换层", asyn
     assert.equal(method, "route");
     current = makeObservation({
       floor_id: "synthetic-floor-new",
+      map_instance_id: "map:synthetic-floor-new:topology-a",
       floor_name: null,
       floor_number: null,
       hero: { loc: { x, y } },
@@ -303,5 +304,6 @@ test("只有已登记 stair 可用 floor_id=null 执行未知目的换层", asyn
   assert.equal(lab.compareExpectedDelta(before, result.observation, action.expected_delta, {
     allowPositionChange: true,
     allowUnknownFloor: true,
+    allowUnknownMapInstance: true,
   }).ok, true);
 });

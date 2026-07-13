@@ -2,6 +2,7 @@ MotaLab.cloneObservationForWire = function cloneObservationForWire(observation) 
   return {
     protocol: observation.protocol,
     page: observation.page,
+    session_id: observation.session_id,
     floor_id: observation.floor_id,
     floor_name: observation.floor_name,
     floor_number: observation.floor_number,
@@ -9,6 +10,15 @@ MotaLab.cloneObservationForWire = function cloneObservationForWire(observation) 
       width: observation.dimensions.width,
       height: observation.dimensions.height,
     },
+    topology: Object.assign({
+      kind: observation.topology.kind,
+      source: observation.topology.source,
+      confidence: observation.topology.confidence,
+    }, observation.topology.valid_cells ? {
+      valid_cells: observation.topology.valid_cells.map((cell) => ({ x: cell.x, y: cell.y })),
+    } : {}),
+    topology_fingerprint: observation.topology_fingerprint,
+    map_instance_id: observation.map_instance_id,
     hero: {
       hp: observation.hero.hp,
       attack: observation.hero.attack,
@@ -53,7 +63,22 @@ MotaLab.createCycleRequest = function createCycleRequest({
   observation,
   completedActionId = null,
   recovery = null,
+  session,
+  intent = "cycle",
 }) {
+  if (!["cycle", "reconnect_only"].includes(intent)) {
+    throw new TypeError("Invalid cycle request intent");
+  }
+  MotaLab.assertProtocolShape(session, ["mode"], ["command", "expected_guard"], "session");
+  if (!MotaLab.SESSION_MODES.includes(session.mode)
+    || (session.command !== undefined && !["observe", "confirm"].includes(session.command))) {
+    throw new TypeError("Invalid session control");
+  }
+  const hasExpectedGuard = Object.prototype.hasOwnProperty.call(session, "expected_guard");
+  if ((session.mode === "handoff_expected_guard") !== hasExpectedGuard) {
+    throw new TypeError("Invalid session expected_guard contract");
+  }
+  if (hasExpectedGuard) MotaLab.validateResponseGuard(session.expected_guard);
   const recoveryValue = recovery || {
     phase: "none",
     pending_action_id: null,
@@ -64,7 +89,13 @@ MotaLab.createCycleRequest = function createCycleRequest({
   if (!allowedPhases.has(recoveryValue.phase)) throw new TypeError("Invalid recovery phase");
   return {
     source: MotaLab.SOURCE,
+    intent,
     completed_action_id: completedActionId,
+    session: Object.assign({ mode: session.mode }, session.command ? {
+      command: session.command,
+    } : {}, hasExpectedGuard ? {
+      expected_guard: MotaLab.cloneJsonValue(session.expected_guard),
+    } : {}),
     observation: MotaLab.cloneObservationForWire(observation),
     recovery: {
       phase: recoveryValue.phase,
@@ -120,7 +151,25 @@ MotaLab.validateResponseKeys = function validateResponseKeys(value, label, allow
   };
 };
 
-MotaLab.validateResponsePosition = function validateResponsePosition(value, label, withDirection) {
+MotaLab.validateDimensions = function validateDimensions(value, label = "dimensions") {
+  MotaLab.assertProtocolShape(value, ["width", "height"], [], label);
+  if (!MotaLab.isFiniteInteger(value.width) || !MotaLab.isFiniteInteger(value.height)
+    || value.width < 1 || value.height < 1 || value.width > MotaLab.MAX_MAP_AXIS
+    || value.height > MotaLab.MAX_MAP_AXIS
+    || value.width * value.height > MotaLab.MAX_MAP_CELLS) {
+    throw new TypeError(`Invalid ${label}`);
+  }
+  return { width: value.width, height: value.height };
+};
+
+MotaLab.validCellSet = function validCellSet(topology) {
+  return topology && Array.isArray(topology.valid_cells)
+    ? new Set(topology.valid_cells.map((cell) => `${cell.x},${cell.y}`)) : null;
+};
+
+MotaLab.validateResponsePosition = function validateResponsePosition(
+  value, label, withDirection, dimensions, topology = null,
+) {
   MotaLab.assertProtocolShape(
     value,
     withDirection ? ["x", "y", "direction"] : ["x", "y"],
@@ -128,8 +177,10 @@ MotaLab.validateResponsePosition = function validateResponsePosition(value, labe
     label,
   );
   if (!MotaLab.isFiniteInteger(value.x) || !MotaLab.isFiniteInteger(value.y)
-    || value.x < 0 || value.x >= MotaLab.MAP_WIDTH
-    || value.y < 0 || value.y >= MotaLab.MAP_HEIGHT) {
+    || !dimensions || value.x < 0 || value.x >= dimensions.width
+    || value.y < 0 || value.y >= dimensions.height
+    || (MotaLab.validCellSet(topology)
+      && !MotaLab.validCellSet(topology).has(`${value.x},${value.y}`))) {
     throw new TypeError(`Invalid ${label}`);
   }
   if (withDirection && !["up", "down", "left", "right"].includes(value.direction)) {
@@ -142,9 +193,17 @@ MotaLab.validateResponsePosition = function validateResponsePosition(value, labe
 
 MotaLab.validateResponseGuard = function validateResponseGuard(value) {
   MotaLab.assertProtocolShape(value, [
-    "floor_id", "floor", "position", "hp", "attack", "defense", "gold", "experience", "keys",
+    "session_id", "floor_id", "floor", "map_instance_id", "dimensions",
+    "topology_fingerprint", "position", "hp", "attack", "defense", "gold", "experience", "keys",
   ], [], "guard");
+  MotaLab.validateProtocolString(value.session_id, "guard.session_id", 1, 128);
   MotaLab.validateProtocolString(value.floor_id, "guard.floor_id", 1, 256);
+  MotaLab.validateProtocolString(value.map_instance_id, "guard.map_instance_id", 1, 256);
+  if (typeof value.topology_fingerprint !== "string"
+    || !/^sha256:[a-f0-9]{64}$/.test(value.topology_fingerprint)) {
+    throw new TypeError("Invalid guard.topology_fingerprint");
+  }
+  const dimensions = MotaLab.validateDimensions(value.dimensions, "guard.dimensions");
   if (value.floor !== null && !MotaLab.isFiniteInteger(value.floor)) {
     throw new TypeError("Invalid guard.floor");
   }
@@ -156,7 +215,11 @@ MotaLab.validateResponseGuard = function validateResponseGuard(value) {
   return {
     floor_id: value.floor_id,
     floor: value.floor,
-    position: MotaLab.validateResponsePosition(value.position, "guard.position", true),
+    session_id: value.session_id,
+    map_instance_id: value.map_instance_id,
+    dimensions,
+    topology_fingerprint: value.topology_fingerprint,
+    position: MotaLab.validateResponsePosition(value.position, "guard.position", true, dimensions),
     hp: value.hp,
     attack: value.attack,
     defense: value.defense,
@@ -166,14 +229,14 @@ MotaLab.validateResponseGuard = function validateResponseGuard(value) {
   };
 };
 
-MotaLab.validateOperation = function validateOperation(operation) {
+MotaLab.validateOperation = function validateOperation(operation, dimensions) {
   MotaLab.assertProtocolShape(operation, ["type", "x", "y"], [], "operation");
   if (operation.type !== "grid") {
     throw new TypeError("Only grid operations are supported");
   }
   if (!MotaLab.isFiniteInteger(operation.x) || !MotaLab.isFiniteInteger(operation.y)
-    || operation.x < 0 || operation.x >= MotaLab.MAP_WIDTH
-    || operation.y < 0 || operation.y >= MotaLab.MAP_HEIGHT) {
+    || operation.x < 0 || operation.x >= dimensions.width
+    || operation.y < 0 || operation.y >= dimensions.height) {
     throw new TypeError("Grid target is out of bounds");
   }
   return { type: "grid", x: operation.x, y: operation.y };
@@ -181,7 +244,9 @@ MotaLab.validateOperation = function validateOperation(operation) {
 
 MotaLab.validateRegistryEntries = function validateRegistryEntries(value) {
   if (value === undefined) return [];
-  if (!Array.isArray(value) || value.length > 121) throw new TypeError("Invalid registry entries");
+  if (!Array.isArray(value) || value.length > MotaLab.MAX_BLOCKS) {
+    throw new TypeError("Invalid registry entries");
+  }
   return value.map((entry) => {
     MotaLab.assertProtocolShape(entry, [
       "id", "cls", "trigger", "category", "passable", "boundary", "fast_path", "version",
@@ -214,6 +279,41 @@ MotaLab.validateRegistryEntries = function validateRegistryEntries(value) {
   });
 };
 
+MotaLab.validateScanState = function validateScanState(value) {
+  if (value === undefined) return undefined;
+  MotaLab.assertProtocolShape(value, [
+    "phase", "anchor_map_instance_id", "current_map_instance_id",
+    "scanned_map_instance_ids", "pending_transition_count",
+    "traversed_transition_count", "frontier_count", "reason",
+  ], [], "scan_state");
+  if (!["anchor", "discover", "sweep", "complete", "paused"].includes(value.phase)) {
+    throw new TypeError("Invalid scan_state.phase");
+  }
+  for (const field of ["anchor_map_instance_id", "current_map_instance_id"]) {
+    MotaLab.validateProtocolString(value[field], `scan_state.${field}`, 1, 256);
+  }
+  if (!Array.isArray(value.scanned_map_instance_ids)
+    || value.scanned_map_instance_ids.length > MotaLab.MAX_MAP_CELLS) {
+    throw new TypeError("Invalid scan_state.scanned_map_instance_ids");
+  }
+  const scanned = new Set();
+  for (const item of value.scanned_map_instance_ids) {
+    MotaLab.validateProtocolString(item, "scan_state map instance", 1, 256);
+    if (scanned.has(item)) throw new TypeError("Duplicate scan_state map instance");
+    scanned.add(item);
+  }
+  if (!scanned.has(value.current_map_instance_id)) {
+    throw new TypeError("scan_state current map is not scanned");
+  }
+  for (const field of ["pending_transition_count", "traversed_transition_count", "frontier_count"]) {
+    if (!MotaLab.isFiniteInteger(value[field]) || value[field] < 0) {
+      throw new TypeError(`Invalid scan_state.${field}`);
+    }
+  }
+  MotaLab.validateProtocolString(value.reason, "scan_state.reason", 1, 512);
+  return MotaLab.cloneJsonValue(value);
+};
+
 MotaLab.validateCycleResponse = function validateCycleResponse(value) {
   if (!MotaLab.isProtocolObject(value)) {
     throw new TypeError("Response must be an object");
@@ -221,10 +321,17 @@ MotaLab.validateCycleResponse = function validateCycleResponse(value) {
   if (!new Set(["execute", "pause", "idle", "error"]).has(value.status)) {
     throw new TypeError("Unsupported response status");
   }
+  const acknowledgment = () => {
+    if (value.acknowledged_action_id === undefined) return {};
+    if (!MotaLab.validateActionId(value.acknowledged_action_id)) {
+      throw new TypeError("Invalid acknowledged_action_id");
+    }
+    return { acknowledged_action_id: value.acknowledged_action_id };
+  };
   if (value.status === "pause") {
     MotaLab.assertProtocolShape(value,
       ["status", "pause_kind", "detail_code", "reason", "details"],
-      ["evidence_path", "registry_entries"], "pause response");
+      ["evidence_path", "registry_entries", "scan_state", "acknowledged_action_id"], "pause response");
     if (!MotaLab.PAUSE_KIND_SET.has(value.pause_kind)) throw new TypeError("Invalid pause_kind");
     if (typeof value.detail_code !== "string" || !/^[A-Z][A-Z0-9_]{2,95}$/.test(value.detail_code)
       || typeof value.reason !== "string" || value.reason.length < 1 || value.reason.length > 512
@@ -232,7 +339,7 @@ MotaLab.validateCycleResponse = function validateCycleResponse(value) {
       || (value.evidence_path !== undefined && typeof value.evidence_path !== "string")) {
       throw new TypeError("Invalid pause response");
     }
-    return {
+    return Object.assign({
       status: "pause",
       pause_kind: value.pause_kind,
       detail_code: value.detail_code,
@@ -240,21 +347,25 @@ MotaLab.validateCycleResponse = function validateCycleResponse(value) {
       details: MotaLab.cloneJsonValue(value.details),
       evidence_path: value.evidence_path,
       registry_entries: MotaLab.validateRegistryEntries(value.registry_entries),
-    };
+      scan_state: MotaLab.validateScanState(value.scan_state),
+    }, acknowledgment());
   }
   if (value.status === "idle") {
-    MotaLab.assertProtocolShape(value, ["status", "reason"], ["registry_entries"], "idle response");
+    MotaLab.assertProtocolShape(value, ["status", "reason"],
+      ["registry_entries", "scan_state", "acknowledged_action_id"], "idle response");
     if (typeof value.reason !== "string" || value.reason.length < 1 || value.reason.length > 512) {
       throw new TypeError("Invalid idle response");
     }
-    return {
+    return Object.assign({
       status: "idle",
       reason: value.reason,
       registry_entries: MotaLab.validateRegistryEntries(value.registry_entries),
-    };
+      scan_state: MotaLab.validateScanState(value.scan_state),
+    }, acknowledgment());
   }
   if (value.status === "error") {
-    MotaLab.assertProtocolShape(value, ["status", "error_code", "reason"], ["errors"], "error response");
+    MotaLab.assertProtocolShape(value, ["status", "error_code", "reason"],
+      ["errors", "acknowledged_action_id"], "error response");
     MotaLab.validateProtocolString(value.error_code, "error_code", 1, 128);
     if (typeof value.reason !== "string" || value.reason.length > 1000) {
       throw new TypeError("Invalid error reason");
@@ -263,17 +374,17 @@ MotaLab.validateCycleResponse = function validateCycleResponse(value) {
       || value.errors.some((entry) => !MotaLab.isProtocolObject(entry)))) {
       throw new TypeError("Invalid error details");
     }
-    return {
+    return Object.assign({
       status: "error",
       error_code: value.error_code,
       reason: value.reason,
       errors: (value.errors || []).map(MotaLab.cloneJsonValue),
-    };
+    }, acknowledgment());
   }
 
   MotaLab.assertProtocolShape(value, [
     "status", "action_id", "action_kind", "reason", "operations", "guard", "expected_delta",
-  ], ["supersedes_action_id", "registry_entries"], "execute response");
+  ], ["supersedes_action_id", "registry_entries", "scan_state", "acknowledged_action_id"], "execute response");
   if (!MotaLab.validateActionId(value.action_id)) throw new TypeError("Invalid action_id");
   if (typeof value.action_kind !== "string"
     || !/^[A-Z][A-Z0-9_]{2,63}$/.test(value.action_kind)) {
@@ -289,21 +400,27 @@ MotaLab.validateCycleResponse = function validateCycleResponse(value) {
     || Object.keys(value.expected_delta).length < 1) {
     throw new TypeError("Missing expected_delta");
   }
-  MotaLab.validateExpectedDelta(value.expected_delta, { allowUnknownFloor: true });
+  const guard = MotaLab.validateResponseGuard(value.guard);
+  MotaLab.validateExpectedDelta(value.expected_delta, {
+    allowUnknownFloor: true,
+    allowUnknownMapInstance: true,
+    dimensions: guard.dimensions,
+  });
   if (value.supersedes_action_id !== undefined && value.supersedes_action_id !== null
     && !MotaLab.validateActionId(value.supersedes_action_id)) {
     throw new TypeError("Invalid supersedes_action_id");
   }
-  return {
+  return Object.assign({
     status: "execute",
     action_id: value.action_id,
     action_kind: value.action_kind,
-    operations: value.operations.map(MotaLab.validateOperation),
-    guard: MotaLab.validateResponseGuard(value.guard),
+    operations: value.operations.map((operation) => MotaLab.validateOperation(operation, guard.dimensions)),
+    guard,
     expected_delta: MotaLab.cloneJsonValue(value.expected_delta),
     reason: value.reason,
     supersedes_action_id: MotaLab.validateActionId(value.supersedes_action_id)
       ? value.supersedes_action_id : null,
     registry_entries: MotaLab.validateRegistryEntries(value.registry_entries),
-  };
+    scan_state: MotaLab.validateScanState(value.scan_state),
+  }, acknowledgment());
 };

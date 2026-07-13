@@ -1,5 +1,7 @@
 # 人工打标
 
+> Protocol v2 中，block 标签仍按 `id + cls + trigger` 审计；世界身份改为 session 内 `map_instance_id`，不能用显示楼层号合并地图。对新 topology revision 的证据必须保留 map instance、topology fingerprint 和 dimensions。打标只解释当前已观察对象，不得补录未进入地图或出口目标。
+
 人工标签只来自服务保存的当前层 pause evidence。不要根据攻略、记忆地图、录像或未访问楼层预填知识，也不要直接编辑游戏。
 
 以下命令假设当前目录是 `games/mota-planning-lab`，且使用项目 `.venv`：

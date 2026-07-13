@@ -75,18 +75,43 @@ def validate_expected_delta(
             )
 
     actual["floor_id"] = post.floor_id
+    actual["map_instance_id"] = post.map_instance_id
+    map_changed = post.map_instance_id != pre.map_instance_id
+    if "map_instance_id" not in declared:
+        if "floor_id" not in declared and map_changed:
+            differences.append(
+                {"field": "map_instance_id", "expected": pre.map_instance_id, "actual": post.map_instance_id}
+            )
+    elif declared["map_instance_id"] is None:
+        if action_kind not in {"MOVE_TO_STAIR", "SCAN_OPAQUE_EXIT", "SCAN_VERIFIED_TRANSITION"} or not map_changed:
+            differences.append(
+                {
+                    "field": "map_instance_id",
+                    "expected": "a different map instance for a transition action",
+                    "actual": post.map_instance_id,
+                }
+            )
+    elif post.map_instance_id != declared["map_instance_id"]:
+        differences.append(
+            {
+                "field": "map_instance_id",
+                "expected": declared["map_instance_id"],
+                "actual": post.map_instance_id,
+            }
+        )
+
     if "floor_id" not in declared:
-        if post.floor_id != pre.floor_id:
+        if not map_changed and post.floor_id != pre.floor_id:
             differences.append(
                 {"field": "floor_id", "expected": pre.floor_id, "actual": post.floor_id}
             )
     elif declared["floor_id"] is None:
-        if action_kind != "MOVE_TO_STAIR" or post.floor_id == pre.floor_id:
+        if action_kind not in {"MOVE_TO_STAIR", "SCAN_OPAQUE_EXIT", "SCAN_VERIFIED_TRANSITION"} or not map_changed:
             differences.append(
                 {
                     "field": "floor_id",
-                    "expected": "a different floor for MOVE_TO_STAIR",
-                    "actual": post.floor_id,
+                    "expected": "a different map instance for a transition action",
+                    "actual": post.map_instance_id,
                 }
             )
     elif post.floor_id != declared["floor_id"]:
@@ -94,7 +119,7 @@ def validate_expected_delta(
             {"field": "floor_id", "expected": declared["floor_id"], "actual": post.floor_id}
         )
 
-    if post.floor_id == pre.floor_id:
+    if not map_changed:
         pre_blocks = {(block.x, block.y): block for block in pre.blocks}
         post_blocks = {(block.x, block.y): block for block in post.blocks}
         changed_coordinates = {
@@ -161,4 +186,8 @@ def validate_expected_delta(
                     ],
                 }
             )
+    else:
+        # Blocks belong to map-instance snapshots.  Their coordinate sets are
+        # intentionally incomparable across a transition.
+        actual["changed_block_coordinates"] = []
     return DeltaValidation(matches=not differences, differences=differences, actual=actual)

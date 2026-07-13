@@ -92,14 +92,49 @@ MotaLab.blockEvidence = function blockEvidence(block, normalizedDamage = undefin
 
 MotaLab.collectObservation = function collectObservation(adapter, now = Date.now) {
   const snapshot = adapter.readRuntimeSnapshot();
-  if (!snapshot.map || snapshot.map.width !== MotaLab.MAP_WIDTH
-    || snapshot.map.height !== MotaLab.MAP_HEIGHT) {
+  const width = snapshot.map && snapshot.map.width;
+  const height = snapshot.map && snapshot.map.height;
+  if (!MotaLab.isFiniteInteger(width) || !MotaLab.isFiniteInteger(height)
+    || width < 1 || height < 1 || width > MotaLab.MAX_MAP_AXIS
+    || height > MotaLab.MAX_MAP_AXIS || width * height > MotaLab.MAX_MAP_CELLS) {
     throw MotaLab.createPauseError(
       "ENGINE_API_INCOMPATIBLE",
       "UNSUPPORTED_MAP_DIMENSIONS",
-      { width: snapshot.map && snapshot.map.width, height: snapshot.map && snapshot.map.height },
+      { width, height },
     );
   }
+  let validCells = null;
+  if (snapshot.map.valid_cells !== null) {
+    if (!Array.isArray(snapshot.map.valid_cells) || snapshot.map.valid_cells.length < 1
+      || snapshot.map.valid_cells.length > width * height) {
+      throw MotaLab.createPauseError(
+        "ENGINE_API_INCOMPATIBLE",
+        "UNRELIABLE_TOPOLOGY",
+        { source: snapshot.map.topology_source },
+      );
+    }
+    const unique = new Set();
+    validCells = snapshot.map.valid_cells.map((cell) => {
+      if (!cell || !MotaLab.isFiniteInteger(cell.x) || !MotaLab.isFiniteInteger(cell.y)
+        || cell.x < 0 || cell.x >= width || cell.y < 0 || cell.y >= height) {
+        throw MotaLab.createPauseError("ENGINE_API_INCOMPATIBLE", "UNRELIABLE_TOPOLOGY");
+      }
+      const key = `${cell.x},${cell.y}`;
+      if (unique.has(key)) {
+        throw MotaLab.createPauseError("ENGINE_API_INCOMPATIBLE", "UNRELIABLE_TOPOLOGY");
+      }
+      unique.add(key);
+      return { x: cell.x, y: cell.y };
+    }).sort((a, b) => a.y - b.y || a.x - b.x);
+  }
+  const topologyProjection = {
+    dimensions: { width, height },
+    valid_cells: validCells,
+  };
+  const topologyFingerprint = `sha256:${MotaLab.sha256(MotaLab.canonicalize(topologyProjection))}`;
+  const validCellSet = validCells && new Set(validCells.map((cell) => `${cell.x},${cell.y}`));
+  const isValidCell = (x, y) => x >= 0 && x < width && y >= 0 && y < height
+    && (!validCellSet || validCellSet.has(`${x},${y}`));
 
   const hero = snapshot.hero;
   const validDirection = new Set(["up", "down", "left", "right"]);
@@ -114,8 +149,7 @@ MotaLab.collectObservation = function collectObservation(adapter, now = Date.now
     ["keys.red", hero.keys.red],
   ].find(([, value]) => !MotaLab.isFiniteInteger(value) || value < 0);
   if (invalidHeroField
-    || hero.loc.x < 0 || hero.loc.x >= MotaLab.MAP_WIDTH
-    || hero.loc.y < 0 || hero.loc.y >= MotaLab.MAP_HEIGHT
+    || !isValidCell(hero.loc.x, hero.loc.y)
     || !validDirection.has(hero.loc.direction)) {
     throw MotaLab.createPauseError(
       "ENGINE_API_INCOMPATIBLE",
@@ -131,13 +165,18 @@ MotaLab.collectObservation = function collectObservation(adapter, now = Date.now
   }
 
   const blocks = [];
+  if (!Array.isArray(snapshot.blocks) || snapshot.blocks.length > MotaLab.MAX_BLOCKS) {
+    throw MotaLab.createPauseError(
+      "ENGINE_API_INCOMPATIBLE", "INVALID_BLOCK_COLLECTION_SIZE",
+      { count: Array.isArray(snapshot.blocks) ? snapshot.blocks.length : null },
+    );
+  }
   const collectionIssues = [];
   const occupied = new Set();
   for (const raw of snapshot.blocks) {
     if (raw.disabled) continue;
     if (!MotaLab.isFiniteInteger(raw.x) || !MotaLab.isFiniteInteger(raw.y)
-      || raw.x < 0 || raw.x >= MotaLab.MAP_WIDTH
-      || raw.y < 0 || raw.y >= MotaLab.MAP_HEIGHT) {
+      || !isValidCell(raw.x, raw.y)) {
       throw MotaLab.createPauseError(
         "ENGINE_API_INCOMPATIBLE",
         "BLOCK_OUT_OF_BOUNDS",
@@ -222,7 +261,22 @@ MotaLab.collectObservation = function collectObservation(adapter, now = Date.now
     floor_id: snapshot.floor_id,
     floor_name: snapshot.map.floor_name || null,
     floor_number: MotaLab.parseFloorNumber(snapshot.map.floor_name, snapshot.floor_id),
-    dimensions: { width: MotaLab.MAP_WIDTH, height: MotaLab.MAP_HEIGHT },
+    dimensions: { width, height },
+    topology: validCells ? {
+      kind: "valid_cells",
+      valid_cells: validCells,
+      source: snapshot.map.topology_source,
+      confidence: snapshot.map.topology_confidence,
+    } : {
+      kind: "rectangle",
+      source: snapshot.map.topology_source,
+      confidence: snapshot.map.topology_confidence,
+    },
+    topology_fingerprint: topologyFingerprint,
+    map_instance_id: `map:${MotaLab.sha256(MotaLab.canonicalize({
+      floor_id: snapshot.floor_id,
+      topology_fingerprint: topologyFingerprint,
+    }))}`,
     hero: {
       hp: hero.hp,
       attack: hero.attack,

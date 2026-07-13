@@ -77,6 +77,20 @@ MotaLab.sha256 = function sha256(input) {
 MotaLab.fingerprintProjection = function fingerprintProjection(observation) {
   return {
     floor_id: observation.floor_id,
+    session_id: observation.session_id,
+    dimensions: {
+      width: observation.dimensions.width,
+      height: observation.dimensions.height,
+    },
+    topology: Object.assign({
+      kind: observation.topology.kind,
+      source: observation.topology.source,
+      confidence: observation.topology.confidence,
+    }, Array.isArray(observation.topology.valid_cells) ? {
+      valid_cells: observation.topology.valid_cells,
+    } : {}),
+    topology_fingerprint: observation.topology_fingerprint,
+    map_instance_id: observation.map_instance_id,
     hero: {
       hp: observation.hero.hp,
       attack: observation.hero.attack,

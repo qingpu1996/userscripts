@@ -13,10 +13,12 @@ from threading import Lock
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from .deltas import validate_expected_delta
+from .guards import compare_guard
 from .knowledge import KnowledgeError, KnowledgeRegistry
 from .logging import DecisionLogger, EvidenceWriter
 from .models import (
@@ -36,7 +38,7 @@ from .state import canonical_json, observation_fingerprint
 from .storage import LedgerError, Store
 
 
-DEFAULT_MAX_BODY_BYTES = 256 * 1024
+DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024
 LOGGER = logging.getLogger(__name__)
 
 
@@ -47,12 +49,15 @@ class Settings:
     bundled_data_dir: Path
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
     rate_limit_per_second: int = 50
+    direct_mount_origin: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.max_body_bytes < 1:
             raise ValueError("max_body_bytes must be positive")
         if self.rate_limit_per_second < 0:
             raise ValueError("rate_limit_per_second cannot be negative")
+        if self.direct_mount_origin not in (None, "https://h5mota.com"):
+            raise ValueError("direct_mount_origin must be exactly https://h5mota.com")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -278,7 +283,9 @@ class CycleCoordinator:
                 details={"differences": validation.differences, "actual_delta": validation.actual},
                 action=record.response,
             )
-        self.store.confirm_action(action_id, observation_fp)
+        self.store.confirm_action_and_transition(
+            action_id, observation_fp, pre, request.observation
+        )
         self.logger.write(
             "action_completed",
             request.observation,
@@ -290,7 +297,39 @@ class CycleCoordinator:
 
     def cycle(self, request: CycleRequest) -> Dict[str, Any]:
         observation = request.observation
-        observation_fp = self.store.record_observation(observation)
+        if request.session.mode == "handoff_expected_guard":
+            differences = compare_guard(request.session.expected_guard, observation)
+            if differences:
+                pause = self._pause(
+                    request,
+                    kind=PauseKind.GUARD_MISMATCH,
+                    detail_code="HANDOFF_BASELINE_MISMATCH",
+                    reason="当前运行态与接管 expected_guard 不一致。",
+                    details={"differences": differences},
+                )
+                response = self._response_payload(pause)
+                self._log_response(request, response)
+                return response
+        try:
+            observation_fp, session_status = self.store.ingest_observation(
+                observation,
+                request.session.mode,
+                request.session.expected_guard,
+                confirm=request.session.command == "confirm",
+            )
+        except LedgerError as exc:
+            raise ServiceError(exc.code, str(exc)) from exc
+        if session_status != "confirmed":
+            pause = self._pause(
+                request,
+                kind=PauseKind.SESSION_CONFIRMATION_REQUIRED,
+                detail_code="SESSION_NOT_CONFIRMED",
+                reason="首次 observation 已记录；必须显式 confirm 后才允许规划行动。",
+                details={"session_id": observation.session_id, "mode": request.session.mode},
+            )
+            response = self._response_payload(pause)
+            self._log_response(request, response)
+            return response
         if observation.busy:
             pause = self._pause(
                 request,
@@ -306,6 +345,111 @@ class CycleCoordinator:
             response = self._response_payload(completion_pause)
             self._log_response(request, response)
             return response
+        if request.completed_action_id is not None:
+            acknowledged = IdleResponse(
+                status="idle",
+                reason="已明确接收并结算 completed_action_id；下一轮再签发后续原子行动。",
+                registry_entries=self.knowledge.registry_entries(observation),
+                acknowledged_action_id=request.completed_action_id,
+            )
+            response = self._response_payload(acknowledged)
+            self._log_response(request, response, "completed_action_acknowledged")
+            return response
+
+        try:
+            unresolved = self.store.issued_action_for_session(observation.session_id)
+        except LedgerError as exc:
+            raise ServiceError(exc.code, str(exc)) from exc
+        recovery_request = request.recovery
+        if request.intent == "reconnect_only":
+            if unresolved is not None:
+                journal_action_id = None if recovery_request is None \
+                    else recovery_request.pending_action_id
+                if journal_action_id != unresolved.action_id:
+                    detail_code = "RECOVERY_JOURNAL_LEDGER_MISMATCH"
+                    reason = (
+                        "仅重连请求未携带与服务端唯一未决行动一致的浏览器身份。"
+                    )
+                else:
+                    detail_code = "RECONNECT_UNRESOLVED_ACTION"
+                    reason = (
+                        "仅重连已核对未决行动身份；为避免隐式执行，保持暂停并等待正常恢复循环。"
+                    )
+                paused = self._pause(
+                    request,
+                    kind=PauseKind.EXPECTED_DELTA_MISMATCH,
+                    detail_code=detail_code,
+                    reason=reason,
+                    details={
+                        "journal_action_id": journal_action_id,
+                        "ledger_action_id": unresolved.action_id,
+                        "ledger_pre_fingerprint": unresolved.pre_fingerprint,
+                        "current_fingerprint": observation_fp,
+                    },
+                    action=unresolved.response,
+                )
+                response = self._response_payload(paused)
+                self._log_response(request, response, "reconnect_only_unresolved")
+                return response
+            if recovery_request is not None and recovery_request.pending_action_id is not None:
+                paused = self._pause(
+                    request,
+                    kind=PauseKind.EXPECTED_DELTA_MISMATCH,
+                    detail_code="RECOVERY_JOURNAL_LEDGER_MISMATCH",
+                    reason="浏览器携带 pending 身份，但服务端 ledger 没有对应未决行动。",
+                    details={
+                        "journal_action_id": recovery_request.pending_action_id,
+                        "ledger_action_id": None,
+                        "current_fingerprint": observation_fp,
+                    },
+                )
+                response = self._response_payload(paused)
+                self._log_response(request, response, "reconnect_only_identity_mismatch")
+                return response
+            idle = IdleResponse(
+                status="idle",
+                reason="localhost 已连接；仅重连观察模式不会签发或执行新行动。",
+                registry_entries=self.knowledge.registry_entries(observation),
+            )
+            response = self._response_payload(idle)
+            self._log_response(request, response, "reconnect_only_idle")
+            return response
+        if unresolved is not None:
+            if recovery_request is None or recovery_request.phase == "none":
+                if observation_fp == unresolved.pre_fingerprint:
+                    self._log_response(request, unresolved.response, "unresolved_action_replayed")
+                    return unresolved.response
+                pause = self._pause(
+                    request,
+                    kind=PauseKind.EXPECTED_DELTA_MISMATCH,
+                    detail_code="RECOVERY_JOURNAL_LEDGER_MISMATCH",
+                    reason="服务端存在未决行动，但浏览器未携带匹配的 pending 身份。",
+                    details={
+                        "ledger_action_id": unresolved.action_id,
+                        "ledger_pre_fingerprint": unresolved.pre_fingerprint,
+                        "current_fingerprint": observation_fp,
+                    },
+                    action=unresolved.response,
+                )
+                response = self._response_payload(pause)
+                self._log_response(request, response)
+                return response
+            if recovery_request.pending_action_id != unresolved.action_id:
+                pause = self._pause(
+                    request,
+                    kind=PauseKind.EXPECTED_DELTA_MISMATCH,
+                    detail_code="RECOVERY_JOURNAL_LEDGER_MISMATCH",
+                    reason="浏览器 pending action_id 与服务端唯一未决行动不一致。",
+                    details={
+                        "journal_action_id": recovery_request.pending_action_id,
+                        "ledger_action_id": unresolved.action_id,
+                        "current_fingerprint": observation_fp,
+                    },
+                    action=unresolved.response,
+                )
+                response = self._response_payload(pause)
+                self._log_response(request, response)
+                return response
 
         try:
             recovery = classify_recovery(
@@ -343,48 +487,9 @@ class CycleCoordinator:
             self._log_response(request, response)
             return response
 
-        if recovery.kind == "resign" and recovery.action is not None:
-            old = recovery.action
-            if old.status == "superseded":
-                replacement = self._latest_replacement(old)
-                self._log_response(request, replacement.response, "decision_replayed")
-                return replacement.response
-            if old.status != "issued":
-                raise ServiceError(
-                    "ACTION_STATE_CONFLICT",
-                    f"action in status {old.status} cannot be re-signed",
-                )
-            decision_key = self._decision_key(
-                observation_fp,
-                "recovery-v1",
-                mode="resign",
-                pending_action_id=old.action_id,
-            )
-            existing = self.store.get_decision(decision_key)
-            if existing is not None:
-                self._log_response(request, existing, "decision_replayed")
-                return existing
-            replacement = dict(old.response)
-            replacement["action_id"] = self.store.reserve_action_id()
-            replacement["supersedes_action_id"] = old.action_id
-            base_reason = old.response["reason"].split(" 上一行动已确认未执行", 1)[0]
-            replacement["reason"] = (
-                base_reason + " 上一行动已确认未执行，本响应使用新的 action_id 安全重签。"
-            )
-            replacement["registry_entries"] = [
-                entry.model_dump(mode="json")
-                for entry in self.knowledge.registry_entries(observation)
-            ]
-            replacement = self._response_payload(ExecuteResponse.model_validate(replacement))
-            persisted = self.store.save_decision(
-                decision_key=decision_key,
-                observation_fingerprint=observation_fp,
-                knowledge_fingerprint=self.knowledge.fingerprint(),
-                response=replacement,
-                supersedes_action_id=old.action_id,
-            )
-            self._log_response(request, persisted)
-            return persisted
+        if recovery.kind == "replay" and recovery.action is not None:
+            self._log_response(request, recovery.action.response, "unresolved_action_replayed")
+            return recovery.action.response
 
         knowledge_fp = self.knowledge.fingerprint()
         supersedes_action_id = None
@@ -397,6 +502,18 @@ class CycleCoordinator:
         )
         existing = self.store.get_decision(decision_key)
         if existing is not None:
+            scan_before_replay = self.store.get_scan_state(observation.session_id)
+            if (
+                scan_before_replay is not None
+                and scan_before_replay.get("phase") != "complete"
+                and existing.get("status") == "execute"
+                and not str(existing.get("action_kind", "")).startswith("SCAN_")
+            ):
+                raise ServiceError(
+                    "SCAN_ACTION_CONFLICT",
+                    "an older non-scan action is pending while takeover scan is active",
+                    409,
+                )
             if existing.get("status") == "execute":
                 action = self.store.get_action(existing["action_id"])
                 if action is None:
@@ -414,9 +531,9 @@ class CycleCoordinator:
                 self._log_response(request, existing, "decision_replayed")
                 return existing
 
-        # A normal retry of an issued state must receive the byte-equivalent
-        # action even if the knowledge files changed after issuance.  Explicit
-        # not_executed recovery bypasses this and signs a replacement below.
+        # A normal retry and an explicit not_executed recovery both replay the
+        # byte-equivalent same action ID.  Protocol v2 never signs a replacement
+        # while that session action remains unresolved.
         if supersedes_action_id is None:
             issued = self.store.issued_action_for_prestate(observation_fp)
             if issued is not None:
@@ -424,6 +541,14 @@ class CycleCoordinator:
                 return issued.response
 
         entries = self.knowledge.registry_entries(observation)
+        labels = self.knowledge.labels()
+        frontier_coordinates = {
+            (block.x, block.y)
+            for block in observation.blocks
+            if (label := labels.get((block.id, block.cls, block.trigger))) is None
+            or label.boundary
+        }
+        self.store.sync_frontiers(observation, observation_fp, frontier_coordinates)
         if not self.knowledge.is_known_floor(observation.floor_id):
             pause = self._pause(
                 request,
@@ -456,13 +581,55 @@ class CycleCoordinator:
                     details={"blocks": unknown_details},
                 )
             else:
+                world_context = {
+                    "map_instances": self.store.map_instances_for_session(observation.session_id),
+                    "observations": self.store.latest_map_observations(observation.session_id),
+                    "transitions": self.store.transitions_for_session(observation.session_id),
+                    "frontiers": self.store.frontiers_for_session(observation.session_id),
+                }
+                scan_state = self.store.get_scan_state(observation.session_id)
+                if scan_state is None:
+                    raise ServiceError(
+                        "LEDGER_CORRUPT", "confirmed session has no takeover scan state", 500
+                    )
+                refreshed_scan = self.planner.refresh_scan_state(
+                    observation, labels, world_context, scan_state
+                )
+                if any(
+                    refreshed_scan.get(field) != scan_state.get(field)
+                    for field in (
+                        "phase", "current_map_instance_id", "scanned_map_instance_ids",
+                        "pending_exits", "traversed_transitions", "reason",
+                    )
+                ):
+                    scan_state = self.store.save_scan_state(
+                        observation.session_id,
+                        refreshed_scan,
+                        event="scan_frontier_refreshed",
+                    )
                 planned = self.planner.plan(
                     observation,
-                    self.knowledge.labels(),
+                    labels,
                     action_id_factory=self.store.reserve_action_id,
                     registry_entries=entries,
                     supersedes_action_id=supersedes_action_id,
+                    world_context=world_context,
+                    scan_state=scan_state,
                 )
+                if getattr(planned, "scan_state", None) is None:
+                    planned = planned.model_copy(update={
+                        "scan_state": self.planner._scan_wire(
+                            scan_state, len(world_context["frontiers"])
+                        )
+                    })
+                if getattr(planned, "scan_state", None) is not None \
+                        and planned.scan_state.phase == "paused":
+                    paused_scan = dict(scan_state)
+                    paused_scan["phase"] = "paused"
+                    paused_scan["reason"] = planned.scan_state.reason
+                    self.store.save_scan_state(
+                        observation.session_id, paused_scan, event="scan_paused"
+                    )
                 if isinstance(planned, PauseResponse) and planned.evidence_path is None:
                     planned = self._pause(
                         request,
@@ -512,6 +679,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     coordinator = CycleCoordinator(settings)
     rate_limiter = FixedWindowRateLimiter(settings.rate_limit_per_second)
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    if settings.direct_mount_origin is not None:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=[settings.direct_mount_origin],
+            allow_methods=["POST"],
+            allow_headers=["Content-Type", "X-Mota-Lab"],
+            allow_credentials=False,
+            expose_headers=[],
+            max_age=600,
+        )
     app.state.settings = settings
     app.state.coordinator = coordinator
 
@@ -552,7 +729,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             ]
             return _error(
                 "SCHEMA_REJECTED",
-                "request does not match protocol 1 schema",
+                "request does not match protocol 2 schema",
                 422,
                 errors=errors,
             )

@@ -1,111 +1,67 @@
-# 浏览器控制状态机
-
-## 主循环
+# Protocol v2 状态机
 
 ```text
 STOPPED
-  -> PREFLIGHT
-  -> BASELINE_VERIFIED
-  -> OBSERVING
-  -> REQUESTING
-  -> VALIDATING_RESPONSE
-  -> GUARD_CHECK
-  -> EXECUTING
-  -> SETTLING
-  -> VERIFYING_DELTA
-  -> REPORTING
-  -> OBSERVING
-
+ -> PREFLIGHT
+ -> AWAITING_BASELINE_CONFIRMATION
+ -> BASELINE_VERIFIED
+ -> TAKEOVER_SCAN(anchor -> discover -> sweep -> complete|paused)
+ -> OBSERVING -> REQUESTING -> GUARD_CHECK
+ -> EXECUTING -> SETTLING -> VERIFYING_DELTA -> REPORTING
 任意阶段 -> PAUSED
-PAUSED -> PREFLIGHT（只允许用户启动或明确重新连接）
 ```
 
-脚本注入后固定从 `STOPPED` 开始。首次观察只核对用户给出的 4F 面板与坐标；核对一致只进入 `BASELINE_VERIFIED`，不会自动进入执行循环，仍需用户选择“启动自动驾驶”。初始化不读档。
+首次 observation 只展示。用户显式确认后浏览器 journal 保存 session_id、mode、baseline 摘要；服务收到 `command=confirm` 前保持 `SESSION_CONFIRMATION_REQUIRED`。启动是与确认分开的第二个用户动作。
+
+## Journal v2
+
+持久字段包括 protocol、session_id/mode/baseline、service confirmation、scan state、pending、completed、ack、seen action IDs、registry 和 pause evidence。只要固定 v1 key 仍存在且未留下专用处置审计，即使已有 v2 journal 也只会触发 `JOURNAL_V1_MIGRATION_REQUIRED`；普通 baseline 确认、启动和重连都不能绕过。
+
+所有会改变这些身份字段的 mutation 都写入 A/B 中非当前最高的 generation 槽。base envelope 固定 `generation=1, previous_generation=0, previous_commit_hash=null`；后续 envelope 必须在自身内部声明 `previous_generation=generation-1`，并携带 previous committed hash、完整 state/hash、commit hash 与导入 witness。安全整数溢出、单槽内部 gap、双槽链断都 fail closed。完整双读并从两槽重新选出唯一最高前，状态机不能进入下一阶段。pending generation 可验证后才能进入 `EXECUTING`；mark-completed 或 ack 的 candidate 不完整时保留旧 pending/completed，candidate 已完整但 API 报错时刷新选择新 generation，仍不会丢失“未执行/已执行待 ack”身份。clear/abandon/archive/disposition 同样是新 generation，不物理删除唯一证据。
+
+唯一迁移入口先把完整 v1 payload 归档到 v2 journal，生成内容哈希 archive id；随后要求用户输入精确确认短语并回传同一 archive id，才可开始一个不继承旧行动身份的新 v2 session。处置时重新哈希当前固定 legacy key，内容与 archive 不同即拒绝；处置后 legacy 内容发生变化会再次 quarantine。若 v2 journal 已有 session、pending、completed、ack、seen action 或 scan identity，专用处置也拒绝且不清空任何证据，必须交给未来的独立审计迁移。direct mount 使用自己的 v1 quarantine key，不枚举游戏 storage。
+
+direct mount 和 userscript 使用隔离 namespace。任何模式都不能枚举游戏 storage。
+
+固定 v1/v2 key 的读取区分 `ABSENT / PARSE_FAILED / WRONG_SHAPE_OR_PROTOCOL / STORAGE_UNSTABLE / VALID`。userscript/direct 模式由构建 marker 决定，不从 GM API 是否存在推断。Tampermonkey 每次 inspect 读取两次 key list，并用两个不同动态 sentinel 双读同一 key；两个默认各自返回才是 absent，同一真实值返回两次才是 present。stale omission/inclusion 可被交叉验证，list/get 变化、异常或不一致暂停 `JOURNAL_STORAGE_UNSTABLE`。存在的 `undefined/null/primitive/array/旧 sentinel` 均按损坏内容处理；证据只保存 key、长度、SHA-256 与错误类别。
 
 ## 行动事务
 
 ```text
-收到 execute
-  -> 校验响应 schema / action_id / 当前 registry
-  -> 重新观察
-  -> 精确核对 guard
-  -> 计算 pre-fingerprint
-  -> 确认边界具有可验证非位置 postcondition
-  -> 持久化 pendingAction
-  -> 调用一个公开行动接口
-  -> 轮询 moving / lock / event
-  -> fingerprint 发生变化并连续两次一致
-  -> 校验真实非位置状态变化与 expected_delta
-  -> 持久化 lastCompletedAction
-  -> 携 completed_action_id 上报
+response schema
+ -> session/map/dimensions/topology/full-panel guard
+ -> current topology route proof
+ -> verified durable pending journal before API
+ -> one public engine action
+ -> moving/lock/event all clear
+ -> changed fingerprint stable twice
+ -> non-position postcondition + expected delta
+ -> completed report
+ -> SQLite action/world/transition transaction
 ```
 
-任何 guard、路径、稳定或差分失败都发生在下一行动之前。行动 API 调用前的 pending journal 是“最多一次执行”门禁。
+同一 action_id 最多进入 EXECUTING 一次，同一 session 最多存在一个 unresolved `issued`。pre fingerprint 未变说明尚未执行时，服务重发原 ID，浏览器核对 pending/ledger identity 后才执行；不得用 replacement ID 绕过未决行动。completed 后即使返回相同现场，也必须由持久 sequence 签发新 ID。
 
-## journal
+## 刷新与故障
 
-GM 持久记录至少包含：
+- fingerprint 等于 pre：`not_executed`，浏览器携带真实 pending 身份请求服务重发同一 action_id，绝不自行换 ID。
+- 符合 expected post 且边界确有非位置变化：补记 completed。
+- 两者都不满足：`RECOVERY_STATE_AMBIGUOUS` 暂停。
 
-- `autopilotEnabled`
-- `initialBaselineVerifiedFingerprint`
-- `pendingAction`
-- `lastCompletedAction`
-- `lastAcknowledgedActionId`
-- `lastPause`
-- `knownProtocolVersion`
+`reconnectOnly` 走同一分类并携带 phase/action ID/pre/current fingerprint，同时明确发送 `intent=reconnect_only`。服务在该 intent 下禁止进入 planner、decision cache 或 action issuance；无 unresolved 返回 idle，有 unresolved 返回同 identity 暂停。浏览器若收到违反门禁的 execute，持久保存 action ID/guard/response hash 并进入 `RECONNECT_UNEXPECTED_EXECUTE`，绝不执行。completed 分类在发送前只形成 recovery report，不清 pending；服务成功结算后必须用独立 idle + 同 ID `acknowledged_action_id` 明确确认。
 
-`pendingAction` 包含 action_id、pre-fingerprint、pre-observation、guard、expected_delta、`requires_non_position_change`、operations、operation index、phase 和 started_at。清除 pending 只清浏览器账本，绝不改游戏现场或服务 ledger；该菜单需要二次确认。只要行动尚未 completed/acknowledged、浏览器仍有 pending 或现场尚未确认，就禁止使用该菜单绕过恢复。
+SQLite 状态机是 `IMPORT_WITNESS -> CONSISTENT_PRIVATE_SNAPSHOT -> CANDIDATE_SCHEMA_AND_BEHAVIOR_PROBE -> IDENTITY_RECHECK -> ATOMIC_GENERATION_MANIFEST -> GENERATION_CONNECT_RECHECK -> WAL`。调用方 pathname 只作导入 witness；分类后不再重开它。WAL/SHM 必须成对且 framing/size 合法，私有 probe 前后复核 source；发布和实际 connect 前后的 replace/swap 只能触发拒绝，不能让替换 inode 接受 DDL/WAL。manifest 指向 state dir 内权威 generation，重启从该 generation 恢复；candidate 崩溃残留在成功启动后清理。
 
-## 服务状态根与浏览器 journal 共同恢复链
+fingerprint 包含 session、map instance、dimensions、topology、英雄面板、keys 和当前 blocks；忽略时间和 busy。
 
-最多一次执行依赖两侧持久身份同时存在：
+state dir 与 journal 共同组成身份链。`UNKNOWN_ACTION_ID` 不能解释为“没执行”；恢复原目录并只读核对。删除 state dir 属于用户明确授权的状态重置，不是重启。
 
-- 浏览器 GM journal 保存 pending、completed、acknowledged、pre-fingerprint 和 expected post-state；
-- `MOTA_LAB_STATE_DIR` 保存 SQLite action ledger、observation、decision cache、持久 `action_id_sequence` issuance sequence、JSONL 决策日志和 pause evidence。
+## 换图
 
-因此 `MOTA_LAB_STATE_DIR` 不是 cache。正常服务重启、升级和重新连接必须复用同一个绝对路径与完整目录；删除、清空或换成空目录会切断 action_id 身份和恢复链。只保留独立的 `MOTA_LAB_KNOWLEDGE_DIR` 只能恢复知识标签，不能恢复 action ledger。
+出口目标在真正转移前保持未知。扫描状态以 SQLite 和浏览器 journal 持久化：anchor 固定接管起点，discover 处理当前安全出口，sweep 通过已验证边返回尚有 pending 的实例，complete 才允许普通资源规划；单向边导致 pending 无法安全返回时进入 paused，不消耗资源强行扩图。
 
-当 pending 尚未 completed/acknowledged、浏览器仍有 pending journal，或现场状态尚未确认时，绝对不得切换或迁移 state dir，也不得清 browser pending 规避门禁。删除整个 state dir 是需要用户明确确认的显式状态重置，不属于“服务重启恢复”。完整的停机迁移、备份和只读核对步骤见[安装文档的状态目录章节](install-and-run.md#21-状态目录不是缓存)。
+completed action 的 pre/post map instance 不同才建立 transition，同 floorId 换图也算换图。未知目标由 `map_instance_id: null` 要求“实例必须改变”，已验证目标要求精确实例。跨图不拿两张地图的 blocks 做 removed/added 比较。重复 completed report 不重复建边；只有端点严格互换的实际反向边才升级为 reversible。
 
-## 刷新与丢包恢复
+## 暂停
 
-页面恢复时，如果存在 pending action，浏览器先重新观察，不调用行动 API：
-
-| 判断 | 分类 | 后续 |
-| --- | --- | --- |
-| current fingerprint == pre-fingerprint | `not_executed` | 向服务报告；只有全新 action_id 且带 `supersedes_action_id` 才可重新签发 |
-| current 满足 expected_delta，且边界已证明非位置变化 | `completed` | 本地补记完成并携 completed_action_id 上报 |
-| 两者均不满足 | `mismatch` | `EXPECTED_DELTA_MISMATCH / RECOVERY_STATE_AMBIGUOUS` 暂停 |
-
-同一 action_id 在正常循环、刷新、HTTP 重试和服务重启后均不得再次进入 `EXECUTING`。
-旧 journal 若没有任何 expected_delta 字段，或边界只发生坐标变化，不得通过恢复门禁，必须进入 `RECOVERY_STATE_AMBIGUOUS`。
-
-服务端区分“同一 pending 行动重试”和“completed 后再次来到同一现场”：前者从 SQLite ledger 重放同一个 action_id；后者通过持久 issuance sequence 签发新 action_id。浏览器继续保留 completed 去重，不因服务修复而削弱门禁；新 ID 才能作为新的行动事务进入 `GUARD_CHECK`。
-
-### `UNKNOWN_ACTION_ID` 人工恢复
-
-浏览器持有 pending/completed action_id，而服务返回 `409 UNKNOWN_ACTION_ID` 时，说明当前 `MOTA_LAB_STATE_DIR` 的 ledger 无法识别该身份。它可能来自目录切错、空目录初始化、备份不完整、目录损坏或真正丢失；**不能**据此推断行动未执行。
-
-处理流程：
-
-1. 立即保持 `PAUSED` 并调用 `stopAutomaticRoute`；不执行、不重放、不请求替代 action，也不清 browser journal。
-2. 保存当前层 observation/fingerprint、pending 的 action_id/phase/pre-fingerprint/expected_delta、last completed/acknowledged 和结构化错误详情。
-3. 停止服务，恢复原 state dir 或完整备份；不得新建空目录冒充恢复，也不得编辑 SQLite 手工伪造 action。
-4. 只读核对 ledger 中的 action_id、状态、replacement chain 和 issuance sequence，再启动服务并使用“仅重新连接”进入上表的 pre / expected post / mismatch 三分法。
-5. 如果原 ledger 无法恢复，继续暂停，由人工依据保留的 journal 与真实现场判断“未执行、已执行或不明”。只有用户明确确认该结论、归档证据并接受显式状态重置后，才能另行建立新状态根；结果不明时不得继续行动。
-
-这一流程恢复的是身份链，而不是“让服务重新规划一次”。任何新 action_id 都必须建立在旧 pending 已被 ledger 正确完成、确认或人工关闭之后。
-
-## 多路段限制
-
-v0.1.0 服务优先每次只返回一个 grid。若浏览器收到多段：
-
-- 非末段必须是当前观察中完整证明的纯空走廊；
-- 末段最多一个已登记状态变化边界；
-- 每段后都重新观察并核对派生 guard；
-- floor、面板、钥匙或 blocks 一旦变化立即停止剩余段；
-- 多边界计划被拒绝，不逐格模拟点击。
-
-## 暂停与恢复
-
-`PAUSED` 是吸收态：定时循环停止，自动路线停止，证据固化。只有用户执行“启动自动驾驶”或“仅重新连接本地决策器”才会重新进入 `PREFLIGHT`；服务恢复本身不会在后台悄悄重新启动车辆。
+暂停会停止自动路线、关闭 autopilot、保存完整当前 observation 和结构化 evidence。未知对象、伤害、交互、guard、差分、API、session 和规划预算都 fail closed。只有用户明确启动或重连才能离开暂停态。

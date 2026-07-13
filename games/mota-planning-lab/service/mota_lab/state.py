@@ -8,7 +8,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
-from .models import Block, BlockLabel, Observation, model_to_dict
+from .models import Block, BlockLabel, Observation
 
 
 Coordinate = Tuple[int, int]
@@ -19,7 +19,7 @@ def canonical_json(value: object) -> str:
 
 
 def observation_payload(observation: Observation, *, include_timestamp: bool = True) -> dict:
-    payload = model_to_dict(observation)
+    payload = observation.model_dump(mode="json", exclude_unset=True)
     if not include_timestamp:
         payload.pop("captured_at", None)
     payload["blocks"] = sorted(
@@ -33,6 +33,11 @@ def fingerprint_payload(observation: Observation) -> dict:
     payload = observation_payload(observation, include_timestamp=False)
     return {
         "floor_id": payload["floor_id"],
+        "session_id": payload["session_id"],
+        "map_instance_id": payload["map_instance_id"],
+        "dimensions": payload["dimensions"],
+        "topology": payload["topology"],
+        "topology_fingerprint": payload["topology_fingerprint"],
         "hero": payload["hero"],
         "keys": payload["keys"],
         "blocks": payload["blocks"],
@@ -76,14 +81,19 @@ class Boundary:
 
 
 class CurrentFloorGraph:
-    """An 11x11 graph derived solely from the current observation."""
-
-    WIDTH = 11
-    HEIGHT = 11
+    """A graph derived solely from one dynamically-sized current observation."""
 
     def __init__(self, observation: Observation, labels: Mapping[tuple, BlockLabel]):
         self.observation = observation
         self.labels = labels
+        self.width = observation.dimensions.width
+        self.height = observation.dimensions.height
+        if observation.topology.valid_cells is None:
+            self.valid_cells = {
+                (x, y) for y in range(self.height) for x in range(self.width)
+            }
+        else:
+            self.valid_cells = {(cell.x, cell.y) for cell in observation.topology.valid_cells}
         self.blocks: Dict[Coordinate, Block] = {
             (block.x, block.y): block for block in observation.blocks
         }
@@ -93,16 +103,15 @@ class CurrentFloorGraph:
             if label is None or label.boundary or not label.passable or block.no_pass:
                 self._blocked.add(coordinate)
 
-    @staticmethod
-    def neighbors(coordinate: Coordinate) -> Iterable[Coordinate]:
+    def neighbors(self, coordinate: Coordinate) -> Iterable[Coordinate]:
         x, y = coordinate
         for next_coordinate in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
             nx, ny = next_coordinate
-            if 0 <= nx < CurrentFloorGraph.WIDTH and 0 <= ny < CurrentFloorGraph.HEIGHT:
+            if (nx, ny) in self.valid_cells:
                 yield next_coordinate
 
     def is_traversable(self, coordinate: Coordinate) -> bool:
-        return coordinate not in self._blocked
+        return coordinate in self.valid_cells and coordinate not in self._blocked
 
     def reachable(self) -> Reachability:
         start = (self.observation.hero.loc.x, self.observation.hero.loc.y)

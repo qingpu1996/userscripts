@@ -1,160 +1,76 @@
 # 安装与启动
 
-以下步骤只构建本地产物、启动 localhost 服务并由用户手动安装 userscript。任何命令都不会打开游戏、安装到 Tampermonkey、读写游戏存档或启动自动驾驶。
+所有步骤默认只在本机工作；不会自动打开游戏、安装扩展、确认基线、开始行动或碰物理存档。
 
-## 前置条件
-
-- Node.js 18 或更高版本，用于构建和 JavaScript 测试。
-- Python 3.11 或更高版本。
-- Tampermonkey 或兼容的 userscript 管理器。
-- 目标页为 `https://h5mota.com/games/24/`。
-
-## 1. 创建项目本地 Python 环境
-
-在仓库根目录执行：
+## 服务
 
 ```bash
 cd games/mota-planning-lab
-python3.11 -m venv .venv
+python3.12 -m venv .venv
 . .venv/bin/activate
 python -m pip install -r service/requirements.lock
-```
-
-`.venv/` 已在项目 `.gitignore` 中排除。依赖只安装到项目环境，不写系统 Python。
-
-也可以安装命令入口：
-
-```bash
-python -m pip install --no-deps -e service
-```
-
-不安装 editable package 时，后续命令加上 `PYTHONPATH=service` 即可。
-
-## 2. 启动 localhost 决策服务
-
-```bash
 PYTHONPATH=service python -m mota_lab serve
 ```
 
-服务固定监听 `127.0.0.1:18724`。CLI 会拒绝非 loopback host 或不同端口；FastAPI 的 docs/openapi 页面也被关闭。
+服务只监听 `127.0.0.1:18724`。`MOTA_LAB_STATE_DIR` 是 session、action_id、世界图和恢复链的持久身份根，不是 cache；正常重启和升级必须复用同一完整绝对路径。pending 时禁止删除、迁移或切空目录。`MOTA_LAB_KNOWLEDGE_DIR` 只保存人工标签，不能替代 ledger。
 
-默认运行数据写入：
+Protocol v2 数据库使用 `PRAGMA user_version=2`，但版本号不是唯一凭据。空白或合法 v2 导入入口会先一致复制 main/WAL/SHM 到 state dir 私有 candidate，schema/CHECK/AUTOINCREMENT 探针只操作 candidate；通过后原子发布 `.mota-lab.sqlite3.manifest.json` 与 `.mota-lab.sqlite3.generations/gen-*`。之后入口文件只作 identity witness，当前账本以 manifest 指向的 generation 为准。WAL/SHM 缺一、framing/size 异常、双读不稳定、rename/swap、legacy/future/unknown schema 或 manifest 损坏都会安全拒绝。详见 [SQLite generation 与恢复](storage.md)。
 
-- 状态、SQLite、JSONL 与暂停证据：`~/.local/state/mota-planning-lab/`
-- 人工知识标签：`~/.local/share/mota-planning-lab/knowledge/`
+浏览器发现 v1 journal 后，普通“确认基线”、启动、重连和 resume 均继续显示 `JOURNAL_V1_MIGRATION_REQUIRED`。Tampermonkey 菜单先执行“归档旧 v1 journal 证据”，核对归档 ID 和 pending/recovery 标记，再执行“确认归档后开始 v2 新会话”并二次确认。确认时当前 legacy 内容必须仍与 archive ID 一致；以后改写会再次 quarantine。若同 namespace 已有 v2 session/pending/completed/ack/seen/scan 证据，处置会拒绝而不是清空 v2 证据。direct mount 使用隔离的 `mota-planning-lab:direct-mount:journal:v1` quarantine key，通过 `__motaPlanningLab.controller.archiveLegacyJournal()` 与 `beginV2AfterLegacyArchive(...)` 执行同一流程；不要直接删除 localStorage key。
 
-可用环境变量改到独立目录：
+若旧 witness/v1 key 无法解析或 shape/protocol 错误，显示 `JOURNAL_CORRUPT`。若 A/B 两槽同 generation、链断、unexpected higher、读不稳定或没有合法 generation，显示 `JOURNAL_STORAGE_UNSTABLE`。候选槽部分写时不要删除它：刷新会保留旧完整槽；候选已完整但调用报错时刷新会恢复新 pending/completed identity。只能恢复存储 API 后重试，不能清 key、清 pending 或把不稳定证据当普通损坏 journal 处置。
 
-```bash
-MOTA_LAB_STATE_DIR="$HOME/mota-lab-state" \
-MOTA_LAB_KNOWLEDGE_DIR="$HOME/mota-lab-knowledge" \
-PYTHONPATH=service python -m mota_lab serve
-```
-
-初始 bundled knowledge 为空，不预装真实 4F 地图、block 或路线。
-
-### 2.1 状态目录不是缓存
-
-`MOTA_LAB_STATE_DIR` 是服务的**持久状态根**，不是临时 cache。它与浏览器 GM journal 共同组成 action_id 的幂等身份和恢复链，目录内包括：
-
-- `mota-lab.sqlite3` 及存在时的 `mota-lab.sqlite3-wal`、`mota-lab.sqlite3-shm` 等 SQLite sidecar；数据库内保存 observation、action ledger、decision cache 和 `action_id_sequence` issuance sequence；
-- `decisions.jsonl` 决策审计日志；
-- `pauses/` 下的结构化 pause evidence。
-
-正常重启、升级和“仅重新连接本地决策器”都必须复用同一个**绝对路径和完整目录**。不得删除、清空、换成空目录，或只留下一个新建的同名 SQLite 文件。删除整个 state dir 属于显式状态重置，超出“服务重启可恢复”的保证范围；必须由用户主动确认，并先处理所有 pending 状态。
-
-`MOTA_LAB_KNOWLEDGE_DIR` 是另一条数据边界，只保存人工维护的 floor/block 知识标签，可以独立配置和备份。仅保留 knowledge dir **不能**恢复 action ledger、action_id issuance sequence、decision cache 或浏览器 pending 对应的服务端身份。
-
-浏览器 journal 与服务状态根如何共同完成最多一次执行，见[浏览器控制状态机](state-machine.md)。
-
-### 2.2 pending 行动期间的绝对门禁
-
-只要满足以下任一条件，就绝对不得切换、迁移、删除或清空 `MOTA_LAB_STATE_DIR`：
-
-- 服务签发的行动尚未 completed 并 acknowledged；
-- 浏览器 GM journal 仍有 `pending_action`；
-- 当前游戏现场尚未与 pre-fingerprint / expected post-state 完成核对。
-
-不确定时一律按“仍有 pending”处理。此时也不得使用“清除待执行行动”菜单绕过；该菜单只清浏览器账本，不会补回或修复服务端 ledger。先保持自动驾驶暂停、停止自动寻路并完成恢复核对，再考虑任何目录操作。
-
-### 2.3 安全迁移 state dir
-
-迁移必须作为一次停机、整目录、可回滚的维护操作执行：
-
-1. 在浏览器中暂停自动驾驶并停止产生新 action；保持 userscript 断开或暂停，不发送新的 `/cycle`。
-2. 确认没有执行中的自动路线、移动、锁控制或活动事件。不得清除 browser pending journal。
-3. 记录源/目标绝对路径、`pending_action`、`last_completed_action`、`last_acknowledged_action_id`，以及当前现场 fingerprint。`pending_action` 此时必须为 `null`，最后完成行动也必须已 acknowledged；若发现 pending，记录其 action_id、phase、pre-fingerprint 和 expected_delta 后立即中止迁移，先按状态机恢复流程处理，全部确认后再从第 1 步重新开始。
-4. 停止 localhost 服务，确认服务进程已退出。SQLite 使用 WAL；不得在数据库运行中只复制单个 `mota-lab.sqlite3`。
-5. 使用文件系统 snapshot，或在同一文件系统的临时目录中完整复制整个 state dir。复制必须包含 SQLite 主文件及所有现存 sidecar、数据库内的 issuance sequence 与 decision cache、`decisions.jsonl`、`pauses/` 及其他目录项；校验完成后再以原子 rename 放到目标路径。
-6. 保留未修改的原目录作为回滚备份，不要让服务先在目标位置初始化空目录，也不要用目标内容覆盖唯一备份。
-7. 将 `MOTA_LAB_STATE_DIR` 指向新的绝对路径，浏览器仍保持暂停/断开，然后启动服务。
-8. 先做健康与只读核对：确认进程只监听 `127.0.0.1:18724`；以只读方式执行 SQLite `PRAGMA quick_check`，核对 actions/decisions/observations 数量、pending 或最后完成 action_id、`action_id_sequence.next_value` 与迁移前记录一致；同时确认 JSONL 和 pause evidence 已完整复制。v0.1.0 没有独立 `/health` endpoint，健康核对不得用会签发行动的 `/cycle` 代替。
-9. 以上均一致后，才使用“仅重新连接本地决策器”核对浏览器 journal、当前现场和迁移后的 ledger 连续性；确认仍无 pending 且 action_id 链一致后，才可恢复自动驾驶。若意外出现 pending、`UNKNOWN_ACTION_ID` 或现场不符，立即保持暂停并进入故障恢复，不得继续。
-
-可选的只读核对命令示例；它不能替代第 3 步保存的浏览器 journal 与现场记录：
-
-```bash
-lsof -nP -iTCP:18724 -sTCP:LISTEN
-sqlite3 -readonly "$MOTA_LAB_STATE_DIR/mota-lab.sqlite3" \
-  'PRAGMA quick_check; SELECT COUNT(*) FROM observations; SELECT COUNT(*) FROM actions; SELECT COUNT(*) FROM decisions; SELECT action_id,status FROM actions ORDER BY updated_at DESC LIMIT 5; SELECT next_value FROM action_id_sequence WHERE singleton=1;'
-```
-
-### 2.4 目录遗失、损坏或切错
-
-如果 state dir 遗失、损坏或误指向空目录：
-
-1. 保持自动驾驶暂停并停止自动寻路；不要盲目重放，不要清 browser journal，也不要新建空目录冒充恢复。
-2. 保留浏览器 pending、最后完成记录和当前现场 observation/fingerprint；停止当前服务，把误用目录单独保存，避免覆盖证据。
-3. 优先恢复原 state dir 或第 2.3 节的完整备份，再按只读 ledger 核对与恢复三分法继续。
-4. 服务返回 `UNKNOWN_ACTION_ID` 只说明当前 ledger 不认识该 action_id，**不代表行动未执行**。恢复原账本后再核对；若账本确实无法恢复，必须进入 [`UNKNOWN_ACTION_ID` 人工恢复流程](state-machine.md#unknown_action_id-人工恢复)，不得自动签发替代行动。
-
-若最终决定删除整个 state dir 并重新开始，这是一项需用户明确确认的显式状态重置。必须先对 pending 行动给出人工结论并归档 journal、现场 fingerprint 和备份位置；不能把它描述成普通服务重启或无损恢复。
-
-## 3. 构建 userscript
-
-回到仓库根目录：
+## Tampermonkey 模式
 
 ```bash
 node scripts/build-userscript.js mota-planning-lab
 node --check dist/mota-planning-lab.user.js
 ```
 
-生成文件为 `dist/mota-planning-lab.user.js`。metadata 只匹配目标页面，只 `@connect 127.0.0.1`，不含自动更新 URL。
+用户手动导入 `dist/mota-planning-lab.user.js`。构建物包含 `userscript` marker，权限包含 `GM_getValue/GM_setValue/GM_deleteValue/GM_listValues/GM_xmlhttpRequest`；缺任一项都 fail closed，不会降级使用页面 localStorage。脚本只核对固定的 witness/v1/A/B journal keys，不枚举游戏 storage，也不会自动更新或发布。
 
-## 4. 手动安装
+迁移或备份浏览器状态时必须同时保留旧 witness key、v1 quarantine key、`journal:v2:slot:a` 与 `journal:v2:slot:b`。不要只复制最新 generation，也不要手工创建 pointer。
 
-1. 打开 Tampermonkey 管理页，选择“添加新脚本”或“从文件安装”。
-2. 手动导入生成的 `dist/mota-planning-lab.user.js`。
-3. 检查权限只有 `unsafeWindow`、GM 本地存储、菜单注册和 localhost 请求。
-4. 保存脚本。项目不会替用户执行这一步。
+## Direct mount 模式
 
-## 5. 首次运行
+```bash
+node games/mota-planning-lab/scripts/build-direct-mount.mjs
+node --check dist/mota-planning-lab.direct-mount.js
+PYTHONPATH=games/mota-planning-lab/service \
+  python -m mota_lab serve --allow-direct-mount-origin https://h5mota.com
+```
 
-首次打开目标页时脚本保持 `STOPPED`，只读取当前层白名单现场并核对：
+CORS 默认关闭。参数只接受精确 origin `https://h5mota.com`，只放行 POST、`Content-Type` 和 `X-Mota-Lab`，不使用通配符。
 
-- 显示 4F，位置 `x=8,y=3`
-- HP 208，ATK 23，DEF 21
-- Gold 16，EXP 63
-- 黄/蓝/红钥匙 `4/1/0`
+将审计过的 `dist/mota-planning-lab.direct-mount.js` 作为本地脚本注入目标页面。该构建物包含独立 `direct-mount` marker，只有这个显式 marker 才允许使用精确 direct journal localStorage namespace；缺 GM API 的 userscript 绝不会隐式进入此模式。具体注入由宿主浏览器/调试工具完成，本项目不会自动打开页面或远程加载代码。
 
-不匹配时以 `GUARD_MISMATCH / INITIAL_BASELINE_MISMATCH` 暂停。匹配时面板显示“现场核对通过，等待手动启动”，仍不会行动。
+没有 GM 菜单时，悬浮面板仍有“确认基线、启动、暂停、重连、导出”。
 
-确认 localhost 已启动后，使用油猴菜单“启动自动驾驶”。因为初始知识库为空，服务第一次会对真实 floorId 返回 `UNKNOWN_FLOOR` 并生成只含当前层的证据包；按 [`manual-labeling.md`](manual-labeling.md) 完成人工标签后，再手动重新连接或启动。
+“仅重新连接本地决策器”发送 `intent=reconnect_only`，只验证连接、completed ACK 与 unresolved identity。它不会触发 planner 或签发新 action；若服务错误返回 execute，面板会暂停为 `RECONNECT_UNEXPECTED_EXECUTE` 并保留 action identity，不会执行。
 
-## 6. 控制菜单
+## 首次会话
 
-- 启动自动驾驶
-- 暂停自动驾驶
-- 导出当前层运行态
-- 清除待执行行动
-- 仅重新连接本地决策器
+1. 页面加载后保持停止，只显示首次稳定 observation。
+2. 导出并核对当前 session/map instance/dimensions/英雄摘要。
+3. 用户明确选择 new game、handoff 或 resume，并确认基线。
+4. 服务端完成 `session.command=confirm`；此前绝不签发行动。
+5. 用户再次点击“启动”才进入循环。
+6. 首次接管先运行物理扫描状态机；扫描期间只走安全空走廊、已验证无消耗 transition 或一次 opaque 楼梯/传送出口，不会打怪、开门、取资源、访问 NPC 或机关。
 
-“清除待执行行动”只清 GM journal，需要确认，不会回滚、移动、改游戏状态或修复服务 ledger。行动尚未 completed/acknowledged、浏览器仍有 pending 或现场尚未确认时禁止使用；它不是 state dir 遗失、迁移或 `UNKNOWN_ACTION_ID` 的恢复手段。“仅重新连接”只做 observation/cycle 握手，不执行服务返回的行动。
+handoff 的 expected guard 来自会话配置，不编译进脚本。resume 必须复用同一 state dir 中已确认的 session。物理 save/load 默认禁用，没有内置槽位。
 
-## 存档边界
+## 状态目录维护
 
-v0.1.0 不启用真实 save/load。初始化不读取 slot 8，任何阶段都不会覆盖 slot 8。搜索分支只存在于本地数据模型中。
+安全迁移只能在自动驾驶暂停、无 pending、最后 completed 已 ack、服务完全停止时执行。完整复制整个 state dir，尤其是 generation manifest、所有 `gen-*`、入口 witness、JSONL 与 pauses；只复制入口 `mota-lab.sqlite3` 会丢失当前权威账本。新路径核对目录级 hash 后启动；不要用 SQLite 客户端直接打开 witness 或活动 generation 做“只读确认”，以免改变 sidecar。
 
-## 停止
+出现 `UNKNOWN_ACTION_ID` 时保留浏览器 pending、pre fingerprint、当前 observation 和旧目录证据，恢复原 ledger 后做 pre/expected-post/ambiguous 三分法；不得清 journal 或重签替代行动。
 
-先使用菜单“暂停自动驾驶”，再在服务终端按 `Ctrl-C`。停止服务不修改游戏；服务不可达时浏览器会安全暂停，不会缓存动作后离线执行。下次启动仍须使用同一个 `MOTA_LAB_STATE_DIR` 绝对路径和完整目录；迁移或故障时按第 2.3、2.4 节处理。
+## 离线 QA
+
+```bash
+MOTA_LAB_PYTHON=/opt/homebrew/bin/python3.12 \
+MOTA_LAB_PYTHONPATH=/opt/homebrew/lib/python3.12/site-packages:/Users/nihplod/Library/Python/3.9/lib/python/site-packages \
+bash games/mota-planning-lab/scripts/run-offline-qa.sh
+```
+
+该命令构建两个产物两次并核对确定性，使用临时 Git index 做 prospective staged diff check，不污染真实 index。

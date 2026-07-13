@@ -7,10 +7,14 @@
   "required": [
     "protocol",
     "page",
+    "session_id",
     "floor_id",
     "floor_name",
     "floor_number",
     "dimensions",
+    "topology",
+    "topology_fingerprint",
+    "map_instance_id",
     "hero",
     "keys",
     "busy",
@@ -18,8 +22,9 @@
     "captured_at"
   ],
   "properties": {
-    "protocol": {"const": 1},
+    "protocol": {"const": 2},
     "page": {"const": "/games/24/"},
+    "session_id": {"type": "string", "minLength": 1, "maxLength": 128},
     "floor_id": {"type": "string", "minLength": 1, "maxLength": 256},
     "floor_name": {"type": ["string", "null"], "maxLength": 128},
     "floor_number": {"type": ["integer", "null"]},
@@ -28,16 +33,19 @@
       "additionalProperties": false,
       "required": ["width", "height"],
       "properties": {
-        "width": {"const": 11},
-        "height": {"const": 11}
+        "width": {"type": "integer", "minimum": 1, "maximum": 256},
+        "height": {"type": "integer", "minimum": 1, "maximum": 256}
       }
     },
+    "topology": {"$ref": "#/$defs/topology"},
+    "topology_fingerprint": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "map_instance_id": {"type": "string", "minLength": 1, "maxLength": 256},
     "hero": {"$ref": "#/$defs/hero"},
     "keys": {"$ref": "#/$defs/keys"},
     "busy": {"type": "boolean"},
     "blocks": {
       "type": "array",
-      "maxItems": 121,
+      "maxItems": 8192,
       "items": {"$ref": "#/$defs/block"}
     },
     "captured_at": {"type": "integer", "minimum": 0}
@@ -46,7 +54,31 @@
     "coordinate": {
       "type": "integer",
       "minimum": 0,
-      "maximum": 10
+      "maximum": 255
+    },
+    "position": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y"],
+      "properties": {
+        "x": {"$ref": "#/$defs/coordinate"},
+        "y": {"$ref": "#/$defs/coordinate"}
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "source", "confidence"],
+      "properties": {
+        "kind": {"enum": ["rectangle", "valid_cells"]},
+        "valid_cells": {"type": "array", "minItems": 1, "maxItems": 65536, "uniqueItems": true, "items": {"$ref": "#/$defs/position"}},
+        "source": {"enum": ["engine_current_map", "runtime_observed"]},
+        "confidence": {"enum": ["confirmed", "inferred"]}
+      },
+      "allOf": [
+        {"if": {"properties": {"kind": {"const": "rectangle"}}}, "then": {"not": {"required": ["valid_cells"]}}},
+        {"if": {"properties": {"kind": {"const": "valid_cells"}}}, "then": {"required": ["valid_cells"]}}
+      ]
     },
     "keys": {
       "type": "object",

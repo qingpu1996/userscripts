@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         魔塔规划实验室运行态代理
 // @namespace    local.mota-planning-lab.userscripts
-// @version      0.1.0
+// @version      0.2.0
 // @description  严格盲玩边界内的 H5 魔塔当前运行态代理。
 // @match        https://h5mota.com/games/24/*
 // @grant        unsafeWindow
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_listValues
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
 // @run-at       document-idle
@@ -21,13 +23,18 @@
 
   const MotaLab = Object.create(null);
 
-  MotaLab.PROTOCOL_VERSION = 1;
+  MotaLab.PROTOCOL_VERSION = 2;
   MotaLab.SOURCE = "mota-planning-lab-userscript";
   MotaLab.PAGE = "/games/24/";
   MotaLab.CYCLE_ENDPOINT = "http://127.0.0.1:18724/cycle";
-  MotaLab.MAP_WIDTH = 11;
-  MotaLab.MAP_HEIGHT = 11;
-  MotaLab.PROTECTED_SAVE_SLOT = 8;
+  MotaLab.MAX_MAP_AXIS = 256;
+  MotaLab.MAX_MAP_CELLS = 65536;
+  MotaLab.MAX_BLOCKS = 8192;
+  MotaLab.SESSION_MODES = Object.freeze([
+    "new_game",
+    "handoff_expected_guard",
+    "resume_existing_ledger",
+  ]);
 
   MotaLab.PAUSE_KINDS = Object.freeze([
     "NEW_OBJECT_OR_MECHANISM",
@@ -38,6 +45,8 @@
     "UNSUPPORTED_INTERACTION",
     "DECISION_SERVICE_UNAVAILABLE",
     "ENGINE_API_INCOMPATIBLE",
+    "SESSION_CONFIRMATION_REQUIRED",
+    "PLANNING_BUDGET_EXHAUSTED",
   ]);
 
   MotaLab.PAUSE_KIND_SET = new Set(MotaLab.PAUSE_KINDS);
@@ -63,20 +72,12 @@
     "stair",
   ]);
 
-  MotaLab.INITIAL_BASELINE = Object.freeze({
-    floor_number: 4,
-    hero: Object.freeze({
-      hp: 208,
-      attack: 23,
-      defense: 21,
-      gold: 16,
-      experience: 63,
-      loc: Object.freeze({ x: 8, y: 3 }),
-    }),
-    keys: Object.freeze({ yellow: 4, blue: 1, red: 0 }),
-  });
-
-  MotaLab.JOURNAL_KEY = "mota-planning-lab:journal:v1";
+  MotaLab.JOURNAL_KEY = "mota-planning-lab:journal:v2";
+  MotaLab.JOURNAL_SLOT_KEYS = Object.freeze([
+    "mota-planning-lab:journal:v2:slot:a",
+    "mota-planning-lab:journal:v2:slot:b",
+  ]);
+  MotaLab.LEGACY_JOURNAL_KEYS = Object.freeze(["mota-planning-lab:journal:v1"]);
   MotaLab.PANEL_ID = "mota-planning-lab-panel";
   MotaLab.STYLE_ID = "mota-planning-lab-style";
 
@@ -118,10 +119,340 @@
     throw new TypeError("Value is not plain JSON data");
   };
 
+  // Source: games/mota-planning-lab/src/runtime-mode.js
+
+  // This source is the audited build marker for the Tampermonkey artifact.
+  // build-direct-mount.mjs replaces this exact assignment in the direct artifact.
+  MotaLab.RUNTIME_MODE = "userscript";
+
+  // Source: games/mota-planning-lab/src/runtime-environment.js
+
+  MotaLab.createRuntimeEnvironment = function createRuntimeEnvironment(
+    scope = globalThis,
+    explicitMode = MotaLab.RUNTIME_MODE,
+  ) {
+    function evidenceText(raw) {
+      try {
+        const text = typeof raw === "string" ? raw : JSON.stringify(raw);
+        return typeof text === "string" ? text : `[${typeof raw}]`;
+      } catch (_) {
+        return `[unserializable:${typeof raw}]`;
+      }
+    }
+
+    function storageFailure(key, reason = "storage-unstable") {
+      return {
+        status: "storage_unstable",
+        key,
+        raw_length: 0,
+        content_hash: `sha256:${MotaLab.sha256(reason)}`,
+      };
+    }
+
+    function inspectRaw(key, raw, { nullishMeansAbsent = false } = {}) {
+      if (nullishMeansAbsent && (raw === null || raw === undefined)) {
+        return { status: "absent", key };
+      }
+      const rawText = evidenceText(raw);
+      const evidence = {
+        key,
+        raw_length: rawText.length,
+        content_hash: `sha256:${MotaLab.sha256(rawText)}`,
+      };
+      if (typeof raw !== "string") {
+        try {
+          return Object.assign({ status: "parsed", value: JSON.parse(rawText) }, evidence);
+        } catch (_) {
+          return Object.assign({ status: "wrong_shape" }, evidence);
+        }
+      }
+      try {
+        return Object.assign({ status: "parsed", value: JSON.parse(raw) }, evidence);
+      } catch (_) {
+        return Object.assign({ status: "parse_failed" }, evidence);
+      }
+    }
+
+    function stableValueSignature(value) {
+      if (value === undefined) return "undefined";
+      if (value === null) return "null";
+      if (typeof value === "number" && Object.is(value, -0)) return "number:-0";
+      if (["string", "number", "boolean"].includes(typeof value)) {
+        return `${typeof value}:${String(value)}`;
+      }
+      try { return `${typeof value}:canonical:${MotaLab.canonicalize(value)}`; }
+      catch (_) { return `${typeof value}:${evidenceText(value)}`; }
+    }
+
+    function journalStorageError(operation, details = {}) {
+      return MotaLab.createPauseError(
+        "ENGINE_API_INCOMPATIBLE",
+        "JOURNAL_STORAGE_UNSTABLE",
+        Object.assign({ operation }, details),
+      );
+    }
+
+    function assertCanonicalInspection(inspected, expected, operation) {
+      if (!inspected || inspected.status !== "parsed") {
+        throw journalStorageError(operation, {
+          observed_status: inspected && inspected.status ? inspected.status : "missing",
+        });
+      }
+      let actualCanonical;
+      let expectedCanonical;
+      try {
+        actualCanonical = MotaLab.canonicalize(inspected.value);
+        expectedCanonical = MotaLab.canonicalize(expected);
+      } catch (_) {
+        throw journalStorageError(operation, { reason: "canonicalization-failed" });
+      }
+      if (actualCanonical !== expectedCanonical) {
+        throw journalStorageError(operation, {
+          reason: "readback-mismatch",
+          expected_hash: `sha256:${MotaLab.sha256(expectedCanonical)}`,
+          actual_hash: `sha256:${MotaLab.sha256(actualCanonical)}`,
+        });
+      }
+      return `sha256:${MotaLab.sha256(expectedCanonical)}`;
+    }
+
+    function unavailableUserscript(missing) {
+      const detailCode = "USERSCRIPT_API_UNAVAILABLE";
+      const error = () => MotaLab.createPauseError(
+        "ENGINE_API_INCOMPATIBLE",
+        detailCode,
+        { missing: missing.slice() },
+      );
+      const blockedStorage = Object.freeze({
+        inspect(key) { return storageFailure(key, detailCode); },
+        get(_key, fallback) { return fallback; },
+        set() { throw error(); },
+        delete() { throw error(); },
+      });
+      return Object.freeze({
+        mode: "userscript",
+        available: false,
+        detail_code: detailCode,
+        missing: Object.freeze(missing.slice()),
+        storage: blockedStorage,
+        request() { throw error(); },
+        registerMenu: null,
+        assertAvailable() { throw error(); },
+      });
+    }
+
+    if (!['userscript', 'direct-mount'].includes(explicitMode)) {
+      throw new TypeError(`Invalid explicit runtime mode: ${String(explicitMode)}`);
+    }
+
+    if (explicitMode === "userscript") {
+      const required = [
+        "GM_getValue", "GM_setValue", "GM_deleteValue", "GM_listValues",
+        "GM_xmlhttpRequest",
+      ];
+      const missing = required.filter((name) => typeof scope[name] !== "function");
+      if (missing.length > 0) return unavailableUserscript(missing);
+      let probeSequence = 0;
+      const storage = {
+        inspect(key) {
+          let firstList;
+          let secondList;
+          let first;
+          let second;
+          const tokenBase = `${key}:${Date.now()}:${probeSequence += 1}`;
+          const firstDefault = { __mota_lab_absent_probe__: `${tokenBase}:A` };
+          const secondDefault = { __mota_lab_absent_probe__: `${tokenBase}:B` };
+          try {
+            firstList = scope.GM_listValues();
+            first = scope.GM_getValue(key, firstDefault);
+            second = scope.GM_getValue(key, secondDefault);
+            secondList = scope.GM_listValues();
+          } catch (_) {
+            return storageFailure(key, "GM-storage-call-failed");
+          }
+          if (!Array.isArray(firstList) || !Array.isArray(secondList)
+            || firstList.some((item) => typeof item !== "string")
+            || secondList.some((item) => typeof item !== "string")) {
+            return storageFailure(key, "GM_listValues-invalid");
+          }
+          const normalizedFirstList = JSON.stringify([...new Set(firstList)].sort());
+          const normalizedSecondList = JSON.stringify([...new Set(secondList)].sort());
+          if (normalizedFirstList !== normalizedSecondList) {
+            return storageFailure(key, "GM_listValues-changed");
+          }
+          const firstIsDefault = stableValueSignature(first) === stableValueSignature(firstDefault);
+          const secondIsDefault = stableValueSignature(second) === stableValueSignature(secondDefault);
+          if (firstIsDefault && secondIsDefault) return { status: "absent", key };
+          if (firstIsDefault !== secondIsDefault
+            || stableValueSignature(first) !== stableValueSignature(second)) {
+            return storageFailure(key, "GM_getValue-changed");
+          }
+          // The two value probes are authoritative.  GM_listValues is used as a
+          // stability signal only because some managers can return a stale list.
+          return inspectRaw(key, first);
+        },
+        get(key, fallback) {
+          const inspected = this.inspect(key);
+          return inspected.status === "parsed" ? inspected.value : fallback;
+        },
+        set(key, value) {
+          try { scope.GM_setValue(key, value); }
+          catch (_) { throw journalStorageError("GM_setValue", { reason: "write-threw" }); }
+          const first = this.inspect(key);
+          const hash = assertCanonicalInspection(first, value, "GM_setValue-readback-1");
+          const second = this.inspect(key);
+          assertCanonicalInspection(second, value, "GM_setValue-readback-2");
+          return Object.freeze({ verified: true, key, canonical_hash: hash });
+        },
+        delete(key) {
+          try { scope.GM_deleteValue(key); }
+          catch (_) { throw journalStorageError("GM_deleteValue", { reason: "delete-threw" }); }
+          const first = this.inspect(key);
+          const second = this.inspect(key);
+          if (first.status !== "absent" || second.status !== "absent") {
+            throw journalStorageError("GM_deleteValue-readback", {
+              first_status: first.status, second_status: second.status,
+            });
+          }
+          return Object.freeze({ verified: true, key, absent: true });
+        },
+      };
+      const request = (options) => {
+        try { return scope.GM_xmlhttpRequest(options); }
+        catch (_) {
+          throw MotaLab.createPauseError(
+            "ENGINE_API_INCOMPATIBLE", "USERSCRIPT_API_UNAVAILABLE",
+            { api: "GM_xmlhttpRequest", failure: "throw" },
+          );
+        }
+      };
+      return Object.freeze({
+        mode: "userscript",
+        available: true,
+        detail_code: null,
+        storage,
+        request,
+        registerMenu: typeof scope.GM_registerMenuCommand === "function"
+          ? scope.GM_registerMenuCommand : null,
+        assertAvailable() { return true; },
+      });
+    }
+
+    const directKey = "mota-planning-lab:direct-mount:journal:v2";
+    const directSlotKeys = Object.freeze([
+      "mota-planning-lab:direct-mount:journal:v2:slot:a",
+      "mota-planning-lab:direct-mount:journal:v2:slot:b",
+    ]);
+    const directLegacyKey = "mota-planning-lab:direct-mount:journal:v1";
+    function directPhysicalKey(key) {
+      if (key === MotaLab.JOURNAL_KEY) return directKey;
+      const slotIndex = MotaLab.JOURNAL_SLOT_KEYS.indexOf(key);
+      if (slotIndex >= 0) return directSlotKeys[slotIndex];
+      if (MotaLab.LEGACY_JOURNAL_KEYS.includes(key)) return directLegacyKey;
+      return null;
+    }
+    const storage = {
+      inspect(key) {
+        const physicalKey = directPhysicalKey(key);
+        if (physicalKey === null) return { status: "absent", key };
+        if (!scope.localStorage) return storageFailure(key, "localStorage-unavailable");
+        let raw;
+        try { raw = scope.localStorage.getItem(physicalKey); }
+        catch (_) { return storageFailure(key, "localStorage-read-failed"); }
+        return inspectRaw(key, raw, { nullishMeansAbsent: true });
+      },
+      get(key, fallback) {
+        const inspected = this.inspect(key);
+        return inspected.status === "parsed" ? inspected.value : fallback;
+      },
+      set(key, value) {
+        const physicalKey = directPhysicalKey(key);
+        if (physicalKey === null || MotaLab.LEGACY_JOURNAL_KEYS.includes(key)) {
+          throw new TypeError("Direct mount storage namespace violation");
+        }
+        if (!scope.localStorage) throw journalStorageError("localStorage.setItem", { reason: "unavailable" });
+        let encoded;
+        try {
+          encoded = JSON.stringify(value);
+          scope.localStorage.setItem(physicalKey, encoded);
+        } catch (_) {
+          throw journalStorageError("localStorage.setItem", { reason: "write-threw" });
+        }
+        let first;
+        let second;
+        try {
+          first = scope.localStorage.getItem(physicalKey);
+          second = scope.localStorage.getItem(physicalKey);
+        } catch (_) {
+          throw journalStorageError("localStorage.setItem-readback", { reason: "read-threw" });
+        }
+        if (first !== encoded || second !== encoded) {
+          throw journalStorageError("localStorage.setItem-readback", {
+            reason: first !== second ? "readback-changed" : "readback-mismatch",
+          });
+        }
+        return Object.freeze({
+          verified: true,
+          key,
+          canonical_hash: `sha256:${MotaLab.sha256(MotaLab.canonicalize(value))}`,
+        });
+      },
+      delete(key) {
+        const physicalKey = directPhysicalKey(key);
+        if (physicalKey === null || MotaLab.LEGACY_JOURNAL_KEYS.includes(key)) {
+          throw new TypeError("Direct mount storage namespace violation");
+        }
+        if (!scope.localStorage || typeof scope.localStorage.removeItem !== "function") {
+          throw journalStorageError("localStorage.removeItem", { reason: "unavailable" });
+        }
+        try { scope.localStorage.removeItem(physicalKey); }
+        catch (_) { throw journalStorageError("localStorage.removeItem", { reason: "delete-threw" }); }
+        let first;
+        let second;
+        try {
+          first = scope.localStorage.getItem(physicalKey);
+          second = scope.localStorage.getItem(physicalKey);
+        } catch (_) {
+          throw journalStorageError("localStorage.removeItem-readback", { reason: "read-threw" });
+        }
+        if (first !== null || second !== null) {
+          throw journalStorageError("localStorage.removeItem-readback", {
+            reason: first !== second ? "readback-changed" : "still-present",
+          });
+        }
+        return Object.freeze({ verified: true, key, absent: true });
+      },
+    };
+    const request = (options) => {
+      const controller = new AbortController();
+      const timer = scope.setTimeout(() => controller.abort(), options.timeout);
+      scope.fetch(options.url, {
+        method: options.method,
+        headers: options.headers,
+        body: options.data,
+        signal: controller.signal,
+        credentials: "omit",
+        mode: "cors",
+      }).then(async (response) => {
+        scope.clearTimeout(timer);
+        options.onload({ status: response.status, responseText: await response.text() });
+      }).catch((error) => {
+        scope.clearTimeout(timer);
+        if (error && error.name === "AbortError") options.ontimeout();
+        else options.onerror(error);
+      });
+      return { abort: () => { controller.abort(); options.onabort(); } };
+    };
+    return Object.freeze({
+      mode: "direct-mount", available: true, detail_code: null,
+      storage, request, registerMenu: null, assertAvailable() { return true; },
+    });
+  };
+
   // Source: games/mota-planning-lab/src/engine-adapter.js
 
   MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
-    const scope = pageScope || (typeof unsafeWindow !== "undefined" ? unsafeWindow : null);
+    const scope = pageScope || (typeof unsafeWindow !== "undefined" ? unsafeWindow : globalThis);
 
     function currentCore() {
       return scope && scope.core;
@@ -171,7 +502,10 @@
         attack: readNumber(hero.atk !== undefined ? hero.atk : hero.attack, "hero.attack"),
         defense: readNumber(hero.def !== undefined ? hero.def : hero.defense, "hero.defense"),
         gold: readNumber(hero.money !== undefined ? hero.money : hero.gold, "hero.gold"),
-        experience: readNumber(hero.experience, "hero.experience"),
+        experience: readNumber(
+          hero.exp !== undefined ? hero.exp : hero.experience,
+          "hero.experience",
+        ),
         loc: {
           x: readNumber(loc.x, "hero.loc.x"),
           y: readNumber(loc.y, "hero.loc.y"),
@@ -179,15 +513,15 @@
         },
         keys: {
           yellow: readNumber(
-            keys.yellowKey !== undefined ? keys.yellowKey : keys.yellow,
+            keys.yellowKey !== undefined ? keys.yellowKey : keys.yellow !== undefined ? keys.yellow : 0,
             "hero.keys.yellow",
           ),
           blue: readNumber(
-            keys.blueKey !== undefined ? keys.blueKey : keys.blue,
+            keys.blueKey !== undefined ? keys.blueKey : keys.blue !== undefined ? keys.blue : 0,
             "hero.keys.blue",
           ),
           red: readNumber(
-            keys.redKey !== undefined ? keys.redKey : keys.red,
+            keys.redKey !== undefined ? keys.redKey : keys.red !== undefined ? keys.red : 0,
             "hero.keys.red",
           ),
         },
@@ -209,10 +543,83 @@
       }
       const title = typeof currentMap.title === "string" ? currentMap.title : null;
       const name = typeof currentMap.name === "string" ? currentMap.name : null;
+      const declaredWidth = currentMap.width;
+      const declaredHeight = currentMap.height;
+      const dynamicGrid = Array.isArray(currentMap.map) ? currentMap.map : null;
+      const declaredValidCells = Array.isArray(currentMap.valid_cells)
+        ? currentMap.valid_cells.map((cell) => ({ x: cell.x, y: cell.y })) : null;
+      let width = declaredWidth;
+      let height = declaredHeight;
+      let validCells = null;
+      let topologySource = "engine_current_map";
+      let topologyConfidence = "confirmed";
+      if (dynamicGrid) {
+        if (dynamicGrid.some((row) => !Array.isArray(row))) {
+          throw MotaLab.createPauseError(
+            "ENGINE_API_INCOMPATIBLE", "UNRELIABLE_TOPOLOGY",
+            { reason: "dynamic grid contains a non-array row" },
+          );
+        }
+        if (!MotaLab.isFiniteInteger(height)) height = dynamicGrid.length;
+        if (!MotaLab.isFiniteInteger(width)) {
+          width = dynamicGrid.reduce((maximum, row) => Math.max(maximum, row.length), 0);
+        }
+        if (dynamicGrid.length > height || dynamicGrid.some((row) => row.length > width)) {
+          throw MotaLab.createPauseError(
+            "ENGINE_API_INCOMPATIBLE", "TOPOLOGY_SOURCE_CONFLICT",
+            { declared_width: width, declared_height: height },
+          );
+        }
+        const gridCells = [];
+        dynamicGrid.forEach((row, y) => {
+          for (let x = 0; x < row.length; x += 1) {
+            if (Object.prototype.hasOwnProperty.call(row, x)) gridCells.push({ x, y });
+          }
+        });
+        if (declaredValidCells) {
+          const key = (cell) => `${cell.x},${cell.y}`;
+          const gridSet = new Set(gridCells.map(key));
+          const declaredSet = new Set(declaredValidCells.map(key));
+          if (gridSet.size !== declaredSet.size
+            || [...gridSet].some((cell) => !declaredSet.has(cell))) {
+            throw MotaLab.createPauseError(
+              "ENGINE_API_INCOMPATIBLE", "TOPOLOGY_SOURCE_CONFLICT",
+              { grid_cells: gridSet.size, declared_valid_cells: declaredSet.size },
+            );
+          }
+          validCells = declaredValidCells;
+          topologySource = "engine_current_map";
+          topologyConfidence = "confirmed";
+        } else if (gridCells.length === width * height
+          && dynamicGrid.length === height
+          && dynamicGrid.every((row) => row.length === width)) {
+          validCells = null;
+          topologySource = "engine_current_map";
+          topologyConfidence = "confirmed";
+        } else {
+          validCells = gridCells;
+          topologySource = "runtime_observed";
+          topologyConfidence = "inferred";
+        }
+      } else if (declaredValidCells) {
+        validCells = declaredValidCells;
+        topologySource = "engine_current_map";
+        topologyConfidence = "confirmed";
+      }
+      if (!MotaLab.isFiniteInteger(width) || !MotaLab.isFiniteInteger(height)) {
+        throw MotaLab.createPauseError(
+          "ENGINE_API_INCOMPATIBLE",
+          "MISSING_MAP_DIMENSIONS",
+          { floor_id: String(currentFloorId) },
+        );
+      }
       return {
         floor_name: title || name,
-        width: MotaLab.MAP_WIDTH,
-        height: MotaLab.MAP_HEIGHT,
+        width,
+        height,
+        valid_cells: validCells,
+        topology_source: topologySource,
+        topology_confidence: topologyConfidence,
       };
     }
 
@@ -349,14 +756,13 @@
         moving_state: typeof runtime.isMoving === "function",
         physical_save_load_present: typeof runtime.doSL === "function",
         physical_save_load_enabled: false,
-        protected_slot: MotaLab.PROTECTED_SAVE_SLOT,
       };
     }
 
     function assertRequiredCapabilities() {
       const report = capabilities();
       const missing = Object.entries(report)
-        .filter(([key, value]) => !["physical_save_load_present", "physical_save_load_enabled", "protected_slot"].includes(key) && value !== true)
+        .filter(([key, value]) => !["physical_save_load_present", "physical_save_load_enabled"].includes(key) && value !== true)
         .map(([key]) => key);
       if (missing.length) {
         throw MotaLab.createPauseError("ENGINE_API_INCOMPATIBLE", "MISSING_API", { missing });
@@ -393,11 +799,7 @@
     }
 
     function physicalSaveLoad() {
-      return {
-        executed: false,
-        reason: "PHYSICAL_SAVE_LOAD_DISABLED",
-        protected_slot: MotaLab.PROTECTED_SAVE_SLOT,
-      };
+      return { executed: false, reason: "PHYSICAL_SAVE_LOAD_DISABLED" };
     }
 
     return Object.freeze({
@@ -509,14 +911,49 @@
 
   MotaLab.collectObservation = function collectObservation(adapter, now = Date.now) {
     const snapshot = adapter.readRuntimeSnapshot();
-    if (!snapshot.map || snapshot.map.width !== MotaLab.MAP_WIDTH
-      || snapshot.map.height !== MotaLab.MAP_HEIGHT) {
+    const width = snapshot.map && snapshot.map.width;
+    const height = snapshot.map && snapshot.map.height;
+    if (!MotaLab.isFiniteInteger(width) || !MotaLab.isFiniteInteger(height)
+      || width < 1 || height < 1 || width > MotaLab.MAX_MAP_AXIS
+      || height > MotaLab.MAX_MAP_AXIS || width * height > MotaLab.MAX_MAP_CELLS) {
       throw MotaLab.createPauseError(
         "ENGINE_API_INCOMPATIBLE",
         "UNSUPPORTED_MAP_DIMENSIONS",
-        { width: snapshot.map && snapshot.map.width, height: snapshot.map && snapshot.map.height },
+        { width, height },
       );
     }
+    let validCells = null;
+    if (snapshot.map.valid_cells !== null) {
+      if (!Array.isArray(snapshot.map.valid_cells) || snapshot.map.valid_cells.length < 1
+        || snapshot.map.valid_cells.length > width * height) {
+        throw MotaLab.createPauseError(
+          "ENGINE_API_INCOMPATIBLE",
+          "UNRELIABLE_TOPOLOGY",
+          { source: snapshot.map.topology_source },
+        );
+      }
+      const unique = new Set();
+      validCells = snapshot.map.valid_cells.map((cell) => {
+        if (!cell || !MotaLab.isFiniteInteger(cell.x) || !MotaLab.isFiniteInteger(cell.y)
+          || cell.x < 0 || cell.x >= width || cell.y < 0 || cell.y >= height) {
+          throw MotaLab.createPauseError("ENGINE_API_INCOMPATIBLE", "UNRELIABLE_TOPOLOGY");
+        }
+        const key = `${cell.x},${cell.y}`;
+        if (unique.has(key)) {
+          throw MotaLab.createPauseError("ENGINE_API_INCOMPATIBLE", "UNRELIABLE_TOPOLOGY");
+        }
+        unique.add(key);
+        return { x: cell.x, y: cell.y };
+      }).sort((a, b) => a.y - b.y || a.x - b.x);
+    }
+    const topologyProjection = {
+      dimensions: { width, height },
+      valid_cells: validCells,
+    };
+    const topologyFingerprint = `sha256:${MotaLab.sha256(MotaLab.canonicalize(topologyProjection))}`;
+    const validCellSet = validCells && new Set(validCells.map((cell) => `${cell.x},${cell.y}`));
+    const isValidCell = (x, y) => x >= 0 && x < width && y >= 0 && y < height
+      && (!validCellSet || validCellSet.has(`${x},${y}`));
 
     const hero = snapshot.hero;
     const validDirection = new Set(["up", "down", "left", "right"]);
@@ -531,8 +968,7 @@
       ["keys.red", hero.keys.red],
     ].find(([, value]) => !MotaLab.isFiniteInteger(value) || value < 0);
     if (invalidHeroField
-      || hero.loc.x < 0 || hero.loc.x >= MotaLab.MAP_WIDTH
-      || hero.loc.y < 0 || hero.loc.y >= MotaLab.MAP_HEIGHT
+      || !isValidCell(hero.loc.x, hero.loc.y)
       || !validDirection.has(hero.loc.direction)) {
       throw MotaLab.createPauseError(
         "ENGINE_API_INCOMPATIBLE",
@@ -548,13 +984,18 @@
     }
 
     const blocks = [];
+    if (!Array.isArray(snapshot.blocks) || snapshot.blocks.length > MotaLab.MAX_BLOCKS) {
+      throw MotaLab.createPauseError(
+        "ENGINE_API_INCOMPATIBLE", "INVALID_BLOCK_COLLECTION_SIZE",
+        { count: Array.isArray(snapshot.blocks) ? snapshot.blocks.length : null },
+      );
+    }
     const collectionIssues = [];
     const occupied = new Set();
     for (const raw of snapshot.blocks) {
       if (raw.disabled) continue;
       if (!MotaLab.isFiniteInteger(raw.x) || !MotaLab.isFiniteInteger(raw.y)
-        || raw.x < 0 || raw.x >= MotaLab.MAP_WIDTH
-        || raw.y < 0 || raw.y >= MotaLab.MAP_HEIGHT) {
+        || !isValidCell(raw.x, raw.y)) {
         throw MotaLab.createPauseError(
           "ENGINE_API_INCOMPATIBLE",
           "BLOCK_OUT_OF_BOUNDS",
@@ -639,7 +1080,22 @@
       floor_id: snapshot.floor_id,
       floor_name: snapshot.map.floor_name || null,
       floor_number: MotaLab.parseFloorNumber(snapshot.map.floor_name, snapshot.floor_id),
-      dimensions: { width: MotaLab.MAP_WIDTH, height: MotaLab.MAP_HEIGHT },
+      dimensions: { width, height },
+      topology: validCells ? {
+        kind: "valid_cells",
+        valid_cells: validCells,
+        source: snapshot.map.topology_source,
+        confidence: snapshot.map.topology_confidence,
+      } : {
+        kind: "rectangle",
+        source: snapshot.map.topology_source,
+        confidence: snapshot.map.topology_confidence,
+      },
+      topology_fingerprint: topologyFingerprint,
+      map_instance_id: `map:${MotaLab.sha256(MotaLab.canonicalize({
+        floor_id: snapshot.floor_id,
+        topology_fingerprint: topologyFingerprint,
+      }))}`,
       hero: {
         hp: hero.hp,
         attack: hero.attack,
@@ -742,6 +1198,7 @@
     return {
       protocol: observation.protocol,
       page: observation.page,
+      session_id: observation.session_id,
       floor_id: observation.floor_id,
       floor_name: observation.floor_name,
       floor_number: observation.floor_number,
@@ -749,6 +1206,15 @@
         width: observation.dimensions.width,
         height: observation.dimensions.height,
       },
+      topology: Object.assign({
+        kind: observation.topology.kind,
+        source: observation.topology.source,
+        confidence: observation.topology.confidence,
+      }, observation.topology.valid_cells ? {
+        valid_cells: observation.topology.valid_cells.map((cell) => ({ x: cell.x, y: cell.y })),
+      } : {}),
+      topology_fingerprint: observation.topology_fingerprint,
+      map_instance_id: observation.map_instance_id,
       hero: {
         hp: observation.hero.hp,
         attack: observation.hero.attack,
@@ -793,7 +1259,22 @@
     observation,
     completedActionId = null,
     recovery = null,
+    session,
+    intent = "cycle",
   }) {
+    if (!["cycle", "reconnect_only"].includes(intent)) {
+      throw new TypeError("Invalid cycle request intent");
+    }
+    MotaLab.assertProtocolShape(session, ["mode"], ["command", "expected_guard"], "session");
+    if (!MotaLab.SESSION_MODES.includes(session.mode)
+      || (session.command !== undefined && !["observe", "confirm"].includes(session.command))) {
+      throw new TypeError("Invalid session control");
+    }
+    const hasExpectedGuard = Object.prototype.hasOwnProperty.call(session, "expected_guard");
+    if ((session.mode === "handoff_expected_guard") !== hasExpectedGuard) {
+      throw new TypeError("Invalid session expected_guard contract");
+    }
+    if (hasExpectedGuard) MotaLab.validateResponseGuard(session.expected_guard);
     const recoveryValue = recovery || {
       phase: "none",
       pending_action_id: null,
@@ -804,7 +1285,13 @@
     if (!allowedPhases.has(recoveryValue.phase)) throw new TypeError("Invalid recovery phase");
     return {
       source: MotaLab.SOURCE,
+      intent,
       completed_action_id: completedActionId,
+      session: Object.assign({ mode: session.mode }, session.command ? {
+        command: session.command,
+      } : {}, hasExpectedGuard ? {
+        expected_guard: MotaLab.cloneJsonValue(session.expected_guard),
+      } : {}),
       observation: MotaLab.cloneObservationForWire(observation),
       recovery: {
         phase: recoveryValue.phase,
@@ -860,7 +1347,25 @@
     };
   };
 
-  MotaLab.validateResponsePosition = function validateResponsePosition(value, label, withDirection) {
+  MotaLab.validateDimensions = function validateDimensions(value, label = "dimensions") {
+    MotaLab.assertProtocolShape(value, ["width", "height"], [], label);
+    if (!MotaLab.isFiniteInteger(value.width) || !MotaLab.isFiniteInteger(value.height)
+      || value.width < 1 || value.height < 1 || value.width > MotaLab.MAX_MAP_AXIS
+      || value.height > MotaLab.MAX_MAP_AXIS
+      || value.width * value.height > MotaLab.MAX_MAP_CELLS) {
+      throw new TypeError(`Invalid ${label}`);
+    }
+    return { width: value.width, height: value.height };
+  };
+
+  MotaLab.validCellSet = function validCellSet(topology) {
+    return topology && Array.isArray(topology.valid_cells)
+      ? new Set(topology.valid_cells.map((cell) => `${cell.x},${cell.y}`)) : null;
+  };
+
+  MotaLab.validateResponsePosition = function validateResponsePosition(
+    value, label, withDirection, dimensions, topology = null,
+  ) {
     MotaLab.assertProtocolShape(
       value,
       withDirection ? ["x", "y", "direction"] : ["x", "y"],
@@ -868,8 +1373,10 @@
       label,
     );
     if (!MotaLab.isFiniteInteger(value.x) || !MotaLab.isFiniteInteger(value.y)
-      || value.x < 0 || value.x >= MotaLab.MAP_WIDTH
-      || value.y < 0 || value.y >= MotaLab.MAP_HEIGHT) {
+      || !dimensions || value.x < 0 || value.x >= dimensions.width
+      || value.y < 0 || value.y >= dimensions.height
+      || (MotaLab.validCellSet(topology)
+        && !MotaLab.validCellSet(topology).has(`${value.x},${value.y}`))) {
       throw new TypeError(`Invalid ${label}`);
     }
     if (withDirection && !["up", "down", "left", "right"].includes(value.direction)) {
@@ -882,9 +1389,17 @@
 
   MotaLab.validateResponseGuard = function validateResponseGuard(value) {
     MotaLab.assertProtocolShape(value, [
-      "floor_id", "floor", "position", "hp", "attack", "defense", "gold", "experience", "keys",
+      "session_id", "floor_id", "floor", "map_instance_id", "dimensions",
+      "topology_fingerprint", "position", "hp", "attack", "defense", "gold", "experience", "keys",
     ], [], "guard");
+    MotaLab.validateProtocolString(value.session_id, "guard.session_id", 1, 128);
     MotaLab.validateProtocolString(value.floor_id, "guard.floor_id", 1, 256);
+    MotaLab.validateProtocolString(value.map_instance_id, "guard.map_instance_id", 1, 256);
+    if (typeof value.topology_fingerprint !== "string"
+      || !/^sha256:[a-f0-9]{64}$/.test(value.topology_fingerprint)) {
+      throw new TypeError("Invalid guard.topology_fingerprint");
+    }
+    const dimensions = MotaLab.validateDimensions(value.dimensions, "guard.dimensions");
     if (value.floor !== null && !MotaLab.isFiniteInteger(value.floor)) {
       throw new TypeError("Invalid guard.floor");
     }
@@ -896,7 +1411,11 @@
     return {
       floor_id: value.floor_id,
       floor: value.floor,
-      position: MotaLab.validateResponsePosition(value.position, "guard.position", true),
+      session_id: value.session_id,
+      map_instance_id: value.map_instance_id,
+      dimensions,
+      topology_fingerprint: value.topology_fingerprint,
+      position: MotaLab.validateResponsePosition(value.position, "guard.position", true, dimensions),
       hp: value.hp,
       attack: value.attack,
       defense: value.defense,
@@ -906,14 +1425,14 @@
     };
   };
 
-  MotaLab.validateOperation = function validateOperation(operation) {
+  MotaLab.validateOperation = function validateOperation(operation, dimensions) {
     MotaLab.assertProtocolShape(operation, ["type", "x", "y"], [], "operation");
     if (operation.type !== "grid") {
       throw new TypeError("Only grid operations are supported");
     }
     if (!MotaLab.isFiniteInteger(operation.x) || !MotaLab.isFiniteInteger(operation.y)
-      || operation.x < 0 || operation.x >= MotaLab.MAP_WIDTH
-      || operation.y < 0 || operation.y >= MotaLab.MAP_HEIGHT) {
+      || operation.x < 0 || operation.x >= dimensions.width
+      || operation.y < 0 || operation.y >= dimensions.height) {
       throw new TypeError("Grid target is out of bounds");
     }
     return { type: "grid", x: operation.x, y: operation.y };
@@ -921,7 +1440,9 @@
 
   MotaLab.validateRegistryEntries = function validateRegistryEntries(value) {
     if (value === undefined) return [];
-    if (!Array.isArray(value) || value.length > 121) throw new TypeError("Invalid registry entries");
+    if (!Array.isArray(value) || value.length > MotaLab.MAX_BLOCKS) {
+      throw new TypeError("Invalid registry entries");
+    }
     return value.map((entry) => {
       MotaLab.assertProtocolShape(entry, [
         "id", "cls", "trigger", "category", "passable", "boundary", "fast_path", "version",
@@ -954,6 +1475,41 @@
     });
   };
 
+  MotaLab.validateScanState = function validateScanState(value) {
+    if (value === undefined) return undefined;
+    MotaLab.assertProtocolShape(value, [
+      "phase", "anchor_map_instance_id", "current_map_instance_id",
+      "scanned_map_instance_ids", "pending_transition_count",
+      "traversed_transition_count", "frontier_count", "reason",
+    ], [], "scan_state");
+    if (!["anchor", "discover", "sweep", "complete", "paused"].includes(value.phase)) {
+      throw new TypeError("Invalid scan_state.phase");
+    }
+    for (const field of ["anchor_map_instance_id", "current_map_instance_id"]) {
+      MotaLab.validateProtocolString(value[field], `scan_state.${field}`, 1, 256);
+    }
+    if (!Array.isArray(value.scanned_map_instance_ids)
+      || value.scanned_map_instance_ids.length > MotaLab.MAX_MAP_CELLS) {
+      throw new TypeError("Invalid scan_state.scanned_map_instance_ids");
+    }
+    const scanned = new Set();
+    for (const item of value.scanned_map_instance_ids) {
+      MotaLab.validateProtocolString(item, "scan_state map instance", 1, 256);
+      if (scanned.has(item)) throw new TypeError("Duplicate scan_state map instance");
+      scanned.add(item);
+    }
+    if (!scanned.has(value.current_map_instance_id)) {
+      throw new TypeError("scan_state current map is not scanned");
+    }
+    for (const field of ["pending_transition_count", "traversed_transition_count", "frontier_count"]) {
+      if (!MotaLab.isFiniteInteger(value[field]) || value[field] < 0) {
+        throw new TypeError(`Invalid scan_state.${field}`);
+      }
+    }
+    MotaLab.validateProtocolString(value.reason, "scan_state.reason", 1, 512);
+    return MotaLab.cloneJsonValue(value);
+  };
+
   MotaLab.validateCycleResponse = function validateCycleResponse(value) {
     if (!MotaLab.isProtocolObject(value)) {
       throw new TypeError("Response must be an object");
@@ -961,10 +1517,17 @@
     if (!new Set(["execute", "pause", "idle", "error"]).has(value.status)) {
       throw new TypeError("Unsupported response status");
     }
+    const acknowledgment = () => {
+      if (value.acknowledged_action_id === undefined) return {};
+      if (!MotaLab.validateActionId(value.acknowledged_action_id)) {
+        throw new TypeError("Invalid acknowledged_action_id");
+      }
+      return { acknowledged_action_id: value.acknowledged_action_id };
+    };
     if (value.status === "pause") {
       MotaLab.assertProtocolShape(value,
         ["status", "pause_kind", "detail_code", "reason", "details"],
-        ["evidence_path", "registry_entries"], "pause response");
+        ["evidence_path", "registry_entries", "scan_state", "acknowledged_action_id"], "pause response");
       if (!MotaLab.PAUSE_KIND_SET.has(value.pause_kind)) throw new TypeError("Invalid pause_kind");
       if (typeof value.detail_code !== "string" || !/^[A-Z][A-Z0-9_]{2,95}$/.test(value.detail_code)
         || typeof value.reason !== "string" || value.reason.length < 1 || value.reason.length > 512
@@ -972,7 +1535,7 @@
         || (value.evidence_path !== undefined && typeof value.evidence_path !== "string")) {
         throw new TypeError("Invalid pause response");
       }
-      return {
+      return Object.assign({
         status: "pause",
         pause_kind: value.pause_kind,
         detail_code: value.detail_code,
@@ -980,21 +1543,25 @@
         details: MotaLab.cloneJsonValue(value.details),
         evidence_path: value.evidence_path,
         registry_entries: MotaLab.validateRegistryEntries(value.registry_entries),
-      };
+        scan_state: MotaLab.validateScanState(value.scan_state),
+      }, acknowledgment());
     }
     if (value.status === "idle") {
-      MotaLab.assertProtocolShape(value, ["status", "reason"], ["registry_entries"], "idle response");
+      MotaLab.assertProtocolShape(value, ["status", "reason"],
+        ["registry_entries", "scan_state", "acknowledged_action_id"], "idle response");
       if (typeof value.reason !== "string" || value.reason.length < 1 || value.reason.length > 512) {
         throw new TypeError("Invalid idle response");
       }
-      return {
+      return Object.assign({
         status: "idle",
         reason: value.reason,
         registry_entries: MotaLab.validateRegistryEntries(value.registry_entries),
-      };
+        scan_state: MotaLab.validateScanState(value.scan_state),
+      }, acknowledgment());
     }
     if (value.status === "error") {
-      MotaLab.assertProtocolShape(value, ["status", "error_code", "reason"], ["errors"], "error response");
+      MotaLab.assertProtocolShape(value, ["status", "error_code", "reason"],
+        ["errors", "acknowledged_action_id"], "error response");
       MotaLab.validateProtocolString(value.error_code, "error_code", 1, 128);
       if (typeof value.reason !== "string" || value.reason.length > 1000) {
         throw new TypeError("Invalid error reason");
@@ -1003,17 +1570,17 @@
         || value.errors.some((entry) => !MotaLab.isProtocolObject(entry)))) {
         throw new TypeError("Invalid error details");
       }
-      return {
+      return Object.assign({
         status: "error",
         error_code: value.error_code,
         reason: value.reason,
         errors: (value.errors || []).map(MotaLab.cloneJsonValue),
-      };
+      }, acknowledgment());
     }
 
     MotaLab.assertProtocolShape(value, [
       "status", "action_id", "action_kind", "reason", "operations", "guard", "expected_delta",
-    ], ["supersedes_action_id", "registry_entries"], "execute response");
+    ], ["supersedes_action_id", "registry_entries", "scan_state", "acknowledged_action_id"], "execute response");
     if (!MotaLab.validateActionId(value.action_id)) throw new TypeError("Invalid action_id");
     if (typeof value.action_kind !== "string"
       || !/^[A-Z][A-Z0-9_]{2,63}$/.test(value.action_kind)) {
@@ -1029,23 +1596,29 @@
       || Object.keys(value.expected_delta).length < 1) {
       throw new TypeError("Missing expected_delta");
     }
-    MotaLab.validateExpectedDelta(value.expected_delta, { allowUnknownFloor: true });
+    const guard = MotaLab.validateResponseGuard(value.guard);
+    MotaLab.validateExpectedDelta(value.expected_delta, {
+      allowUnknownFloor: true,
+      allowUnknownMapInstance: true,
+      dimensions: guard.dimensions,
+    });
     if (value.supersedes_action_id !== undefined && value.supersedes_action_id !== null
       && !MotaLab.validateActionId(value.supersedes_action_id)) {
       throw new TypeError("Invalid supersedes_action_id");
     }
-    return {
+    return Object.assign({
       status: "execute",
       action_id: value.action_id,
       action_kind: value.action_kind,
-      operations: value.operations.map(MotaLab.validateOperation),
-      guard: MotaLab.validateResponseGuard(value.guard),
+      operations: value.operations.map((operation) => MotaLab.validateOperation(operation, guard.dimensions)),
+      guard,
       expected_delta: MotaLab.cloneJsonValue(value.expected_delta),
       reason: value.reason,
       supersedes_action_id: MotaLab.validateActionId(value.supersedes_action_id)
         ? value.supersedes_action_id : null,
       registry_entries: MotaLab.validateRegistryEntries(value.registry_entries),
-    };
+      scan_state: MotaLab.validateScanState(value.scan_state),
+    }, acknowledgment());
   };
 
   // Source: games/mota-planning-lab/src/fingerprint.js
@@ -1129,6 +1702,20 @@
   MotaLab.fingerprintProjection = function fingerprintProjection(observation) {
     return {
       floor_id: observation.floor_id,
+      session_id: observation.session_id,
+      dimensions: {
+        width: observation.dimensions.width,
+        height: observation.dimensions.height,
+      },
+      topology: Object.assign({
+        kind: observation.topology.kind,
+        source: observation.topology.source,
+        confidence: observation.topology.confidence,
+      }, Array.isArray(observation.topology.valid_cells) ? {
+        valid_cells: observation.topology.valid_cells,
+      } : {}),
+      topology_fingerprint: observation.topology_fingerprint,
+      map_instance_id: observation.map_instance_id,
       hero: {
         hp: observation.hero.hp,
         attack: observation.hero.attack,
@@ -1174,6 +1761,18 @@
       if (expected !== actual) differences.push({ field, expected, actual });
     }
 
+    if (guard.session_id !== undefined) {
+      compare("session_id", guard.session_id, observation.session_id || guard.session_id);
+    }
+    compare("map_instance_id", guard.map_instance_id, observation.map_instance_id,
+      guard.map_instance_id !== undefined);
+    compare("topology_fingerprint", guard.topology_fingerprint, observation.topology_fingerprint,
+      guard.topology_fingerprint !== undefined);
+    if (guard.dimensions) {
+      compare("dimensions.width", guard.dimensions.width, observation.dimensions.width);
+      compare("dimensions.height", guard.dimensions.height, observation.dimensions.height);
+    }
+
     if (guard.floor_id !== undefined) compare("floor_id", String(guard.floor_id), observation.floor_id);
     else if (guard.floor !== undefined) {
       if (typeof guard.floor === "number") compare("floor", guard.floor, observation.floor_number);
@@ -1208,19 +1807,16 @@
     return { ok: differences.length === 0, differences };
   };
 
-  MotaLab.compareInitialBaseline = function compareInitialBaseline(observation) {
-    const baseline = MotaLab.INITIAL_BASELINE;
-    const guard = {
-      floor: baseline.floor_number,
-      position: baseline.hero.loc,
-      hp: baseline.hero.hp,
-      attack: baseline.hero.attack,
-      defense: baseline.hero.defense,
-      gold: baseline.hero.gold,
-      experience: baseline.hero.experience,
-      keys: baseline.keys,
+  MotaLab.baselineSummary = function baselineSummary(observation) {
+    return {
+      fingerprint: MotaLab.fingerprintObservation(observation),
+      floor_id: observation.floor_id,
+      map_instance_id: observation.map_instance_id,
+      dimensions: Object.assign({}, observation.dimensions),
+      topology_fingerprint: observation.topology_fingerprint,
+      hero: MotaLab.cloneJsonValue(observation.hero),
+      keys: MotaLab.cloneJsonValue(observation.keys),
     };
-    return MotaLab.compareGuard(observation, guard);
   };
 
   // Source: games/mota-planning-lab/src/delta.js
@@ -1231,7 +1827,7 @@
     }
     const allowed = new Set([
       "hp", "attack", "defense", "gold", "experience", "keys",
-      "position", "floor_id", "removed_blocks", "added_blocks",
+      "position", "floor_id", "map_instance_id", "removed_blocks", "added_blocks",
     ]);
     for (const key of Object.keys(expected)) {
       if (!allowed.has(key)) throw new TypeError(`Unsupported expected_delta field: ${key}`);
@@ -1253,7 +1849,10 @@
       }
     }
     if (expected.position !== undefined) {
-      MotaLab.validateResponsePosition(expected.position, "expected_delta.position", false);
+      if (!options.dimensions) throw new TypeError("dimensions required for expected position");
+      MotaLab.validateResponsePosition(
+        expected.position, "expected_delta.position", false, options.dimensions, options.topology,
+      );
     }
     if (expected.floor_id !== undefined) {
       if (expected.floor_id === null) {
@@ -1263,11 +1862,29 @@
         throw new TypeError("Invalid expected floor_id");
       }
     }
+    if (expected.map_instance_id !== undefined) {
+      if (expected.map_instance_id === null) {
+        if (options.allowUnknownMapInstance !== true) {
+          throw new TypeError("Unknown map_instance_id is only allowed for map transitions");
+        }
+      } else if (typeof expected.map_instance_id !== "string"
+        || expected.map_instance_id.length < 1 || expected.map_instance_id.length > 256) {
+        throw new TypeError("Invalid expected map_instance_id");
+      }
+      if (expected.removed_blocks !== undefined || expected.added_blocks !== undefined) {
+        throw new TypeError("Map transition cannot compare blocks from different instances");
+      }
+    }
     for (const field of ["removed_blocks", "added_blocks"]) {
       if (expected[field] !== undefined && !Array.isArray(expected[field])) {
         throw new TypeError(`Invalid ${field}`);
       }
-      if ((expected[field] || []).length > MotaLab.MAP_WIDTH * MotaLab.MAP_HEIGHT) {
+      const dimensions = options.dimensions;
+      if (expected[field] !== undefined && !dimensions) {
+        throw new TypeError("dimensions required for block references");
+      }
+      if (!dimensions) continue;
+      if ((expected[field] || []).length > dimensions.width * dimensions.height) {
         throw new TypeError(`Invalid ${field}`);
       }
       for (const block of expected[field] || []) {
@@ -1278,8 +1895,8 @@
           `${field} block reference`,
         );
         if (!MotaLab.isFiniteInteger(block.x) || !MotaLab.isFiniteInteger(block.y)
-          || block.x < 0 || block.x >= MotaLab.MAP_WIDTH
-          || block.y < 0 || block.y >= MotaLab.MAP_HEIGHT
+          || block.x < 0 || block.x >= dimensions.width
+          || block.y < 0 || block.y >= dimensions.height
           || typeof block.id !== "string" || block.id.length === 0 || block.id.length > 256
           || (block.cls !== undefined
             && (typeof block.cls !== "string" || block.cls.length === 0 || block.cls.length > 256))
@@ -1315,7 +1932,10 @@
   };
 
   MotaLab.compareExpectedDelta = function compareExpectedDelta(before, after, expected, options = {}) {
-    MotaLab.validateExpectedDelta(expected, options);
+    MotaLab.validateExpectedDelta(expected, Object.assign({
+      dimensions: before.dimensions,
+      topology: before.topology,
+    }, options));
     const differences = [];
     function compare(field, expectedValue, actualValue) {
       if (expectedValue !== actualValue) differences.push({ field, expected: expectedValue, actual: actualValue });
@@ -1330,12 +1950,23 @@
       compare(`keys.${color}`, before.keys[color] + delta, after.keys[color]);
     }
 
+    const mapInstanceChanged = before.map_instance_id !== after.map_instance_id;
+    if (expected.map_instance_id === null && options.allowUnknownMapInstance === true) {
+      if (!mapInstanceChanged) {
+        differences.push({ field: "map_instance_id", expected: `different from ${before.map_instance_id}`, actual: after.map_instance_id });
+      }
+    } else if (expected.map_instance_id !== undefined) {
+      compare("map_instance_id", expected.map_instance_id, after.map_instance_id);
+    } else if (expected.floor_id === undefined) {
+      compare("map_instance_id", before.map_instance_id, after.map_instance_id);
+    }
+
     if (expected.floor_id === null && options.allowUnknownFloor === true) {
-      if (after.floor_id === before.floor_id) {
-        differences.push({ field: "floor_id", expected: `different from ${before.floor_id}`, actual: after.floor_id });
+      if (!mapInstanceChanged) {
+        differences.push({ field: "map_instance_id", expected: "a different map instance", actual: after.map_instance_id });
       }
     } else if (expected.floor_id !== undefined) compare("floor_id", String(expected.floor_id), after.floor_id);
-    else compare("floor_id", before.floor_id, after.floor_id);
+    else if (!mapInstanceChanged) compare("floor_id", before.floor_id, after.floor_id);
 
     if (expected.position !== undefined) {
       compare("position.x", expected.position.x, after.hero.loc.x);
@@ -1348,7 +1979,13 @@
       compare("position.y", before.hero.loc.y, after.hero.loc.y);
     }
 
-    const floorChanged = before.floor_id !== after.floor_id;
+    if (mapInstanceChanged) {
+      return {
+        ok: differences.length === 0,
+        differences,
+        actual: { map_instance_changed: true, removed: [], added: [] },
+      };
+    }
     const beforeByCoordinate = new Map(before.blocks.map((block) => [`${block.x},${block.y}`, block]));
     const afterByCoordinate = new Map(after.blocks.map((block) => [`${block.x},${block.y}`, block]));
     const coordinates = new Set([...beforeByCoordinate.keys(), ...afterByCoordinate.keys()]);
@@ -1364,12 +2001,10 @@
     }
     const expectedRemoved = expected.removed_blocks || [];
     const expectedAdded = expected.added_blocks || [];
-    if ((!floorChanged || expected.removed_blocks !== undefined)
-      && !MotaLab.compareBlockRefs(expectedRemoved, removed)) {
+    if (!MotaLab.compareBlockRefs(expectedRemoved, removed)) {
       differences.push({ field: "removed_blocks", expected: expectedRemoved, actual: removed });
     }
-    if ((!floorChanged || expected.added_blocks !== undefined)
-      && !MotaLab.compareBlockRefs(expectedAdded, added)) {
+    if (!MotaLab.compareBlockRefs(expectedAdded, added)) {
       differences.push({ field: "added_blocks", expected: expectedAdded, actual: added });
     }
 
@@ -1398,6 +2033,7 @@
       }
     }
     if (Object.prototype.hasOwnProperty.call(expected, "floor_id")) return true;
+    if (Object.prototype.hasOwnProperty.call(expected, "map_instance_id")) return true;
     return ["removed_blocks", "added_blocks"].some(
       (field) => Array.isArray(expected[field]) && expected[field].length > 0,
     );
@@ -1421,8 +2057,9 @@
         }
       }
       if (finalStep.category === "stair"
-        && !Object.prototype.hasOwnProperty.call(expected, "floor_id")) {
-        throw new TypeError("Stair boundary must declare floor_id");
+        && !Object.prototype.hasOwnProperty.call(expected, "floor_id")
+        && !Object.prototype.hasOwnProperty.call(expected, "map_instance_id")) {
+        throw new TypeError("Stair boundary must declare a map transition");
       }
       return { requires_non_position_change: true };
     }
@@ -1521,7 +2158,9 @@
         const x = current.x + dx;
         const y = current.y + dy;
         const key = MotaLab.coordinateKey(x, y);
-        if (x < 0 || y < 0 || x >= MotaLab.MAP_WIDTH || y >= MotaLab.MAP_HEIGHT
+        const validCells = MotaLab.validCellSet(observation.topology);
+        if (x < 0 || y < 0 || x >= observation.dimensions.width || y >= observation.dimensions.height
+          || (validCells && !validCells.has(key))
           || previous.has(key) || !cellAllowed(x, y)) continue;
         previous.set(key, currentKey);
         queue.push({ x, y });
@@ -1642,7 +2281,14 @@
     const plan = MotaLab.planOperations(action, initialObservation, registry, adapter);
     const allowUnknownFloor = action.expected_delta.floor_id === null
       && plan.length > 0 && plan[plan.length - 1].category === "stair";
-    MotaLab.validateExpectedDelta(action.expected_delta, { allowUnknownFloor });
+    const allowUnknownMapInstance = action.expected_delta.map_instance_id === null
+      && plan.length > 0 && plan[plan.length - 1].category === "stair";
+    MotaLab.validateExpectedDelta(action.expected_delta, {
+      allowUnknownFloor,
+      allowUnknownMapInstance,
+      dimensions: initialObservation.dimensions,
+      topology: initialObservation.topology,
+    });
     let beforeStep = initialObservation;
     let beforeFingerprint = MotaLab.fingerprintObservation(beforeStep);
 
@@ -1702,20 +2348,52 @@
   MotaLab.createMemoryStorage = function createMemoryStorage(seed = {}) {
     const values = new Map(Object.entries(seed));
     return {
-      get(key, fallback) {
-        return values.has(key) ? values.get(key) : fallback;
+      inspect(key) {
+        if (!values.has(key)) return { status: "absent", key };
+        const raw = values.get(key);
+        let rawText;
+        try { rawText = typeof raw === "string" ? raw : JSON.stringify(raw); } catch (_) { rawText = ""; }
+        const evidence = { key, raw_length: rawText ? rawText.length : 0,
+          content_hash: `sha256:${MotaLab.sha256(rawText || `[${typeof raw}]`)}` };
+        if (typeof raw === "string") {
+          try { return Object.assign({ status: "parsed", value: JSON.parse(raw) }, evidence); }
+          catch (_) { return Object.assign({ status: "parse_failed" }, evidence); }
+        }
+        try { return Object.assign({ status: "parsed", value: JSON.parse(rawText) }, evidence); }
+        catch (_) { return Object.assign({ status: "wrong_shape" }, evidence); }
       },
+      get(key, fallback) { return values.has(key) ? values.get(key) : fallback; },
       set(key, value) {
-        values.set(key, value);
+        const clone = MotaLab.cloneJsonValue(value);
+        values.set(key, clone);
+        return Object.freeze({ verified: true, key,
+          canonical_hash: `sha256:${MotaLab.sha256(MotaLab.canonicalize(clone))}` });
+      },
+      delete(key) {
+        values.delete(key);
+        return Object.freeze({ verified: true, key, absent: true });
       },
     };
   };
 
   MotaLab.createJournal = function createJournal(storage) {
+    const STORAGE_PROTOCOL = 1;
     const defaults = () => ({
       protocol: MotaLab.PROTOCOL_VERSION,
       autopilot_enabled: false,
-      initial_baseline_verified_fingerprint: null,
+      session_id: null,
+      session_mode: null,
+      expected_guard: null,
+      baseline: null,
+      service_session_confirmed: false,
+      migration_required: false,
+      corruption_required: false,
+      legacy_archive: null,
+      legacy_disposition: null,
+      corrupt_archive: null,
+      corrupt_disposition: null,
+      corrupt_evidence: [],
+      scan_state: null,
       pending_action: null,
       last_completed_action: null,
       last_acknowledged_action_id: null,
@@ -1723,48 +2401,490 @@
       last_pause: null,
       registry_entries: [],
     });
+    const JOURNAL_FIELDS = Object.freeze(Object.keys(defaults()).sort());
+    const ENVELOPE_FIELDS = Object.freeze([
+      "commit_hash", "generation", "import_witness", "previous_commit_hash",
+      "previous_generation", "state", "state_hash", "storage_protocol",
+    ].sort());
 
-    function read() {
-      const stored = storage.get(MotaLab.JOURNAL_KEY, null);
-      if (!stored || typeof stored !== "object" || stored.protocol !== MotaLab.PROTOCOL_VERSION) {
-        return defaults();
+    function pauseStorage(operation, details = {}) {
+      return MotaLab.createPauseError(
+        "ENGINE_API_INCOMPATIBLE", "JOURNAL_STORAGE_UNSTABLE",
+        Object.assign({ operation }, details),
+      );
+    }
+
+    function inspectKey(key) {
+      if (storage && typeof storage.inspect === "function") return storage.inspect(key);
+      try {
+        const marker = Object.freeze({ absent: true });
+        const value = storage.get(key, marker);
+        if (value === marker) return { status: "absent", key };
+        const raw = JSON.stringify(value);
+        return { status: "parsed", key, value: MotaLab.cloneJsonValue(value),
+          raw_length: raw.length, content_hash: `sha256:${MotaLab.sha256(raw)}` };
+      } catch (_) {
+        return { status: "read_failed", key, raw_length: 0,
+          content_hash: `sha256:${MotaLab.sha256("storage-read-failed")}` };
       }
-      return Object.assign(defaults(), stored, {
-        seen_action_ids: stored.seen_action_ids && typeof stored.seen_action_ids === "object"
-          ? Object.assign({}, stored.seen_action_ids) : {},
-        registry_entries: Array.isArray(stored.registry_entries) ? stored.registry_entries : [],
+    }
+
+    function isPlainObject(value) {
+      return Boolean(value && Object.prototype.toString.call(value) === "[object Object]");
+    }
+
+    function validateV2State(value) {
+      if (!isPlainObject(value) || value.protocol !== MotaLab.PROTOCOL_VERSION) return false;
+      if (Object.keys(value).sort().join("\u0000") !== JOURNAL_FIELDS.join("\u0000")) return false;
+      if (typeof value.autopilot_enabled !== "boolean"
+        || typeof value.service_session_confirmed !== "boolean"
+        || typeof value.migration_required !== "boolean"
+        || typeof value.corruption_required !== "boolean") return false;
+      for (const field of ["session_id", "session_mode", "last_acknowledged_action_id"]) {
+        if (value[field] !== null && (typeof value[field] !== "string" || value[field].length < 1)) return false;
+      }
+      if (value.session_mode !== null && !MotaLab.SESSION_MODES.includes(value.session_mode)) return false;
+      for (const field of [
+        "expected_guard", "baseline", "legacy_archive", "legacy_disposition",
+        "corrupt_archive", "corrupt_disposition", "scan_state", "pending_action",
+        "last_completed_action", "last_pause",
+      ]) {
+        if (value[field] !== null && !isPlainObject(value[field])) return false;
+      }
+      if (!isPlainObject(value.seen_action_ids) || !Array.isArray(value.registry_entries)
+        || !Array.isArray(value.corrupt_evidence)) return false;
+      if (Object.values(value.seen_action_ids).some((item) => typeof item !== "string")) return false;
+      for (const field of ["pending_action", "last_completed_action"]) {
+        if (value[field] !== null
+          && (typeof value[field].action_id !== "string" || value[field].action_id.length < 1)) return false;
+      }
+      return value.corrupt_evidence.every((item) => isPlainObject(item)
+        && typeof item.key === "string" && Number.isInteger(item.raw_length)
+        && typeof item.content_hash === "string" && /^sha256:[a-f0-9]{64}$/.test(item.content_hash));
+    }
+
+    function rawInspectionIdentity(inspected) {
+      if (!inspected) return "missing";
+      if (inspected.status === "parsed") {
+        try { return `parsed:sha256:${MotaLab.sha256(MotaLab.canonicalize(inspected.value))}`; }
+        catch (_) { return `parsed-invalid:${inspected.raw_length || 0}:${inspected.content_hash || "missing"}`; }
+      }
+      return `${inspected.status}:${inspected.raw_length || 0}:${inspected.content_hash || "none"}`;
+    }
+
+    function inspectionIdentity(inspected) {
+      if (!inspected || ["storage_unstable", "read_failed"].includes(inspected.status)) {
+        throw pauseStorage("journal-storage-witness", {
+          observed_status: inspected && inspected.status,
+          key: inspected && inspected.key,
+        });
+      }
+      return rawInspectionIdentity(inspected);
+    }
+
+    function importWitness(inspected, classification, evidence = null) {
+      return {
+        key: MotaLab.JOURNAL_KEY,
+        identity: inspectionIdentity(inspected),
+        classification,
+        evidence: evidence ? MotaLab.cloneJsonValue(evidence) : null,
+      };
+    }
+
+    function envelopeCore(envelope) {
+      return {
+        storage_protocol: envelope.storage_protocol,
+        generation: envelope.generation,
+        previous_generation: envelope.previous_generation,
+        previous_commit_hash: envelope.previous_commit_hash,
+        state: envelope.state,
+        state_hash: envelope.state_hash,
+        import_witness: envelope.import_witness,
+      };
+    }
+
+    function validateEnvelope(value) {
+      if (!isPlainObject(value)
+        || Object.keys(value).sort().join("\u0000") !== ENVELOPE_FIELDS.join("\u0000")
+        || value.storage_protocol !== STORAGE_PROTOCOL
+        || !Number.isSafeInteger(value.generation) || value.generation < 1
+        || !isPlainObject(value.import_witness)
+        || value.import_witness.key !== MotaLab.JOURNAL_KEY
+        || typeof value.import_witness.identity !== "string"
+        || !["absent", "valid_v2", "corrupt"].includes(value.import_witness.classification)
+        || (value.import_witness.evidence !== null && !isPlainObject(value.import_witness.evidence))
+        || (value.import_witness.classification === "corrupt" && !isPlainObject(value.import_witness.evidence))
+        || !validateV2State(value.state)) return false;
+      if (value.generation === 1) {
+        if (value.previous_generation !== 0 || value.previous_commit_hash !== null) return false;
+      } else if (!Number.isSafeInteger(value.previous_generation)
+        || value.previous_generation < 1
+        || value.previous_generation !== value.generation - 1
+        || typeof value.previous_commit_hash !== "string"
+        || !/^sha256:[a-f0-9]{64}$/.test(value.previous_commit_hash)) return false;
+      if (typeof value.state_hash !== "string" || typeof value.commit_hash !== "string") return false;
+      const stateHash = `sha256:${MotaLab.sha256(MotaLab.canonicalize(value.state))}`;
+      if (stateHash !== value.state_hash) return false;
+      const commitHash = `sha256:${MotaLab.sha256(MotaLab.canonicalize(envelopeCore(value)))}`;
+      return commitHash === value.commit_hash;
+    }
+
+    function buildEnvelope(state, active, witness) {
+      if (active && active.envelope.generation >= Number.MAX_SAFE_INTEGER) {
+        throw pauseStorage("journal-generation-build", { reason: "generation-overflow" });
+      }
+      const envelope = {
+        storage_protocol: STORAGE_PROTOCOL,
+        generation: active ? active.envelope.generation + 1 : 1,
+        previous_generation: active ? active.envelope.generation : 0,
+        previous_commit_hash: active ? active.envelope.commit_hash : null,
+        state: MotaLab.cloneJsonValue(state),
+        state_hash: `sha256:${MotaLab.sha256(MotaLab.canonicalize(state))}`,
+        import_witness: MotaLab.cloneJsonValue(witness),
+        commit_hash: null,
+      };
+      envelope.commit_hash = `sha256:${MotaLab.sha256(MotaLab.canonicalize(envelopeCore(envelope)))}`;
+      return envelope;
+    }
+
+    function evidenceFromInspection(inspected, reason = null) {
+      return {
+        key: inspected.key,
+        status: reason || inspected.status,
+        raw_length: Number.isInteger(inspected.raw_length) ? inspected.raw_length : 0,
+        content_hash: typeof inspected.content_hash === "string"
+          ? inspected.content_hash : `sha256:${MotaLab.sha256("unreadable")}`,
+      };
+    }
+
+    function loadContextOnce() {
+      const slotInspections = MotaLab.JOURNAL_SLOT_KEYS.map(inspectKey);
+      for (const inspected of slotInspections) inspectionIdentity(inspected);
+      const valid = [];
+      for (let index = 0; index < slotInspections.length; index += 1) {
+        const inspected = slotInspections[index];
+        if (inspected.status === "parsed" && validateEnvelope(inspected.value)) {
+          valid.push({ key: MotaLab.JOURNAL_SLOT_KEYS[index], envelope: inspected.value });
+        }
+      }
+      let active = null;
+      if (valid.length === 2) {
+        const sorted = valid.slice().sort((left, right) => left.envelope.generation - right.envelope.generation);
+        const lower = sorted[0].envelope;
+        const higher = sorted[1].envelope;
+        if (lower.generation === higher.generation) {
+          throw pauseStorage("journal-slot-selection", { reason: "same-generation-conflict" });
+        }
+        if (higher.generation !== lower.generation + 1
+          || higher.previous_generation !== lower.generation
+          || higher.previous_commit_hash !== lower.commit_hash
+          || MotaLab.canonicalize(higher.import_witness) !== MotaLab.canonicalize(lower.import_witness)) {
+          throw pauseStorage("journal-slot-selection", { reason: "generation-chain-broken" });
+        }
+        active = sorted[1];
+      } else if (valid.length === 1) {
+        active = valid[0];
+        for (const inspected of slotInspections) {
+          const rawGeneration = inspected.status === "parsed" && isPlainObject(inspected.value)
+            ? inspected.value.generation : null;
+          if (Number.isSafeInteger(rawGeneration)
+            && rawGeneration > active.envelope.generation + 1) {
+            throw pauseStorage("journal-slot-selection", { reason: "unexpected-higher-generation" });
+          }
+        }
+      } else if (slotInspections.some((item) => item.status !== "absent")) {
+        throw pauseStorage("journal-slot-selection", { reason: "no-valid-generation" });
+      }
+
+      const singleV2 = inspectKey(MotaLab.JOURNAL_KEY);
+      const legacy = MotaLab.LEGACY_JOURNAL_KEYS.map(inspectKey);
+      const corruptEvidence = [];
+      let sourceState = null;
+      let witness = null;
+      if (active) {
+        inspectionIdentity(singleV2);
+        sourceState = active.envelope.state;
+        witness = active.envelope.import_witness;
+        if (witness.identity !== rawInspectionIdentity(singleV2)) {
+          corruptEvidence.push(evidenceFromInspection(singleV2, "legacy_v2_witness_changed"));
+        } else if (witness.classification === "corrupt") {
+          corruptEvidence.push(MotaLab.cloneJsonValue(witness.evidence));
+        }
+      } else if (singleV2.status === "parsed" && validateV2State(singleV2.value)) {
+        sourceState = singleV2.value;
+        witness = importWitness(singleV2, "valid_v2");
+      } else if (singleV2.status === "absent") {
+        witness = importWitness(singleV2, "absent");
+      } else if (singleV2.status !== "absent") {
+        const reason = singleV2.status === "parsed"
+          ? (isPlainObject(singleV2.value) && singleV2.value.protocol !== MotaLab.PROTOCOL_VERSION
+            ? "wrong_protocol" : "wrong_shape") : null;
+        const evidence = evidenceFromInspection(singleV2, reason);
+        if (!["storage_unstable", "read_failed"].includes(singleV2.status)) {
+          witness = importWitness(singleV2, "corrupt", evidence);
+        }
+        corruptEvidence.push(evidence);
+      }
+
+      const legacyEntries = [];
+      for (const inspected of legacy) {
+        if (inspected.status === "absent") continue;
+        if (inspected.status === "parsed" && isPlainObject(inspected.value)
+          && inspected.value.protocol === 1) {
+          legacyEntries.push({ key: inspected.key, payload: MotaLab.cloneJsonValue(inspected.value) });
+        } else {
+          corruptEvidence.push(evidenceFromInspection(
+            inspected, inspected.status === "parsed" ? "wrong_shape_or_protocol" : null,
+          ));
+        }
+      }
+      return { active, sourceState, witness, slotInspections, singleV2,
+        legacyEntries, corruptEvidence };
+    }
+
+    function contextIdentity(context) {
+      return MotaLab.canonicalize({
+        slots: context.slotInspections.map(inspectionIdentity),
+        single: rawInspectionIdentity(context.singleV2),
+        legacy: context.legacyEntries,
+        active: context.active ? {
+          key: context.active.key,
+          generation: context.active.envelope.generation,
+          commit_hash: context.active.envelope.commit_hash,
+        } : null,
+        corruption: context.corruptEvidence,
       });
     }
 
-    function write(next) {
-      storage.set(MotaLab.JOURNAL_KEY, next);
-      return next;
+    function loadStableContext(operation = "journal-read") {
+      const first = loadContextOnce();
+      const second = loadContextOnce();
+      if (contextIdentity(first) !== contextIdentity(second)) {
+        throw pauseStorage(operation, { reason: "two-slot-read-changed" });
+      }
+      return second;
+    }
+
+    function legacyArchiveId(entries) {
+      return `legacy-archive:${MotaLab.sha256(MotaLab.canonicalize(entries))}`;
+    }
+
+    function stateFromContext(context) {
+      const result = context.sourceState ? MotaLab.cloneJsonValue(context.sourceState) : defaults();
+      result.autopilot_enabled = result.autopilot_enabled === true;
+      result.corrupt_evidence = MotaLab.cloneJsonValue(context.corruptEvidence);
+      if (context.legacyEntries.length > 0) {
+        const currentArchiveId = legacyArchiveId(context.legacyEntries);
+        const dispositionMatches = Boolean(
+          result.legacy_archive && result.legacy_archive.archive_id === currentArchiveId
+          && result.legacy_disposition && result.legacy_disposition.archive_id === currentArchiveId
+        );
+        result.migration_required = !dispositionMatches;
+      } else if (result.legacy_archive && !result.legacy_disposition) {
+        result.migration_required = true;
+      }
+      if (context.corruptEvidence.length > 0) {
+        const currentArchiveId = `corrupt-archive:${MotaLab.sha256(MotaLab.canonicalize(context.corruptEvidence))}`;
+        const dispositionMatches = Boolean(
+          result.corrupt_archive && result.corrupt_archive.archive_id === currentArchiveId
+          && result.corrupt_disposition && result.corrupt_disposition.archive_id === currentArchiveId
+        );
+        result.corruption_required = !dispositionMatches;
+      } else if (result.corrupt_archive && !result.corrupt_disposition) {
+        result.corruption_required = true;
+      }
+      if (result.corruption_required) result.autopilot_enabled = false;
+      return result;
+    }
+
+    function read() { return stateFromContext(loadStableContext()); }
+
+    function write(next, context, allowInitialCorruptArchive = false) {
+      if (next.corruption_required && !next.corrupt_archive && !allowInitialCorruptArchive) {
+        throw new TypeError("Corrupt journal evidence must be archived before a generation is written");
+      }
+      if (!validateV2State(next)) throw pauseStorage("journal-write", { reason: "invalid-state" });
+      if (!context.witness) {
+        throw pauseStorage("journal-write", { reason: "unstable-import-witness" });
+      }
+      const precondition = loadStableContext("journal-write-precondition");
+      if (contextIdentity(precondition) !== contextIdentity(context)) {
+        throw pauseStorage("journal-write-precondition", { reason: "read-write-witness-changed" });
+      }
+      const target = context.active
+        ? MotaLab.JOURNAL_SLOT_KEYS.find((key) => key !== context.active.key)
+        : MotaLab.JOURNAL_SLOT_KEYS[0];
+      const envelope = buildEnvelope(next, context.active, context.witness);
+      let writeError = null;
+      try { storage.set(target, MotaLab.cloneJsonValue(envelope)); }
+      catch (error) { writeError = error; }
+      const first = inspectKey(target);
+      const second = inspectKey(target);
+      let committed = false;
+      try {
+        committed = first.status === "parsed" && second.status === "parsed"
+          && validateEnvelope(first.value) && validateEnvelope(second.value)
+          && MotaLab.canonicalize(first.value) === MotaLab.canonicalize(envelope)
+          && MotaLab.canonicalize(second.value) === MotaLab.canonicalize(envelope);
+      } catch (_) { committed = false; }
+      if (!committed || writeError) {
+        throw pauseStorage("journal-generation-write", {
+          reason: writeError ? "write-call-uncertain" : "candidate-readback-invalid",
+          target_slot: target,
+          candidate_generation: envelope.generation,
+          complete_candidate_observed: committed,
+        });
+      }
+      const after = loadStableContext("journal-generation-commit");
+      if (!after.active || after.active.key !== target
+        || after.active.envelope.commit_hash !== envelope.commit_hash) {
+        throw pauseStorage("journal-generation-commit", { reason: "candidate-not-selected" });
+      }
+      return Object.freeze({
+        verified: true,
+        state: MotaLab.cloneJsonValue(next),
+        generation: envelope.generation,
+        commit_hash: envelope.commit_hash,
+      });
     }
 
     function update(mutator) {
-      const state = read();
+      const context = loadStableContext("journal-update-read");
+      const state = stateFromContext(context);
       mutator(state);
-      return write(state);
+      return write(state, context);
+    }
+
+    function hasV2RecoveryEvidence(state) {
+      return Boolean(state.session_id || state.session_mode || state.baseline || state.expected_guard
+        || state.service_session_confirmed || state.scan_state || state.pending_action
+        || state.last_completed_action || state.last_acknowledged_action_id
+        || Object.keys(state.seen_action_ids || {}).length > 0);
     }
 
     return Object.freeze({
       snapshot: read,
-      setAutopilot(enabled) {
-        return update((state) => { state.autopilot_enabled = enabled === true; });
+      setAutopilot(enabled) { return update((state) => { state.autopilot_enabled = enabled === true; }); },
+      establishSession({ session_id, mode, baseline, expected_guard = null }) {
+        if (typeof session_id !== "string" || session_id.length < 1
+          || !MotaLab.SESSION_MODES.includes(mode) || !baseline) throw new TypeError("Invalid session baseline");
+        return update((state) => {
+          if (state.migration_required || state.corruption_required) {
+            throw new TypeError("Journal quarantine requires explicit archived disposition");
+          }
+          state.session_id = session_id;
+          state.session_mode = mode;
+          state.baseline = MotaLab.cloneJsonValue(baseline);
+          state.expected_guard = expected_guard ? MotaLab.cloneJsonValue(expected_guard) : null;
+          state.service_session_confirmed = false;
+        });
       },
-      verifyBaseline(fingerprint) {
-        return update((state) => { state.initial_baseline_verified_fingerprint = fingerprint; });
+      archiveLegacyJournal() {
+        const context = loadStableContext("legacy-archive-read");
+        if (context.legacyEntries.length === 0) throw new TypeError("No legacy journal is present");
+        const archiveId = legacyArchiveId(context.legacyEntries);
+        const archive = {
+          archive_id: archiveId,
+          archived_at: Date.now(),
+          has_pending_or_recovery: context.legacyEntries.some((entry) => Boolean(entry.payload
+            && (entry.payload.pending_action || entry.payload.recovery || entry.payload.last_completed_action))),
+          entries: MotaLab.cloneJsonValue(context.legacyEntries),
+        };
+        const result = update((state) => {
+          state.migration_required = true;
+          state.legacy_archive = archive;
+          state.legacy_disposition = null;
+          state.autopilot_enabled = false;
+        });
+        if (legacyArchiveId(loadStableContext().legacyEntries) !== archiveId) {
+          throw pauseStorage("legacy-archive-postcondition", { reason: "legacy-content-changed" });
+        }
+        return MotaLab.cloneJsonValue(archive);
       },
+      authorizeV2AfterLegacyArchive({ archive_id, confirmation }) {
+        if (confirmation !== "START_V2_NEW_SESSION") {
+          throw new TypeError("Explicit legacy disposition confirmation is required");
+        }
+        const result = update((state) => {
+          const current = loadStableContext("legacy-disposition-read").legacyEntries;
+          const currentArchiveId = current.length > 0 ? legacyArchiveId(current) : null;
+          if (!state.migration_required || !state.legacy_archive
+            || state.legacy_archive.archive_id !== archive_id || currentArchiveId !== archive_id) {
+            throw new TypeError("Legacy archive identity does not match");
+          }
+          if (hasV2RecoveryEvidence(state)) {
+            throw new TypeError("Existing v2 recovery evidence requires a separate audited disposition");
+          }
+          state.legacy_disposition = {
+            kind: "archived_then_new_v2_session", archive_id, command: confirmation,
+            confirmed_at: Date.now(),
+            had_pending_or_recovery: state.legacy_archive.has_pending_or_recovery === true,
+          };
+          state.migration_required = false;
+        });
+        const current = loadStableContext().legacyEntries;
+        if (current.length === 0 || legacyArchiveId(current) !== archive_id) {
+          throw pauseStorage("legacy-disposition-postcondition", { reason: "legacy-content-changed" });
+        }
+        return result;
+      },
+      archiveCorruptJournal() {
+        const context = loadStableContext("corrupt-archive-read");
+        if (context.corruptEvidence.length === 0) throw new TypeError("No corrupt journal is present");
+        const archive = {
+          archive_id: `corrupt-archive:${MotaLab.sha256(MotaLab.canonicalize(context.corruptEvidence))}`,
+          archived_at: Date.now(), evidence: MotaLab.cloneJsonValue(context.corruptEvidence),
+        };
+        const state = stateFromContext(context);
+        if (hasV2RecoveryEvidence(state)) {
+          throw new TypeError("Existing v2 recovery evidence requires a separate audited corrupt-journal disposition");
+        }
+        state.autopilot_enabled = false;
+        state.corruption_required = true;
+        state.corrupt_evidence = MotaLab.cloneJsonValue(context.corruptEvidence);
+        state.corrupt_archive = archive;
+        state.corrupt_disposition = null;
+        write(state, context, true);
+        if (MotaLab.canonicalize(loadStableContext().corruptEvidence)
+          !== MotaLab.canonicalize(archive.evidence)) {
+          throw pauseStorage("corrupt-archive-postcondition", { reason: "content-changed" });
+        }
+        return MotaLab.cloneJsonValue(archive);
+      },
+      authorizeV2AfterCorruptArchive({ archive_id, confirmation }) {
+        if (confirmation !== "ARCHIVE_CORRUPT_AND_START_V2") {
+          throw new TypeError("Explicit corrupt journal disposition confirmation is required");
+        }
+        const result = update((state) => {
+          if (!state.corruption_required || !state.corrupt_archive
+            || state.corrupt_archive.archive_id !== archive_id) {
+            throw new TypeError("Corrupt journal archive identity does not match");
+          }
+          if (hasV2RecoveryEvidence(state)) {
+            throw new TypeError("Existing v2 recovery evidence requires a separate audited disposition");
+          }
+          const current = loadStableContext("corrupt-disposition-read").corruptEvidence;
+          if (MotaLab.canonicalize(current) !== MotaLab.canonicalize(state.corrupt_archive.evidence)) {
+            throw new TypeError("Corrupt journal content changed after archive");
+          }
+          state.corrupt_disposition = {
+            kind: "fingerprint_bound_corrupt_archive", archive_id,
+            command: confirmation, confirmed_at: Date.now(),
+          };
+          state.corruption_required = false;
+          state.corrupt_evidence = [];
+        });
+        return result;
+      },
+      markServiceSessionConfirmed() { return update((state) => { state.service_session_confirmed = true; }); },
       setPending(pending) {
         return update((state) => {
-          state.pending_action = pending;
+          state.pending_action = MotaLab.cloneJsonValue(pending);
           state.seen_action_ids[pending.action_id] = "pending";
         });
       },
       updatePending(fields) {
-        return update((state) => {
-          if (state.pending_action) Object.assign(state.pending_action, fields);
-        });
+        return update((state) => { if (state.pending_action) Object.assign(state.pending_action, fields); });
       },
       abandonPending() {
         return update((state) => {
@@ -1780,25 +2900,21 @@
       },
       markCompleted(record) {
         return update((state) => {
-          state.last_completed_action = record;
+          state.last_completed_action = MotaLab.cloneJsonValue(record);
           state.pending_action = null;
           state.seen_action_ids[record.action_id] = "completed";
         });
       },
-      acknowledge(actionId) {
-        return update((state) => { state.last_acknowledged_action_id = actionId; });
-      },
-      actionState(actionId) {
-        return read().seen_action_ids[actionId] || null;
-      },
+      acknowledge(actionId) { return update((state) => { state.last_acknowledged_action_id = actionId; }); },
+      actionState(actionId) { return read().seen_action_ids[actionId] || null; },
       setPause(pause) {
-        return update((state) => {
-          state.last_pause = pause;
-          state.autopilot_enabled = false;
-        });
+        return update((state) => { state.last_pause = MotaLab.cloneJsonValue(pause); state.autopilot_enabled = false; });
       },
       setRegistryEntries(entries) {
-        return update((state) => { state.registry_entries = entries; });
+        return update((state) => { state.registry_entries = MotaLab.cloneJsonValue(entries); });
+      },
+      setScanState(scanState) {
+        return update((state) => { state.scan_state = scanState ? MotaLab.cloneJsonValue(scanState) : null; });
       },
     });
   };
@@ -1851,6 +2967,7 @@
         {
           allowPositionChange: true,
           allowUnknownFloor: pending.allow_unknown_floor === true,
+          allowUnknownMapInstance: pending.allow_unknown_map_instance === true,
         },
       );
     } catch (error) {
@@ -1979,7 +3096,7 @@
   MotaLab.createPanel = function createPanel(documentObject) {
     const doc = documentObject;
     if (!doc || !doc.body) {
-      return Object.freeze({ update() {}, setCollapsed() {} });
+      return Object.freeze({ update() {}, setCollapsed() {}, bindControls() {} });
     }
     if (!doc.getElementById(MotaLab.STYLE_ID)) {
       const style = doc.createElement("style");
@@ -1996,6 +3113,8 @@
         #${MotaLab.PANEL_ID}.collapsed .ml-body{display:none}
         #${MotaLab.PANEL_ID} .ml-label{color:#9ca3af}
         #${MotaLab.PANEL_ID} .ml-value{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        #${MotaLab.PANEL_ID} .ml-controls{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:3px;margin-top:4px}
+        #${MotaLab.PANEL_ID} .ml-controls button{border:1px solid #52606d;border-radius:3px;padding:2px 4px}
         #${MotaLab.PANEL_ID} .ml-bad{color:#fca5a5}.ml-good{color:#86efac}
       `;
       doc.head.appendChild(style);
@@ -2032,6 +3151,22 @@
       fields[key] = valueNode;
       body.append(labelNode, valueNode);
     }
+    const controls = doc.createElement("div");
+    controls.className = "ml-controls";
+    const controlHandlers = Object.create(null);
+    for (const [key, label] of [
+      ["confirm", "确认基线"], ["start", "启动"], ["pause", "暂停"],
+      ["reconnect", "重连"], ["export", "导出"],
+    ]) {
+      const button = doc.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      button.addEventListener("click", () => {
+        if (typeof controlHandlers[key] === "function") controlHandlers[key]();
+      });
+      controls.appendChild(button);
+    }
+    body.appendChild(controls);
     root.append(head, body);
     doc.body.appendChild(root);
 
@@ -2057,7 +3192,10 @@
       setField("service", state.connected ? "已连接" : "断开", state.connected ? "ml-good" : "ml-bad");
       setField("pause", state.pause_kind, state.pause_kind ? "ml-bad" : "");
     }
-    return Object.freeze({ update, setCollapsed, element: root });
+    function bindControls(handlers) {
+      Object.assign(controlHandlers, handlers || {});
+    }
+    return Object.freeze({ update, setCollapsed, bindControls, element: root });
   };
 
   // Source: games/mota-planning-lab/src/menus.js
@@ -2085,6 +3223,29 @@
     exporter = MotaLab.downloadObservation,
   }) {
     const registrations = [
+      ["确认新会话基线", () => controller.confirmBaseline({ mode: "new_game" })],
+      ["归档旧 v1 journal 证据", () => controller.archiveLegacyJournal()],
+      ["确认归档后开始 v2 新会话", () => {
+        const archive = controller.getLegacyArchive();
+        if (!archive) return;
+        if (confirmAction("旧 v1 journal 已本地归档。明确放弃旧 pending/recovery 身份链并开始全新 v2 会话？")) {
+          controller.beginV2AfterLegacyArchive({
+            archive_id: archive.archive_id,
+            confirmation: "START_V2_NEW_SESSION",
+          });
+        }
+      }],
+      ["归档损坏 journal 摘要", () => controller.archiveCorruptJournal()],
+      ["确认损坏 journal 归档后开始 v2", () => {
+        const archive = controller.getCorruptArchive();
+        if (!archive) return;
+        if (confirmAction("损坏 journal 的 key、长度和内容哈希已归档。确认按该 fingerprint 处置并开始全新 v2 会话？")) {
+          controller.beginV2AfterCorruptArchive({
+            archive_id: archive.archive_id,
+            confirmation: "ARCHIVE_CORRUPT_AND_START_V2",
+          });
+        }
+      }],
       ["启动自动驾驶", () => controller.start()],
       ["暂停自动驾驶", () => controller.manualPause()],
       ["导出当前层运行态", () => {
@@ -2106,7 +3267,12 @@
 
   MotaLab.createController = function createController(dependencies, options = {}) {
     const { adapter, journal, registry, client, panel } = dependencies;
-    const observe = dependencies.observe || (() => MotaLab.collectObservation(adapter));
+    const observeRaw = dependencies.observe || (() => MotaLab.collectObservation(adapter));
+    const observe = () => {
+      const observation = observeRaw();
+      observation.session_id = journal.snapshot().session_id || "UNCONFIRMED";
+      return observation;
+    };
     const logger = dependencies.logger || console;
     const autoSchedule = options.autoSchedule === true;
     const cycleDelayMs = MotaLab.isFiniteInteger(options.cycleDelayMs) ? options.cycleDelayMs : 300;
@@ -2114,7 +3280,7 @@
     let state = "STOPPED";
     let currentObservation = null;
     let currentActionId = null;
-    let lastReason = "等待首次现场核对";
+    let lastReason = "等待显式确认会话基线";
     let cyclePromise = null;
     let unsafeResponseCount = 0;
     let duplicatePendingCount = 0;
@@ -2126,7 +3292,11 @@
     }
 
     function refreshPanel(extra = {}) {
-      const snapshot = journal.snapshot();
+      let snapshot;
+      try { snapshot = journal.snapshot(); }
+      catch (_) {
+        snapshot = { autopilot_enabled: false, last_pause: null };
+      }
       panel.update(Object.assign({
         autopilot: snapshot.autopilot_enabled,
         action_id: currentActionId,
@@ -2146,6 +3316,7 @@
       } catch (error) {
         if (error && error.observation) {
           currentObservation = error.observation;
+          currentObservation.session_id = journal.snapshot().session_id || "UNCONFIRMED";
           refreshPanel();
         }
         throw error;
@@ -2166,7 +3337,11 @@
         block_evidence: evidenceBlocks,
         details: MotaLab.cloneJsonValue(details),
       };
-      journal.setPause(record);
+      try { journal.setPause(record); } catch (journalError) {
+        record.journal_write_blocked = true;
+        record.journal_error = journalError && journalError.message
+          ? journalError.message : String(journalError);
+      }
       state = "PAUSED";
       lastReason = detailCode || pauseKind;
       refreshPanel({ autopilot: false, pause_kind: pauseKind });
@@ -2211,23 +3386,39 @@
         const observation = capture();
         const fingerprint = MotaLab.fingerprintObservation(observation);
         const snapshot = journal.snapshot();
-        if (!snapshot.initial_baseline_verified_fingerprint) {
-          const baseline = MotaLab.compareInitialBaseline(observation);
-          if (!baseline.ok) {
-            return pause(
-              "GUARD_MISMATCH",
-              "INITIAL_BASELINE_MISMATCH",
-              { differences: baseline.differences },
-              observation,
-            );
-          }
-          adapter.assertRequiredCapabilities();
-          journal.verifyBaseline(fingerprint);
+        if (snapshot.corruption_required) {
+          const storageUnstable = snapshot.corrupt_evidence.some(
+            (item) => item.status === "storage_unstable",
+          );
+          return pause(
+            storageUnstable ? "ENGINE_API_INCOMPATIBLE" : "GUARD_MISMATCH",
+            storageUnstable ? "JOURNAL_STORAGE_UNSTABLE" : "JOURNAL_CORRUPT",
+            storageUnstable
+              ? { evidence: snapshot.corrupt_evidence, retry_only: true }
+              : { evidence: snapshot.corrupt_evidence, required_command: "archiveCorruptJournal" },
+            observation,
+          );
+        }
+        if (snapshot.migration_required) {
+          return pause(
+            "GUARD_MISMATCH",
+            "JOURNAL_V1_MIGRATION_REQUIRED",
+            { legacy_protocol: 1, required_protocol: 2 },
+            observation,
+          );
+        }
+        if (!snapshot.baseline || !snapshot.session_id) {
           journal.setAutopilot(false);
-          state = "BASELINE_VERIFIED";
-          lastReason = "现场核对通过，等待手动启动";
+          state = "AWAITING_BASELINE_CONFIRMATION";
+          lastReason = "已读取首次稳定现场；请显式确认会话基线";
           refreshPanel({ autopilot: false, pause_kind: null });
-          return { verified: true, fingerprint, auto_started: false };
+          return {
+            verified: false,
+            requires_confirmation: true,
+            fingerprint,
+            baseline: MotaLab.baselineSummary(observation),
+            auto_started: false,
+          };
         }
         adapter.assertRequiredCapabilities();
         state = "STOPPED";
@@ -2240,26 +3431,155 @@
       }
     }
 
-    async function start() {
-      const snapshot = journal.snapshot();
-      if (!snapshot.initial_baseline_verified_fingerprint) {
-        const result = await initialize();
-        if (!result || !result.verified) return result;
+    function confirmBaseline({
+      mode = "new_game",
+      expected_guard = null,
+      session_id = null,
+    } = {}) {
+      try {
+        if (journal.snapshot().corruption_required) {
+          const corruptSnapshot = journal.snapshot();
+          const storageUnstable = corruptSnapshot.corrupt_evidence.some(
+            (item) => item.status === "storage_unstable",
+          );
+          return pause(
+            storageUnstable ? "ENGINE_API_INCOMPATIBLE" : "GUARD_MISMATCH",
+            storageUnstable ? "JOURNAL_STORAGE_UNSTABLE" : "JOURNAL_CORRUPT",
+            storageUnstable
+              ? { evidence: corruptSnapshot.corrupt_evidence, retry_only: true }
+              : { required_command: "archiveCorruptJournal + beginV2AfterCorruptArchive" },
+          );
+        }
+        if (journal.snapshot().migration_required) {
+          return pause(
+            "GUARD_MISMATCH",
+            "JOURNAL_V1_MIGRATION_REQUIRED",
+            { required_command: "archiveLegacyJournal + beginV2AfterLegacyArchive" },
+          );
+        }
+        if (!MotaLab.SESSION_MODES.includes(mode)) throw new TypeError("Invalid session mode");
+        const observation = capture();
+        const provisionalFingerprint = MotaLab.fingerprintObservation(observation);
+        const id = session_id || `SESSION-${MotaLab.sha256(`${provisionalFingerprint}:${Date.now()}`).slice(0, 24)}`;
+        observation.session_id = id;
+        if (mode === "handoff_expected_guard") {
+          if (!expected_guard) throw new TypeError("handoff_expected_guard requires expected_guard");
+          const matched = MotaLab.compareGuard(observation, expected_guard);
+          if (!matched.ok) {
+            return pause(
+              "GUARD_MISMATCH",
+              "SESSION_BASELINE_MISMATCH",
+              { differences: matched.differences },
+              observation,
+            );
+          }
+        }
+        if (mode === "resume_existing_ledger" && !session_id) {
+          throw new TypeError("resume_existing_ledger requires session_id");
+        }
+        const fingerprint = MotaLab.fingerprintObservation(observation);
+        journal.establishSession({
+          session_id: id,
+          mode,
+          baseline: MotaLab.baselineSummary(observation),
+          expected_guard,
+        });
+        journal.setAutopilot(false);
+        state = "BASELINE_VERIFIED";
+        lastReason = `会话基线已显式确认（${mode}），等待启动`;
+        refreshPanel({ autopilot: false, pause_kind: null });
+        return { verified: true, session_id: id, mode, fingerprint };
+      } catch (error) {
+        return handleError(error, "GUARD_MISMATCH", "INVALID_SESSION_BASELINE");
       }
-      journal.setAutopilot(true);
-      state = "OBSERVING";
-      lastReason = "用户已启动自动驾驶";
-      refreshPanel({ autopilot: true, pause_kind: null });
-      return runSingleCycle();
+    }
+
+    function archiveLegacyJournal() {
+      try {
+        const archive = journal.archiveLegacyJournal();
+        lastReason = `v1 journal 已本地归档（${archive.archive_id.slice(0, 24)}…），仍禁止行动`;
+        refreshPanel({ autopilot: false, pause_kind: "GUARD_MISMATCH" });
+        return archive;
+      } catch (error) {
+        handleError(error, "GUARD_MISMATCH", "LEGACY_ARCHIVE_FAILED");
+        return { archived: false, error: error.message };
+      }
+    }
+
+    function beginV2AfterLegacyArchive({
+      archive_id,
+      confirmation,
+      mode = "new_game",
+      expected_guard = null,
+      session_id = null,
+    } = {}) {
+      try {
+        journal.authorizeV2AfterLegacyArchive({ archive_id, confirmation });
+      } catch (error) {
+        return pause(
+          "GUARD_MISMATCH",
+          "LEGACY_DISPOSITION_NOT_CONFIRMED",
+          { message: error.message, archive_id: archive_id || null },
+        );
+      }
+      return confirmBaseline({ mode, expected_guard, session_id });
+    }
+
+    function archiveCorruptJournal() {
+      try {
+        const archive = journal.archiveCorruptJournal();
+        lastReason = `损坏 journal 摘要已归档（${archive.archive_id.slice(0, 25)}…），仍禁止行动`;
+        refreshPanel({ autopilot: false, pause_kind: "GUARD_MISMATCH" });
+        return archive;
+      } catch (error) {
+        handleError(error, "GUARD_MISMATCH", "CORRUPT_JOURNAL_ARCHIVE_FAILED");
+        return { archived: false, error: error.message };
+      }
+    }
+
+    function beginV2AfterCorruptArchive({
+      archive_id, confirmation, mode = "new_game", expected_guard = null, session_id = null,
+    } = {}) {
+      try {
+        journal.authorizeV2AfterCorruptArchive({ archive_id, confirmation });
+      } catch (error) {
+        return pause(
+          "GUARD_MISMATCH", "CORRUPT_JOURNAL_DISPOSITION_NOT_CONFIRMED",
+          { message: error.message, archive_id: archive_id || null },
+        );
+      }
+      return confirmBaseline({ mode, expected_guard, session_id });
+    }
+
+    async function start() {
+      try {
+        const snapshot = journal.snapshot();
+        if (!snapshot.baseline || !snapshot.session_id
+          || snapshot.migration_required || snapshot.corruption_required) {
+          const result = await initialize();
+          if (!result || !result.verified) return result;
+        }
+        journal.setAutopilot(true);
+        state = "OBSERVING";
+        lastReason = "用户已启动自动驾驶";
+        refreshPanel({ autopilot: true, pause_kind: null });
+        return runSingleCycle();
+      } catch (error) {
+        return handleError(error);
+      }
     }
 
     function manualPause() {
       try { adapter.stopAutomaticRoute(); } catch (_) { /* best-effort stop */ }
-      journal.setAutopilot(false);
-      state = "STOPPED";
-      lastReason = "用户手动暂停";
-      refreshPanel({ autopilot: false, pause_kind: null });
-      return { stopped: true };
+      try {
+        journal.setAutopilot(false);
+        state = "STOPPED";
+        lastReason = "用户手动暂停";
+        refreshPanel({ autopilot: false, pause_kind: null });
+        return { stopped: true };
+      } catch (error) {
+        return handleError(error);
+      }
     }
 
     function clearPending() {
@@ -2268,21 +3588,27 @@
         refreshPanel();
         return { cleared: false, reason: "AUTOPILOT_ACTIVE" };
       }
-      journal.clearPending();
-      currentActionId = null;
-      lastReason = "待执行行动已清除；游戏现场未改变";
-      refreshPanel();
-      return { cleared: true };
+      try {
+        journal.clearPending();
+        currentActionId = null;
+        lastReason = "待执行行动已清除；游戏现场未改变";
+        refreshPanel();
+        return { cleared: true };
+      } catch (error) {
+        const record = handleError(error);
+        return Object.assign(record, { cleared: false });
+      }
     }
 
-    function requestRecovery(snapshot, fingerprint) {
+    function prepareRecovery(snapshot, fingerprint) {
       const pending = snapshot.pending_action;
       if (!pending) {
-        return {
-          phase: "none",
-          pending_action_id: null,
-          pre_fingerprint: null,
-          current_fingerprint: fingerprint,
+        return { recovery: {
+            phase: "none",
+            pending_action_id: null,
+            pre_fingerprint: null,
+            current_fingerprint: fingerprint,
+          }, completionRecord: null,
         };
       }
       const recovery = MotaLab.classifyPendingRecovery(pending, currentObservation, fingerprint);
@@ -2290,18 +3616,14 @@
         pause("EXPECTED_DELTA_MISMATCH", recovery.detail_code, recovery, currentObservation);
         return null;
       }
-      if (recovery.phase === "completed") {
-        journal.markCompleted({
+      const completionRecord = recovery.phase === "completed" ? {
           action_id: pending.action_id,
           fingerprint,
           observation: MotaLab.cloneObservationForWire(currentObservation),
           completed_at: Date.now(),
           recovered: true,
-        });
-      } else {
-        journal.updatePending({ phase: "not_executed" });
-      }
-      return recovery;
+        } : null;
+      return { recovery, completionRecord };
     }
 
     async function cycleBody() {
@@ -2313,16 +3635,24 @@
       }
       const fingerprint = MotaLab.fingerprintObservation(observation);
       let snapshot = journal.snapshot();
-      const recovery = requestRecovery(snapshot, fingerprint);
-      if (!recovery) return { paused: true };
+      const preparedRecovery = prepareRecovery(snapshot, fingerprint);
+      if (!preparedRecovery) return { paused: true };
+      const { recovery, completionRecord } = preparedRecovery;
       snapshot = journal.snapshot();
-      const completedActionId = snapshot.last_completed_action
+      const completedActionId = completionRecord ? completionRecord.action_id
+        : snapshot.last_completed_action
         && snapshot.last_acknowledged_action_id !== snapshot.last_completed_action.action_id
         ? snapshot.last_completed_action.action_id : null;
       const request = MotaLab.createCycleRequest({
         observation,
         completedActionId,
         recovery,
+        session: Object.assign({
+          mode: snapshot.session_mode,
+          command: snapshot.service_session_confirmed ? "observe" : "confirm",
+        }, snapshot.session_mode === "handoff_expected_guard" ? {
+          expected_guard: snapshot.expected_guard,
+        } : {}),
       });
 
       state = "REQUESTING";
@@ -2337,13 +3667,6 @@
           observation,
         );
       }
-      if (completedActionId) journal.acknowledge(completedActionId);
-      try {
-        validateAndReplaceRegistry(response.registry_entries || [], observation);
-      } catch (error) {
-        return handleError(error, "DECISION_SERVICE_UNAVAILABLE", "INVALID_RESPONSE");
-      }
-
       if (response.status === "pause") {
         lastReason = response.reason;
         return pause(response.pause_kind, response.detail_code, response.details, observation);
@@ -2356,6 +3679,30 @@
           observation,
         );
       }
+      if (completedActionId) {
+        if (response.status !== "idle" || response.acknowledged_action_id !== completedActionId) {
+          return pause(
+            "DECISION_SERVICE_UNAVAILABLE", "RECOVERY_ACK_MISSING",
+            { completed_action_id: completedActionId, response_status: response.status,
+              acknowledged_action_id: response.acknowledged_action_id || null }, observation,
+          );
+        }
+        if (completionRecord) journal.markCompleted(completionRecord);
+        journal.acknowledge(completedActionId);
+      } else if (response.acknowledged_action_id) {
+        return pause(
+          "DECISION_SERVICE_UNAVAILABLE", "RECOVERY_ACK_IDENTITY_MISMATCH",
+          { acknowledged_action_id: response.acknowledged_action_id }, observation,
+        );
+      }
+      if (!snapshot.service_session_confirmed) journal.markServiceSessionConfirmed();
+      try {
+        validateAndReplaceRegistry(response.registry_entries || [], observation);
+        if (response.scan_state) journal.setScanState(response.scan_state);
+      } catch (error) {
+        return handleError(error, "DECISION_SERVICE_UNAVAILABLE", "INVALID_RESPONSE");
+      }
+
       if (response.status === "idle") {
         state = "OBSERVING";
         lastReason = response.reason;
@@ -2368,37 +3715,59 @@
       lastReason = response.reason;
       refreshPanel({ connected: true, action_id: currentActionId });
       const pending = journal.snapshot().pending_action;
+      let retryingSameAction = false;
       if (pending) {
         if (response.action_id === pending.action_id) {
-          duplicatePendingCount += 1;
-          if (duplicatePendingCount >= 2) {
-            return pause(
-              "DECISION_SERVICE_UNAVAILABLE",
-              "DUPLICATE_PENDING_RESPONSE",
-              { action_id: response.action_id },
-              observation,
-            );
+          if (recovery.phase === "not_executed") {
+            if (response.supersedes_action_id) {
+              return pause(
+                "DECISION_SERVICE_UNAVAILABLE",
+                "INVALID_RECOVERY_REISSUE",
+                {
+                  pending_action_id: pending.action_id,
+                  action_id: response.action_id,
+                  supersedes_action_id: response.supersedes_action_id,
+                },
+                observation,
+              );
+            }
+            if (pending.rejection_detail_code) {
+              unsafeResponseCount = Math.max(
+                unsafeResponseCount,
+                MotaLab.isFiniteInteger(pending.rejection_count) ? pending.rejection_count : 1,
+              );
+            }
+            duplicatePendingCount = 0;
+            retryingSameAction = true;
+          } else {
+            duplicatePendingCount += 1;
+            if (duplicatePendingCount >= 2) {
+              return pause(
+                "DECISION_SERVICE_UNAVAILABLE",
+                "DUPLICATE_PENDING_RESPONSE",
+                { action_id: response.action_id },
+                observation,
+              );
+            }
+            scheduleNext();
+            return { duplicate_pending: true, executed: false };
           }
-          scheduleNext();
-          return { duplicate_pending: true, executed: false };
-        }
-        if (recovery.phase !== "not_executed"
-          || response.supersedes_action_id !== pending.action_id) {
+        } else {
           return pause(
             "DECISION_SERVICE_UNAVAILABLE",
             "INVALID_RECOVERY_REISSUE",
-            { pending_action_id: pending.action_id, action_id: response.action_id },
+            {
+              pending_action_id: pending.action_id,
+              action_id: response.action_id,
+              supersedes_action_id: response.supersedes_action_id || null,
+            },
             observation,
           );
         }
-        if (pending.rejection_detail_code) {
-          unsafeResponseCount = Math.max(
-            unsafeResponseCount,
-            MotaLab.isFiniteInteger(pending.rejection_count) ? pending.rejection_count : 1,
-          );
+        if (!retryingSameAction) {
+          journal.abandonPending();
+          duplicatePendingCount = 0;
         }
-        journal.abandonPending();
-        duplicatePendingCount = 0;
       } else if (response.supersedes_action_id) {
         return pause(
           "DECISION_SERVICE_UNAVAILABLE",
@@ -2409,11 +3778,11 @@
       }
 
       const actionState = journal.actionState(response.action_id);
-      if (actionState === "completed") {
+      if (!retryingSameAction && actionState === "completed") {
         scheduleNext();
         return { duplicate_completed: true, executed: false };
       }
-      if (actionState) {
+      if (!retryingSameAction && actionState) {
         return pause(
           "DECISION_SERVICE_UNAVAILABLE",
           "STALE_ACTION_ID",
@@ -2451,7 +3820,14 @@
         planned = MotaLab.planOperations(response, freshObservation, registry, adapter);
         const allowUnknownFloor = response.expected_delta.floor_id === null
           && planned.length > 0 && planned[planned.length - 1].category === "stair";
-        MotaLab.validateExpectedDelta(response.expected_delta, { allowUnknownFloor });
+        const allowUnknownMapInstance = response.expected_delta.map_instance_id === null
+          && planned.length > 0 && planned[planned.length - 1].category === "stair";
+        MotaLab.validateExpectedDelta(response.expected_delta, {
+          allowUnknownFloor,
+          allowUnknownMapInstance,
+          dimensions: freshObservation.dimensions,
+          topology: freshObservation.topology,
+        });
         actionConstraints = MotaLab.validateActionPostconditions(planned, response.expected_delta);
       } catch (error) {
         if (MotaLab.isPauseError(error)
@@ -2464,6 +3840,8 @@
               pre_observation: MotaLab.cloneObservationForWire(freshObservation),
               guard: response.guard,
               expected_delta: response.expected_delta,
+              allow_unknown_floor: response.expected_delta.floor_id === null,
+              allow_unknown_map_instance: response.expected_delta.map_instance_id === null,
               requires_non_position_change: Boolean(
                 planned && planned.length > 0 && planned[planned.length - 1].boundary,
               ),
@@ -2491,6 +3869,7 @@
         expected_delta: response.expected_delta,
         requires_non_position_change: actionConstraints.requires_non_position_change,
         allow_unknown_floor: response.expected_delta.floor_id === null,
+        allow_unknown_map_instance: response.expected_delta.map_instance_id === null,
         operations: response.operations,
         operation_index: 0,
         phase: "prepared",
@@ -2541,6 +3920,7 @@
         {
           allowPositionChange: true,
           allowUnknownFloor: pendingRecord.allow_unknown_floor,
+          allowUnknownMapInstance: pendingRecord.allow_unknown_map_instance,
         },
       );
       if (!delta.ok) {
@@ -2574,29 +3954,104 @@
 
     async function reconnectOnly() {
       try {
+        if (journal.snapshot().corruption_required) {
+          return pause(
+            "GUARD_MISMATCH",
+            "JOURNAL_CORRUPT",
+            { reconnect_blocked: true },
+          );
+        }
+        if (journal.snapshot().migration_required) {
+          return pause(
+            "GUARD_MISMATCH",
+            "JOURNAL_V1_MIGRATION_REQUIRED",
+            { reconnect_blocked: true },
+          );
+        }
         const observation = capture();
         const fingerprint = MotaLab.fingerprintObservation(observation);
+        let snapshot = journal.snapshot();
+        const preparedRecovery = prepareRecovery(snapshot, fingerprint);
+        if (!preparedRecovery) return { connected: false, paused: true, executed: false };
+        const { recovery, completionRecord } = preparedRecovery;
+        snapshot = journal.snapshot();
+        const completedActionId = completionRecord ? completionRecord.action_id
+          : snapshot.last_completed_action
+          && snapshot.last_acknowledged_action_id !== snapshot.last_completed_action.action_id
+          ? snapshot.last_completed_action.action_id : null;
         const request = MotaLab.createCycleRequest({
           observation,
-          completedActionId: null,
-          recovery: {
-            phase: "none",
-            pending_action_id: null,
-            pre_fingerprint: null,
-            current_fingerprint: fingerprint,
-          },
+          completedActionId,
+          recovery,
+          intent: "reconnect_only",
+          session: snapshot.session_id ? Object.assign({
+            mode: snapshot.session_mode,
+            command: "observe",
+          }, snapshot.session_mode === "handoff_expected_guard" ? {
+            expected_guard: snapshot.expected_guard,
+          } : {}) : { mode: "new_game", command: "observe" },
         });
         const response = await client.postCycle(request);
+        if (response.status === "execute") {
+          const record = pause(
+            "DECISION_SERVICE_UNAVAILABLE", "RECONNECT_UNEXPECTED_EXECUTE",
+            {
+              response_status: response.status,
+              action_id: response.action_id,
+              response_fingerprint: `sha256:${MotaLab.sha256(MotaLab.canonicalize(response))}`,
+              guard: MotaLab.cloneJsonValue(response.guard),
+            },
+            observation,
+          );
+          return Object.assign(record, {
+            connected: false, response_status: "execute", executed: false,
+          });
+        }
+        if (response.status === "pause") {
+          const record = pause(
+            response.pause_kind, response.detail_code, response.details || {}, observation,
+          );
+          return Object.assign(record, { connected: false, response_status: "pause", executed: false });
+        }
+        if (response.status === "error") {
+          const record = pause(
+            "DECISION_SERVICE_UNAVAILABLE", response.error_code,
+            { reason: response.reason, errors: response.errors || [] }, observation,
+          );
+          return Object.assign(record, { connected: false, response_status: "error", executed: false });
+        }
+        if (completedActionId) {
+          if (response.status !== "idle" || response.acknowledged_action_id !== completedActionId) {
+            const record = pause(
+              "DECISION_SERVICE_UNAVAILABLE", "RECOVERY_ACK_MISSING",
+              { completed_action_id: completedActionId, response_status: response.status,
+                acknowledged_action_id: response.acknowledged_action_id || null }, observation,
+            );
+            return Object.assign(record, { connected: false, response_status: response.status, executed: false });
+          }
+          if (completionRecord) journal.markCompleted(completionRecord);
+          journal.acknowledge(completedActionId);
+        } else if (response.acknowledged_action_id) {
+          const record = pause(
+            "DECISION_SERVICE_UNAVAILABLE", "RECOVERY_ACK_IDENTITY_MISMATCH",
+            { acknowledged_action_id: response.acknowledged_action_id }, observation,
+          );
+          return Object.assign(record, { connected: false, response_status: response.status, executed: false });
+        }
         validateAndReplaceRegistry(response.registry_entries || [], observation);
+        if (response.scan_state) journal.setScanState(response.scan_state);
         lastReason = "localhost 重新连接成功；未执行返回行动";
         refreshPanel({ connected: true });
         return { connected: true, response_status: response.status, executed: false };
       } catch (error) {
-        return pause(
-          "DECISION_SERVICE_UNAVAILABLE",
-          error.detail_code || "CONNECTION_FAILED",
-          { message: error.message },
-        );
+        const record = MotaLab.isPauseError(error)
+          ? handleError(error)
+          : pause(
+            "DECISION_SERVICE_UNAVAILABLE",
+            error.detail_code || "CONNECTION_FAILED",
+            { message: error.message },
+          );
+        return Object.assign(record, { connected: false, executed: false });
       }
     }
 
@@ -2609,14 +4064,31 @@
       }
     }
 
+    function getLegacyArchive() {
+      const archive = journal.snapshot().legacy_archive;
+      return archive ? MotaLab.cloneJsonValue(archive) : null;
+    }
+
+    function getCorruptArchive() {
+      const archive = journal.snapshot().corrupt_archive;
+      return archive ? MotaLab.cloneJsonValue(archive) : null;
+    }
+
     return Object.freeze({
       initialize,
+      confirmBaseline,
+      archiveLegacyJournal,
+      beginV2AfterLegacyArchive,
+      archiveCorruptJournal,
+      beginV2AfterCorruptArchive,
       start,
       manualPause,
       clearPending,
       reconnectOnly,
       runSingleCycle,
       getCurrentObservation,
+      getLegacyArchive,
+      getCorruptArchive,
       getState: () => state,
     });
   };
@@ -2624,27 +4096,62 @@
   // Source: games/mota-planning-lab/src/main.js
 
   MotaLab.main = async function main() {
-    const adapter = MotaLab.createEngineAdapter();
-    const storage = {
-      get: (key, fallback) => GM_getValue(key, fallback),
-      set: (key, value) => GM_setValue(key, value),
-    };
-    const journal = MotaLab.createJournal(storage);
-    const registry = MotaLab.createBlockRegistry();
-    const client = MotaLab.createLocalhostClient(GM_xmlhttpRequest);
+    const environment = MotaLab.createRuntimeEnvironment(globalThis);
     const panel = MotaLab.createPanel(document);
+    try {
+      environment.assertAvailable();
+    } catch (error) {
+      const detailCode = error && error.detail_code
+        ? error.detail_code : "USERSCRIPT_API_UNAVAILABLE";
+      panel.update({
+        autopilot: false,
+        action_id: null,
+        location: null,
+        reason: detailCode,
+        connected: false,
+        pause_kind: "ENGINE_API_INCOMPATIBLE",
+      });
+      console.error("[Mota Planning Lab pause]", {
+        pause_kind: "ENGINE_API_INCOMPATIBLE",
+        detail_code: detailCode,
+        details: error && error.details ? error.details : {},
+      });
+      globalThis.__motaPlanningLab = Object.freeze({
+        controller: null,
+        capabilities: () => ({ runtime_environment: false }),
+        currentObservation: () => null,
+        mode: environment.mode,
+        available: false,
+      });
+      return;
+    }
+    const adapter = MotaLab.createEngineAdapter();
+    const journal = MotaLab.createJournal(environment.storage);
+    const registry = MotaLab.createBlockRegistry();
+    const client = MotaLab.createLocalhostClient(environment.request);
     const controller = MotaLab.createController(
       { adapter, journal, registry, client, panel },
       { autoSchedule: true },
     );
-    MotaLab.registerMenus({
-      register: GM_registerMenuCommand,
-      controller,
+    const exportCurrent = () => {
+      const observation = controller.getCurrentObservation();
+      if (observation) MotaLab.downloadObservation(observation);
+    };
+    panel.bindControls({
+      confirm: () => controller.confirmBaseline({ mode: "new_game" }),
+      start: () => controller.start(),
+      pause: () => controller.manualPause(),
+      reconnect: () => controller.reconnectOnly(),
+      export: exportCurrent,
     });
+    if (environment.registerMenu) {
+      MotaLab.registerMenus({ register: environment.registerMenu, controller });
+    }
     globalThis.__motaPlanningLab = Object.freeze({
       controller,
       capabilities: () => adapter.capabilities(),
       currentObservation: () => controller.getCurrentObservation(),
+      mode: environment.mode,
     });
     await controller.initialize();
   };

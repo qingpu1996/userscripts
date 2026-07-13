@@ -80,14 +80,28 @@ def make_observation(
     busy: bool = False,
     blocks: Optional[List[Dict[str, Any]]] = None,
     captured_at: int = 1234567890,
+    width: int = 11,
+    height: int = 11,
+    session_id: str = "test-session",
+    map_instance_id: Optional[str] = None,
+    valid_cells: Optional[List[Dict[str, int]]] = None,
 ) -> Dict[str, Any]:
     return {
-        "protocol": 1,
+        "protocol": 2,
         "page": "/games/24/",
+        "session_id": session_id,
         "floor_id": floor_id,
         "floor_name": floor_name,
         "floor_number": floor_number,
-        "dimensions": {"width": 11, "height": 11},
+        "dimensions": {"width": width, "height": height},
+        "topology": {
+            "kind": "rectangle" if valid_cells is None else "valid_cells",
+            **({} if valid_cells is None else {"valid_cells": copy.deepcopy(valid_cells)}),
+            "source": "engine_current_map",
+            "confidence": "confirmed",
+        },
+        "topology_fingerprint": "sha256:" + "1" * 64,
+        "map_instance_id": map_instance_id or f"{floor_id}@" + "1" * 16,
         "hero": {
             "hp": hp,
             "attack": attack,
@@ -106,6 +120,7 @@ def make_observation(
 def make_request(observation: Dict[str, Any], **overrides: Any) -> Dict[str, Any]:
     payload = {
         "source": "mota-planning-lab-userscript",
+        "intent": "cycle",
         "completed_action_id": None,
         "observation": observation,
         "recovery": {
@@ -115,6 +130,7 @@ def make_request(observation: Dict[str, Any], **overrides: Any) -> Dict[str, Any
             "current_fingerprint": None,
             "detail_code": None,
         },
+        "session": {"mode": "new_game", "command": "confirm"},
     }
     payload.update(overrides)
     return payload

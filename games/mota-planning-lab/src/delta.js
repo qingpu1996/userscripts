@@ -4,7 +4,7 @@ MotaLab.validateExpectedDelta = function validateExpectedDelta(expected, options
   }
   const allowed = new Set([
     "hp", "attack", "defense", "gold", "experience", "keys",
-    "position", "floor_id", "removed_blocks", "added_blocks",
+    "position", "floor_id", "map_instance_id", "removed_blocks", "added_blocks",
   ]);
   for (const key of Object.keys(expected)) {
     if (!allowed.has(key)) throw new TypeError(`Unsupported expected_delta field: ${key}`);
@@ -26,7 +26,10 @@ MotaLab.validateExpectedDelta = function validateExpectedDelta(expected, options
     }
   }
   if (expected.position !== undefined) {
-    MotaLab.validateResponsePosition(expected.position, "expected_delta.position", false);
+    if (!options.dimensions) throw new TypeError("dimensions required for expected position");
+    MotaLab.validateResponsePosition(
+      expected.position, "expected_delta.position", false, options.dimensions, options.topology,
+    );
   }
   if (expected.floor_id !== undefined) {
     if (expected.floor_id === null) {
@@ -36,11 +39,29 @@ MotaLab.validateExpectedDelta = function validateExpectedDelta(expected, options
       throw new TypeError("Invalid expected floor_id");
     }
   }
+  if (expected.map_instance_id !== undefined) {
+    if (expected.map_instance_id === null) {
+      if (options.allowUnknownMapInstance !== true) {
+        throw new TypeError("Unknown map_instance_id is only allowed for map transitions");
+      }
+    } else if (typeof expected.map_instance_id !== "string"
+      || expected.map_instance_id.length < 1 || expected.map_instance_id.length > 256) {
+      throw new TypeError("Invalid expected map_instance_id");
+    }
+    if (expected.removed_blocks !== undefined || expected.added_blocks !== undefined) {
+      throw new TypeError("Map transition cannot compare blocks from different instances");
+    }
+  }
   for (const field of ["removed_blocks", "added_blocks"]) {
     if (expected[field] !== undefined && !Array.isArray(expected[field])) {
       throw new TypeError(`Invalid ${field}`);
     }
-    if ((expected[field] || []).length > MotaLab.MAP_WIDTH * MotaLab.MAP_HEIGHT) {
+    const dimensions = options.dimensions;
+    if (expected[field] !== undefined && !dimensions) {
+      throw new TypeError("dimensions required for block references");
+    }
+    if (!dimensions) continue;
+    if ((expected[field] || []).length > dimensions.width * dimensions.height) {
       throw new TypeError(`Invalid ${field}`);
     }
     for (const block of expected[field] || []) {
@@ -51,8 +72,8 @@ MotaLab.validateExpectedDelta = function validateExpectedDelta(expected, options
         `${field} block reference`,
       );
       if (!MotaLab.isFiniteInteger(block.x) || !MotaLab.isFiniteInteger(block.y)
-        || block.x < 0 || block.x >= MotaLab.MAP_WIDTH
-        || block.y < 0 || block.y >= MotaLab.MAP_HEIGHT
+        || block.x < 0 || block.x >= dimensions.width
+        || block.y < 0 || block.y >= dimensions.height
         || typeof block.id !== "string" || block.id.length === 0 || block.id.length > 256
         || (block.cls !== undefined
           && (typeof block.cls !== "string" || block.cls.length === 0 || block.cls.length > 256))
@@ -88,7 +109,10 @@ MotaLab.compareBlockRefs = function compareBlockRefs(references, actualBlocks) {
 };
 
 MotaLab.compareExpectedDelta = function compareExpectedDelta(before, after, expected, options = {}) {
-  MotaLab.validateExpectedDelta(expected, options);
+  MotaLab.validateExpectedDelta(expected, Object.assign({
+    dimensions: before.dimensions,
+    topology: before.topology,
+  }, options));
   const differences = [];
   function compare(field, expectedValue, actualValue) {
     if (expectedValue !== actualValue) differences.push({ field, expected: expectedValue, actual: actualValue });
@@ -103,12 +127,23 @@ MotaLab.compareExpectedDelta = function compareExpectedDelta(before, after, expe
     compare(`keys.${color}`, before.keys[color] + delta, after.keys[color]);
   }
 
+  const mapInstanceChanged = before.map_instance_id !== after.map_instance_id;
+  if (expected.map_instance_id === null && options.allowUnknownMapInstance === true) {
+    if (!mapInstanceChanged) {
+      differences.push({ field: "map_instance_id", expected: `different from ${before.map_instance_id}`, actual: after.map_instance_id });
+    }
+  } else if (expected.map_instance_id !== undefined) {
+    compare("map_instance_id", expected.map_instance_id, after.map_instance_id);
+  } else if (expected.floor_id === undefined) {
+    compare("map_instance_id", before.map_instance_id, after.map_instance_id);
+  }
+
   if (expected.floor_id === null && options.allowUnknownFloor === true) {
-    if (after.floor_id === before.floor_id) {
-      differences.push({ field: "floor_id", expected: `different from ${before.floor_id}`, actual: after.floor_id });
+    if (!mapInstanceChanged) {
+      differences.push({ field: "map_instance_id", expected: "a different map instance", actual: after.map_instance_id });
     }
   } else if (expected.floor_id !== undefined) compare("floor_id", String(expected.floor_id), after.floor_id);
-  else compare("floor_id", before.floor_id, after.floor_id);
+  else if (!mapInstanceChanged) compare("floor_id", before.floor_id, after.floor_id);
 
   if (expected.position !== undefined) {
     compare("position.x", expected.position.x, after.hero.loc.x);
@@ -121,7 +156,13 @@ MotaLab.compareExpectedDelta = function compareExpectedDelta(before, after, expe
     compare("position.y", before.hero.loc.y, after.hero.loc.y);
   }
 
-  const floorChanged = before.floor_id !== after.floor_id;
+  if (mapInstanceChanged) {
+    return {
+      ok: differences.length === 0,
+      differences,
+      actual: { map_instance_changed: true, removed: [], added: [] },
+    };
+  }
   const beforeByCoordinate = new Map(before.blocks.map((block) => [`${block.x},${block.y}`, block]));
   const afterByCoordinate = new Map(after.blocks.map((block) => [`${block.x},${block.y}`, block]));
   const coordinates = new Set([...beforeByCoordinate.keys(), ...afterByCoordinate.keys()]);
@@ -137,12 +178,10 @@ MotaLab.compareExpectedDelta = function compareExpectedDelta(before, after, expe
   }
   const expectedRemoved = expected.removed_blocks || [];
   const expectedAdded = expected.added_blocks || [];
-  if ((!floorChanged || expected.removed_blocks !== undefined)
-    && !MotaLab.compareBlockRefs(expectedRemoved, removed)) {
+  if (!MotaLab.compareBlockRefs(expectedRemoved, removed)) {
     differences.push({ field: "removed_blocks", expected: expectedRemoved, actual: removed });
   }
-  if ((!floorChanged || expected.added_blocks !== undefined)
-    && !MotaLab.compareBlockRefs(expectedAdded, added)) {
+  if (!MotaLab.compareBlockRefs(expectedAdded, added)) {
     differences.push({ field: "added_blocks", expected: expectedAdded, actual: added });
   }
 
@@ -171,6 +210,7 @@ MotaLab.hasVerifiableNonPositionPostcondition = function hasVerifiableNonPositio
     }
   }
   if (Object.prototype.hasOwnProperty.call(expected, "floor_id")) return true;
+  if (Object.prototype.hasOwnProperty.call(expected, "map_instance_id")) return true;
   return ["removed_blocks", "added_blocks"].some(
     (field) => Array.isArray(expected[field]) && expected[field].length > 0,
   );
@@ -194,8 +234,9 @@ MotaLab.validateActionPostconditions = function validateActionPostconditions(pla
       }
     }
     if (finalStep.category === "stair"
-      && !Object.prototype.hasOwnProperty.call(expected, "floor_id")) {
-      throw new TypeError("Stair boundary must declare floor_id");
+      && !Object.prototype.hasOwnProperty.call(expected, "floor_id")
+      && !Object.prototype.hasOwnProperty.call(expected, "map_instance_id")) {
+      throw new TypeError("Stair boundary must declare a map transition");
     }
     return { requires_non_position_change: true };
   }

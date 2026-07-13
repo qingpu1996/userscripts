@@ -1,0 +1,43 @@
+{
+  "run": "2026-07-14-runtime-v2-fix-7",
+  "status": "pass",
+  "targeted": {
+    "journal_dual_slot": {"passed": 9, "failed": 0},
+    "javascript_total": {"passed": 97, "failed": 0},
+    "static_ast": "pass"
+  },
+  "full_offline_qa": {
+    "javascript": {"passed": 97, "failed": 0},
+    "python": {"passed": 90, "failed": 0},
+    "integration": {"passed": 1, "failed": 0},
+    "total": {"passed": 188, "failed": 0},
+    "fixtures_and_schema": "pass",
+    "protocol_wire": "pass",
+    "compile_and_syntax": "pass",
+    "deterministic_builds": "pass",
+    "static_ast": "pass",
+    "docs_json": "pass",
+    "diff_check": "pass",
+    "prospective_index": "pass"
+  },
+  "artifacts": {
+    "userscript": {"lines": 4160, "bytes": 170752, "sha256": "50911bfc0d9b5867c86046af4a2acdbec24affb967a847978f5e6b6365bc4417"},
+    "direct_mount": {"lines": 4103, "bytes": 161286, "sha256": "7d5b5ee433cbb7c72fd6c4126839955eeff5dcb633c306407a41f48fd7007f7e"}
+  },
+  "vendor": {
+    "name": "acorn",
+    "version": "8.16.0",
+    "license": "MIT",
+    "parser_sha256": "efb0124a960b34d53f9928c4926bfcfd300bb6a3d7ab64ee949b3a8bed1c7e5f",
+    "license_sha256": "76a876cf886ff9be2a8b5e2e86514fed06223c8c9f0c1e9ee9606e93841e00b7",
+    "provenance_sha256": "5a848c0a053f52a1cd9802aef0708ac49d35545730e892e3f72a71e059f3ef69"
+  },
+  "git": {
+    "branch": "codex/mota-planning-lab-runtime-v2",
+    "head": "fed28f7c6407e81ca65858ce91dda08858d7ad84",
+    "real_index_sha256_before": "2add78eb6b7ee74c43de89114e97b262f6b36b2a8fa2a242e2879fd62c7515a9",
+    "real_index_sha256_after": "2add78eb6b7ee74c43de89114e97b262f6b36b2a8fa2a242e2879fd62c7515a9"
+  },
+  "live_browser": "not-run",
+  "network": "not-used"
+}

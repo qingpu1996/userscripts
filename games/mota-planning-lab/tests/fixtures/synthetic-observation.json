@@ -6,8 +6,9 @@
     "warning": "This invented observation is only for contract and integration tests."
   },
   "observation": {
-    "protocol": 1,
+    "protocol": 2,
     "page": "/games/24/",
+    "session_id": "SESSION-SYNTHETIC-0001",
     "floor_id": "synthetic-floor-4",
     "floor_name": "Synthetic 4F",
     "floor_number": 4,
@@ -15,6 +16,13 @@
       "width": 11,
       "height": 11
     },
+    "topology": {
+      "kind": "rectangle",
+      "source": "engine_current_map",
+      "confidence": "confirmed"
+    },
+    "topology_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "map_instance_id": "map:synthetic-floor-4:topology-a",
     "hero": {
       "hp": 208,
       "attack": 23,

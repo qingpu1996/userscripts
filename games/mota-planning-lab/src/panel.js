@@ -1,7 +1,7 @@
 MotaLab.createPanel = function createPanel(documentObject) {
   const doc = documentObject;
   if (!doc || !doc.body) {
-    return Object.freeze({ update() {}, setCollapsed() {} });
+    return Object.freeze({ update() {}, setCollapsed() {}, bindControls() {} });
   }
   if (!doc.getElementById(MotaLab.STYLE_ID)) {
     const style = doc.createElement("style");
@@ -18,6 +18,8 @@ MotaLab.createPanel = function createPanel(documentObject) {
       #${MotaLab.PANEL_ID}.collapsed .ml-body{display:none}
       #${MotaLab.PANEL_ID} .ml-label{color:#9ca3af}
       #${MotaLab.PANEL_ID} .ml-value{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #${MotaLab.PANEL_ID} .ml-controls{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:3px;margin-top:4px}
+      #${MotaLab.PANEL_ID} .ml-controls button{border:1px solid #52606d;border-radius:3px;padding:2px 4px}
       #${MotaLab.PANEL_ID} .ml-bad{color:#fca5a5}.ml-good{color:#86efac}
     `;
     doc.head.appendChild(style);
@@ -54,6 +56,22 @@ MotaLab.createPanel = function createPanel(documentObject) {
     fields[key] = valueNode;
     body.append(labelNode, valueNode);
   }
+  const controls = doc.createElement("div");
+  controls.className = "ml-controls";
+  const controlHandlers = Object.create(null);
+  for (const [key, label] of [
+    ["confirm", "确认基线"], ["start", "启动"], ["pause", "暂停"],
+    ["reconnect", "重连"], ["export", "导出"],
+  ]) {
+    const button = doc.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.addEventListener("click", () => {
+      if (typeof controlHandlers[key] === "function") controlHandlers[key]();
+    });
+    controls.appendChild(button);
+  }
+  body.appendChild(controls);
   root.append(head, body);
   doc.body.appendChild(root);
 
@@ -79,5 +97,8 @@ MotaLab.createPanel = function createPanel(documentObject) {
     setField("service", state.connected ? "已连接" : "断开", state.connected ? "ml-good" : "ml-bad");
     setField("pause", state.pause_kind, state.pause_kind ? "ml-bad" : "");
   }
-  return Object.freeze({ update, setCollapsed, element: root });
+  function bindControls(handlers) {
+    Object.assign(controlHandlers, handlers || {});
+  }
+  return Object.freeze({ update, setCollapsed, bindControls, element: root });
 };

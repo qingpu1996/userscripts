@@ -32,7 +32,9 @@ MotaLab.findSafePath = function findSafePath(observation, registry, start, targe
       const x = current.x + dx;
       const y = current.y + dy;
       const key = MotaLab.coordinateKey(x, y);
-      if (x < 0 || y < 0 || x >= MotaLab.MAP_WIDTH || y >= MotaLab.MAP_HEIGHT
+      const validCells = MotaLab.validCellSet(observation.topology);
+      if (x < 0 || y < 0 || x >= observation.dimensions.width || y >= observation.dimensions.height
+        || (validCells && !validCells.has(key))
         || previous.has(key) || !cellAllowed(x, y)) continue;
       previous.set(key, currentKey);
       queue.push({ x, y });
@@ -153,7 +155,14 @@ MotaLab.executeAction = async function executeAction({
   const plan = MotaLab.planOperations(action, initialObservation, registry, adapter);
   const allowUnknownFloor = action.expected_delta.floor_id === null
     && plan.length > 0 && plan[plan.length - 1].category === "stair";
-  MotaLab.validateExpectedDelta(action.expected_delta, { allowUnknownFloor });
+  const allowUnknownMapInstance = action.expected_delta.map_instance_id === null
+    && plan.length > 0 && plan[plan.length - 1].category === "stair";
+  MotaLab.validateExpectedDelta(action.expected_delta, {
+    allowUnknownFloor,
+    allowUnknownMapInstance,
+    dimensions: initialObservation.dimensions,
+    topology: initialObservation.topology,
+  });
   let beforeStep = initialObservation;
   let beforeFingerprint = MotaLab.fingerprintObservation(beforeStep);
 

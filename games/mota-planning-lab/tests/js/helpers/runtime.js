@@ -36,12 +36,20 @@ function loadRuntime() {
 
 function makeObservation(overrides = {}) {
   const base = {
-    protocol: 1,
+    protocol: 2,
     page: "/games/24/",
+    session_id: "SESSION-SYNTHETIC-0001",
     floor_id: "synthetic-floor-4",
     floor_name: "4F",
     floor_number: 4,
     dimensions: { width: 11, height: 11 },
+    topology: {
+      kind: "rectangle",
+      source: "engine_current_map",
+      confidence: "confirmed",
+    },
+    topology_fingerprint: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    map_instance_id: "map:synthetic-floor-4:topology-a",
     hero: {
       hp: 208,
       attack: 23,
@@ -70,8 +78,12 @@ function makeObservation(overrides = {}) {
 
 function makeGuard(observation = makeObservation()) {
   return {
+    session_id: "SESSION-SYNTHETIC-0001",
     floor_id: observation.floor_id,
     floor: observation.floor_number,
+    map_instance_id: observation.map_instance_id,
+    dimensions: Object.assign({}, observation.dimensions),
+    topology_fingerprint: observation.topology_fingerprint,
     position: {
       x: observation.hero.loc.x,
       y: observation.hero.loc.y,
@@ -107,7 +119,7 @@ function makePoisonCore(options = {}) {
     loc: { x: 8, y: 3, direction: "down" },
     items: { keys: { yellowKey: 4, blueKey: 1, redKey: 0 } },
   };
-  const currentMap = options.currentMap || { title: "4F" };
+  const currentMap = Object.assign({ title: "4F", width: 11, height: 11 }, options.currentMap || {});
   const maps = new Proxy({}, {
     get(_target, key) {
       calls.mapKeys.push(String(key));

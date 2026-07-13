@@ -79,6 +79,17 @@ def response_schema() -> dict:
     )
 
 
+def upgrade_execute_fixture(execute: dict) -> dict:
+    execute = copy.deepcopy(execute)
+    execute["guard"].update(
+        session_id="test-session",
+        map_instance_id="synthetic-floor@1111111111111111",
+        dimensions={"width": 11, "height": 11},
+        topology_fingerprint="sha256:" + "1" * 64,
+    )
+    return execute
+
+
 class ProtocolModelTests(unittest.TestCase):
     def test_valid_observation_and_nullable_enemy_attack_defense(self) -> None:
         block = make_block(
@@ -177,11 +188,19 @@ class ProtocolModelTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CycleRequest.model_validate(make_request(make_observation(blocks=[block])))
 
-    def test_dimensions_and_coordinates_are_strict_11_by_11(self) -> None:
-        wrong = make_observation()
-        wrong["dimensions"]["width"] = 12
-        with self.assertRaises(ValidationError):
-            Observation.model_validate(wrong)
+    def test_cycle_intent_is_strict_and_reconnect_only_is_explicit(self) -> None:
+        normal = CycleRequest.model_validate(make_request(make_observation()))
+        self.assertEqual(normal.intent, "cycle")
+        reconnect = make_request(make_observation(), intent="reconnect_only")
+        self.assertEqual(CycleRequest.model_validate(reconnect).intent, "reconnect_only")
+        for invalid in (None, "observe", 1):
+            payload = make_request(make_observation(), intent=invalid)
+            with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
+                CycleRequest.model_validate(payload)
+
+    def test_dimensions_and_coordinates_follow_dynamic_bounds(self) -> None:
+        self.assertEqual(Observation.model_validate(make_observation(width=13, height=13)).dimensions.width, 13)
+        self.assertEqual(Observation.model_validate(make_observation(width=7, height=19)).dimensions.height, 19)
         out_of_bounds = make_observation(blocks=[make_block(x=11, y=0)])
         with self.assertRaises(ValidationError):
             Observation.model_validate(out_of_bounds)
@@ -210,6 +229,8 @@ class ProtocolModelTests(unittest.TestCase):
                 "UNSUPPORTED_INTERACTION",
                 "DECISION_SERVICE_UNAVAILABLE",
                 "ENGINE_API_INCOMPATIBLE",
+                "SESSION_CONFIRMATION_REQUIRED",
+                "PLANNING_BUDGET_EXHAUSTED",
             },
         )
 
@@ -220,7 +241,7 @@ class ProtocolModelTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        execute = fixtures["execute"]
+        execute = upgrade_execute_fixture(fixtures["execute"])
         execute["registry_entries"] = [
             {
                 "id": "syntheticRedPotion",
@@ -273,6 +294,16 @@ class ProtocolModelTests(unittest.TestCase):
                 {"status": "error", "error_code": "BAD", "reason": "bad", "extra": True}
             )
 
+        for model, payload in (
+            (ExecuteResponse, execute),
+            (PauseResponse, fixtures["pause"]),
+            (IdleResponse, fixtures["idle"]),
+        ):
+            explicit_null_scan = copy.deepcopy(payload)
+            explicit_null_scan["scan_state"] = None
+            with self.subTest(model=model.__name__), self.assertRaises(ValidationError):
+                model.model_validate(explicit_null_scan)
+
     def test_response_serialization_preserves_required_nulls_and_omits_unset_optionals(self) -> None:
         project_dir = Path(__file__).resolve().parents[2]
         fixtures = json.loads(
@@ -290,7 +321,7 @@ class ProtocolModelTests(unittest.TestCase):
             "fast_path": False,
             "version": 1,
         }
-        execute_fixture = copy.deepcopy(fixtures["execute"])
+        execute_fixture = upgrade_execute_fixture(fixtures["execute"])
         execute_fixture["guard"]["floor"] = None
         execute_fixture["registry_entries"] = [registry_entry]
         responses = [
@@ -391,6 +422,8 @@ class ApiBoundaryTests(unittest.TestCase):
         text = response.text
         self.assertNotIn("must-not-echo", text)
         self.assertEqual(response.json()["error_code"], "SCHEMA_REJECTED")
+        self.assertIn("protocol 2", response.json()["reason"])
+        self.assertNotIn("protocol 1", response.json()["reason"])
 
     def test_only_cycle_route_is_exposed(self) -> None:
         self.assertEqual(self.client.get("/docs").status_code, 404)
