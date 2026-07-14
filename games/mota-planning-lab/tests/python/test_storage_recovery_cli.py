@@ -134,7 +134,7 @@ class StorageAndRecoveryTests(unittest.TestCase):
         finally:
             restarted.store.close()
 
-    def test_completed_roundtrip_reissues_unique_persistent_action_ids(self) -> None:
+    def test_completed_verified_stair_roundtrip_is_idle_and_restart_stable(self) -> None:
         stair = make_block(
             x=1,
             y=0,
@@ -193,12 +193,13 @@ class StorageAndRecoveryTests(unittest.TestCase):
         complete(first_coordinator, first["action_id"])
 
         second = first_coordinator.cycle(CycleRequest.model_validate(make_request(pre)))
-        self.assertNotEqual(second["action_id"], first["action_id"])
+        self.assertEqual(second["status"], "idle")
+        self.assertNotIn("action_id", second)
         self.assertEqual(
             first_coordinator.cycle(CycleRequest.model_validate(make_request(pre))),
             second,
         )
-        self.assertEqual(ledger_counts(first_coordinator), (2, 1))
+        self.assertEqual(ledger_counts(first_coordinator), (1, 1))
         first_coordinator.store.close()
 
         restarted = CycleCoordinator(settings)
@@ -207,11 +208,7 @@ class StorageAndRecoveryTests(unittest.TestCase):
                 restarted.cycle(CycleRequest.model_validate(make_request(pre))),
                 second,
             )
-            self.assertEqual(ledger_counts(restarted), (2, 1))
-            complete(restarted, second["action_id"])
-            third = restarted.cycle(CycleRequest.model_validate(make_request(pre)))
-            self.assertNotIn(third["action_id"], {first["action_id"], second["action_id"]})
-            self.assertEqual(ledger_counts(restarted), (3, 1))
+            self.assertEqual(ledger_counts(restarted), (1, 1))
         finally:
             restarted.store.close()
 

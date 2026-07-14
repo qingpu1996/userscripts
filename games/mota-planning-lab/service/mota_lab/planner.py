@@ -45,6 +45,8 @@ class PlannedBoundary:
 @dataclass(frozen=True)
 class WorldSearchResult:
     first: PlannedBoundary
+    target: PlannedBoundary
+    target_map_instance_id: str
     score: float
     explored_nodes: int
     path_length: int
@@ -64,7 +66,10 @@ PROGRESS_BONUS = {
     "door": 30.0,
     "resource": 10.0,
     "enemy": 5.0,
-    "stair": 100.0,
+    # A verified stair is transport, not progress.  Opaque stairs are still
+    # discovered by the takeover scan, while verified stairs receive value
+    # only from an executable downstream frontier.
+    "stair": 0.0,
     "npc": 20.0,
     "mechanism": 20.0,
     "other": 0.0,
@@ -353,9 +358,6 @@ class Planner:
         scanned = set(str(item) for item in scan_state.get("scanned_map_instance_ids", []))
         scanned.add(observation.map_instance_id)
         traversed = list(scan_state.get("traversed_transitions", []))
-        traversed_keys = {
-            self._transition_key(item) for item in traversed if isinstance(item, Mapping)
-        }
         transitions = [
             item for item in world_context.get("transitions", []) if isinstance(item, Mapping)
         ]
@@ -422,22 +424,10 @@ class Planner:
                         "block_id": boundary.block.id, "target_floor_number_hint": None,
                     })
                     continue
-                valid_targets = [item for item in valid_targets if item[2] not in traversed_keys]
-                if not valid_targets:
-                    continue
-                for edge, target, key in valid_targets:
-                    pending.append({
-                        "kind": "verified",
-                        "from_map_instance_id": map_id,
-                        "from_x": boundary.block.x,
-                        "from_y": boundary.block.y,
-                        "block_id": boundary.block.id,
-                        "to_map_instance_id": target.map_instance_id,
-                        "to_x": key[4],
-                        "to_y": key[5],
-                        "target_floor_id": target.floor_id,
-                        "target_floor_number_hint": target.floor_number,
-                    })
+                # A unique verified edge is already discovered.  It is not a
+                # scan frontier of its own and must never be traversed merely
+                # to mark the edge as progress.  _plan_scan may still use it
+                # as a BFS repositioning edge toward a different opaque exit.
         phase = "complete" if not pending else ("discover" if len(scanned) == 1 else "sweep")
         hints = sorted(
             item["target_floor_number_hint"] for item in pending
@@ -676,6 +666,10 @@ class Planner:
             0,
         )])
         seen = set()
+        root_state_key = (
+            observation.map_instance_id, initial_position, initial_resources, frozenset()
+        )
+        best_enqueued_score = {root_state_key: 0.0}
         best: Optional[WorldSearchResult] = None
         explored = 0
         exhausted = False
@@ -732,33 +726,59 @@ class Planner:
                     ),
                 )
                 first_candidate = first or candidate
+                path_length = depth + 1
+                transition_rows = transitions.get(
+                    (map_id, boundary.block.x, boundary.block.y), []
+                ) if label.category == "stair" else []
+                valid_transition_successors = []
+                for edge in transition_rows:
+                    target_id = str(edge.get("to_map_instance_id"))
+                    if target_id not in facts:
+                        continue
+                    try:
+                        target_position = (int(edge.get("to_x")), int(edge.get("to_y")))
+                    except (TypeError, ValueError):
+                        continue
+                    if not self._valid_position(facts[target_id], *target_position):
+                        continue
+                    valid_transition_successors.append((target_id, target_position))
+                valid_transition_successors = sorted(set(valid_transition_successors))
+                if len(valid_transition_successors) > 1:
+                    # Conflicting observed targets are never guessed inside a
+                    # historical branch.  A current ambiguous exit is handled
+                    # by the explicit fail-closed pause in plan().
+                    continue
+                if valid_transition_successors:
+                    # A verified transition has exactly zero reward and is not
+                    # a terminal candidate.  Check dominance before enqueueing
+                    # so A->B->A cannot manufacture progress or a candidate.
+                    for target_id, target_position in valid_transition_successors:
+                        successor_key = (target_id, target_position, next_resources, removed)
+                        if successor_key in seen:
+                            continue
+                        previous_score = best_enqueued_score.get(successor_key)
+                        if previous_score is not None and previous_score >= score:
+                            continue
+                        best_enqueued_score[successor_key] = score
+                        queue.append((
+                            target_id, target_position, next_resources, removed,
+                            score, first_candidate, path_length,
+                        ))
+                    continue
+
                 next_score = score + value_delta(
                     delta,
                     distance=boundary.distance,
                     progress_bonus=PROGRESS_BONUS.get(label.category, 0.0),
                 )
-                path_length = depth + 1
                 if best is None or (next_score, -path_length) > (best.score, -best.path_length):
-                    best = WorldSearchResult(first_candidate, next_score, explored, path_length)
+                    best = WorldSearchResult(
+                        first_candidate, candidate, map_id, next_score, explored, path_length
+                    )
 
                 if label.category == "enemy":
                     # A live combat boundary is one atomic terminal candidate.
                     # Its outcome cannot authorize any simulated successor.
-                    continue
-
-                transition_rows = transitions.get(
-                    (map_id, boundary.block.x, boundary.block.y), []
-                ) if label.category == "stair" else []
-                if transition_rows:
-                    for edge in transition_rows:
-                        target_id = str(edge.get("to_map_instance_id"))
-                        if target_id not in facts:
-                            continue
-                        target_position = (int(edge.get("to_x")), int(edge.get("to_y")))
-                        if not self._valid_position(facts[target_id], *target_position):
-                            continue
-                        queue.append((target_id, target_position, next_resources, removed,
-                                      next_score + 25.0, first_candidate, path_length))
                     continue
                 if label.category == "stair":
                     # Unknown destination is opaque.  The branch ends at the
@@ -768,10 +788,21 @@ class Planner:
                 consumed = removed | frozenset({(
                     map_id, boundary.block.x, boundary.block.y, boundary.block.id,
                 )})
-                queue.append((map_id, (boundary.block.x, boundary.block.y), next_resources,
+                successor_position = (boundary.block.x, boundary.block.y)
+                successor_key = (map_id, successor_position, next_resources, consumed)
+                previous_score = best_enqueued_score.get(successor_key)
+                if successor_key in seen or (
+                    previous_score is not None and previous_score >= next_score
+                ):
+                    continue
+                best_enqueued_score[successor_key] = next_score
+                queue.append((map_id, successor_position, next_resources,
                               consumed, next_score, first_candidate, path_length))
         if best is not None:
-            best = WorldSearchResult(best.first, best.score, explored, best.path_length)
+            best = WorldSearchResult(
+                best.first, best.target, best.target_map_instance_id,
+                best.score, explored, best.path_length,
+            )
         return best, exhausted
 
     def plan(
@@ -920,36 +951,47 @@ class Planner:
         # frontier exactly once.
         initial = ResourceState.from_observation(observation)
         scored = []
-        transitions = [] if world_context is None else list(world_context.get("transitions", []))
-        known_transition_exits = {
-            (row.get("from_x"), row.get("from_y"))
-            for row in transitions
-            if row.get("from_map_instance_id") == observation.map_instance_id
-        }
+        known_transition_exits = set()
+        ambiguous_transition_exits = set()
+        for item in planned:
+            if item.boundary.label.category != "stair":
+                continue
+            target_kind, _target = self._resolved_exit_target(
+                observation, item.boundary.block, world_context or {},
+            )
+            coordinate = (item.boundary.block.x, item.boundary.block.y)
+            if target_kind == "exact":
+                known_transition_exits.add(coordinate)
+            elif target_kind == "ambiguous":
+                ambiguous_transition_exits.add(coordinate)
+        if ambiguous_transition_exits:
+            x, y = min(ambiguous_transition_exits, key=lambda item: (item[1], item[0]))
+            return self._pause(
+                PauseKind.EXPECTED_DELTA_MISMATCH,
+                "TRANSITION_TARGET_AMBIGUOUS",
+                "同一出口存在多个冲突目标；保持 opaque 并暂停等待审计。",
+                registry_entries,
+                map_instance_id=observation.map_instance_id, x=x, y=y,
+            )
         for item in planned:
             candidate = item.search_candidate
             next_state = apply_delta(initial, candidate.delta)
             if next_state is None:
+                continue
+            if (
+                item.boundary.label.category == "stair"
+                and (item.boundary.block.x, item.boundary.block.y) in known_transition_exits
+            ):
+                # A verified transition may be selected only when world search
+                # proves a downstream executable frontier.  It is never a
+                # standalone fallback candidate.
                 continue
             score = value_delta(
                 candidate.delta,
                 distance=candidate.distance,
                 progress_bonus=candidate.progress_bonus,
             )
-            if (
-                item.boundary.label.category == "stair"
-                and (item.boundary.block.x, item.boundary.block.y) in known_transition_exits
-            ):
-                score += 25.0
             scored.append((score, -candidate.distance, item))
-        if not scored:
-            if unsupported:
-                return self._pause_for_unsupported(unsupported, registry_entries)
-            return IdleResponse(
-                status="idle",
-                reason="当前已知边界都会导致生命归零或资源不足，保持现场不行动。",
-                registry_entries=registry_entries,
-            )
         if len(scored) > self.planning_budget:
             return self._pause(
                 PauseKind.PLANNING_BUDGET_EXHAUSTED,
@@ -970,11 +1012,24 @@ class Planner:
                     registry_entries,
                     planning_budget=self.planning_budget,
                 )
+        if world_result is None and not scored:
+            if unsupported:
+                return self._pause_for_unsupported(unsupported, registry_entries)
+            return IdleResponse(
+                status="idle",
+                reason=(
+                    "当前没有可执行的实际进展；已验证跨图边仅作通往远端目标的中间边，"
+                    "不会因往返本身签发行动。"
+                ),
+                registry_entries=registry_entries,
+            )
         if world_result is not None:
             selected = world_result.first
             selected_score = world_result.score
             explored_nodes = world_result.explored_nodes
             path_length = world_result.path_length
+            world_target = world_result.target
+            world_target_map_id = world_result.target_map_instance_id
         else:
             explored_nodes = len(scored)
             selected_score, _, selected = max(
@@ -982,6 +1037,8 @@ class Planner:
                 key=lambda row: (row[0], row[1], -row[2].boundary.block.y, -row[2].boundary.block.x),
             )
             path_length = 1
+            world_target = selected
+            world_target_map_id = observation.map_instance_id
         block = selected.boundary.block
         label = selected.boundary.label
         action_kind = ACTION_KINDS.get(label.category, "MOVE_TO_BOUNDARY")
@@ -1023,7 +1080,12 @@ class Planner:
             f"世界图 frontier 搜索选择距离 {selected.boundary.distance} 的{category_name} "
             f"({block.x},{block.y})；估值 {selected_score:.1f}，"
             f"检查 {explored_nodes} 个世界状态，最佳已知路径 {path_length} 个原子边界。"
-            + (" 该出口是已验证的跨图返回边。" if known_transition else "")
+            + (
+                f" 该已验证跨图边仅作为通往 {world_target_map_id} 的实际目标 "
+                f"{world_target.boundary.block.id}@"
+                f"{world_target.boundary.block.x},{world_target.boundary.block.y} 的第一步。"
+                if known_transition and world_target is not selected else ""
+            )
         )
         operations = []
         approach = selected.boundary.approach

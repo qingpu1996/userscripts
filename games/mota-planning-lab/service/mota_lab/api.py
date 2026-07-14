@@ -523,10 +523,11 @@ class CycleCoordinator:
                     self._log_response(request, current.response, "decision_replayed")
                     return current.response
                 # A completed action may legitimately lead back to the exact
-                # same observation later (for example a stair round-trip).
-                # Continue planning so this visit receives a globally fresh
-                # action id; Store.save_decision atomically refreshes this one
-                # cache row instead of replaying the completed id.
+                # same observation later.  Continue planning so this visit can
+                # either idle (for a no-progress stair round-trip) or receive a
+                # globally fresh id for a genuinely new action; never replay
+                # the completed id.  Store.save_decision atomically refreshes
+                # this one cache row.
             else:
                 self._log_response(request, existing, "decision_replayed")
                 return existing

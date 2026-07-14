@@ -743,6 +743,354 @@ class ProtocolV2TopologyTests(unittest.TestCase):
 
 
 class SessionWorldAndCorsTests(unittest.TestCase):
+    @staticmethod
+    def _complete_scan(*map_ids: str, current: str) -> dict:
+        return {
+            "phase": "complete",
+            "anchor_map_instance_id": map_ids[0],
+            "current_map_instance_id": current,
+            "scanned_map_instance_ids": list(map_ids),
+            "pending_exits": [],
+            "traversed_transitions": [],
+            "reason": "synthetic complete scan",
+        }
+
+    def test_verified_stairs_without_remote_progress_are_idle_not_a_round_trip(self) -> None:
+        portal_a = make_block(
+            x=1, y=0, block_id="portalA", cls="terrains", trigger="changeFloor"
+        )
+        portal_b = make_block(
+            x=1, y=0, block_id="portalB", cls="terrains", trigger="changeFloor"
+        )
+        a = Observation.model_validate(make_observation(
+            width=2, height=1, x=0, y=0, map_instance_id="A", floor_id="A",
+            blocks=[portal_a],
+        ))
+        b = Observation.model_validate(make_observation(
+            width=2, height=1, x=0, y=0, map_instance_id="B", floor_id="B",
+            blocks=[portal_b],
+        ))
+        labels = {}
+        for portal in (portal_a, portal_b):
+            label = BlockLabel(
+                id=portal["id"], cls=portal["cls"], trigger=portal["trigger"],
+                category="stair", passable=False, boundary=True, fast_path=False,
+            )
+            labels[label.identity] = label
+        context = {
+            "map_facts": [map_fact(a), map_fact(b)],
+            "transitions": [
+                {"from_map_instance_id": "A", "to_map_instance_id": "B",
+                 "from_x": 1, "from_y": 0, "to_x": 0, "to_y": 0},
+                {"from_map_instance_id": "B", "to_map_instance_id": "A",
+                 "from_x": 1, "from_y": 0, "to_x": 0, "to_y": 0},
+            ],
+        }
+
+        result, exhausted = Planner(planning_budget=32)._world_search(a, labels, context)
+        response = Planner(planning_budget=32).plan(
+            a, labels, action_id_factory=lambda: "AUTO-0000000000000005",
+            registry_entries=[], world_context=context,
+            scan_state=self._complete_scan("A", "B", current="A"),
+        )
+
+        self.assertFalse(exhausted)
+        self.assertIsNone(result)
+        self.assertEqual(response.status, "idle")
+        self.assertNotIn("action_id", response.model_dump(mode="json", exclude_unset=True))
+
+    def test_direct_red_door_beats_verified_return_stair(self) -> None:
+        down = make_block(
+            x=1, y=0, block_id="downFloor", cls="terrains", trigger="changeFloor"
+        )
+        red_door = make_block(
+            x=2, y=1, block_id="redDoor", cls="terrains", trigger="openDoor"
+        )
+        up = make_block(
+            x=1, y=0, block_id="upFloor", cls="terrains", trigger="changeFloor"
+        )
+        mt1 = Observation.model_validate(make_observation(
+            width=3, height=2, x=1, y=1, red=1, map_instance_id="MT1", floor_id="MT1",
+            blocks=[down, red_door],
+        ))
+        mt0 = Observation.model_validate(make_observation(
+            width=2, height=1, x=0, y=0, red=1, map_instance_id="MT0", floor_id="MT0",
+            blocks=[up],
+        ))
+        labels = {}
+        for stair in (down, up):
+            label = BlockLabel(
+                id=stair["id"], cls=stair["cls"], trigger=stair["trigger"],
+                category="stair", passable=False, boundary=True, fast_path=False,
+            )
+            labels[label.identity] = label
+        door_label = BlockLabel(
+            id=red_door["id"], cls=red_door["cls"], trigger=red_door["trigger"],
+            category="door", passable=False, boundary=True, fast_path=False,
+            expected_delta={"keys": {"red": -1}},
+        )
+        labels[door_label.identity] = door_label
+        context = {
+            "map_facts": [map_fact(mt0), map_fact(mt1)],
+            "transitions": [
+                {"from_map_instance_id": "MT1", "to_map_instance_id": "MT0",
+                 "from_x": 1, "from_y": 0, "to_x": 0, "to_y": 0},
+                {"from_map_instance_id": "MT0", "to_map_instance_id": "MT1",
+                 "from_x": 1, "from_y": 0, "to_x": 1, "to_y": 1},
+            ],
+        }
+
+        response = Planner(planning_budget=32).plan(
+            mt1, labels, action_id_factory=lambda: "AUTO-0000000000000005",
+            registry_entries=[], world_context=context,
+            scan_state=self._complete_scan("MT0", "MT1", current="MT1"),
+        )
+
+        self.assertEqual(response.status, "execute")
+        self.assertEqual(response.action_kind, "OPEN_DOOR")
+        self.assertEqual((response.operations[-1].x, response.operations[-1].y), (2, 1))
+
+    def test_verified_stair_is_only_first_step_toward_named_remote_frontier(self) -> None:
+        stair = make_block(
+            x=1, y=0, block_id="upFloor", cls="terrains", trigger="changeFloor"
+        )
+        remote = make_block(
+            x=1, y=0, block_id="remotePotion", cls="items", trigger="getItem"
+        )
+        a = Observation.model_validate(make_observation(
+            width=2, height=1, map_instance_id="A", floor_id="A", blocks=[stair]
+        ))
+        b = Observation.model_validate(make_observation(
+            width=2, height=1, map_instance_id="B", floor_id="B", blocks=[remote]
+        ))
+        stair_label = BlockLabel(
+            id=stair["id"], cls=stair["cls"], trigger=stair["trigger"],
+            category="stair", passable=False, boundary=True, fast_path=False,
+        )
+        resource_label = BlockLabel(
+            id=remote["id"], cls=remote["cls"], trigger=remote["trigger"],
+            category="resource", passable=False, boundary=True, fast_path=False,
+            expected_delta={"attack": 10},
+        )
+        context = {
+            "map_facts": [map_fact(a), map_fact(b)],
+            "transitions": [{
+                "from_map_instance_id": "A", "to_map_instance_id": "B",
+                "from_x": 1, "from_y": 0, "to_x": 0, "to_y": 0,
+            }],
+        }
+
+        response = Planner(planning_budget=32).plan(
+            a, {stair_label.identity: stair_label, resource_label.identity: resource_label},
+            action_id_factory=lambda: "AUTO-0000000000000004", registry_entries=[],
+            world_context=context,
+            scan_state=self._complete_scan("A", "B", current="A"),
+        )
+
+        self.assertEqual(response.status, "execute")
+        self.assertEqual(response.action_kind, "MOVE_TO_STAIR")
+        self.assertEqual(response.expected_delta.map_instance_id, "B")
+        self.assertEqual(response.expected_delta.floor_id, "B")
+        self.assertIn("remotePotion", response.reason)
+        self.assertIn("B", response.reason)
+
+    def test_verified_exit_is_not_rediscovered_after_opaque_scan_completion(self) -> None:
+        stair = make_block(
+            x=1, y=0, block_id="portal", cls="terrains", trigger="changeFloor"
+        )
+        a = Observation.model_validate(make_observation(
+            width=2, height=1, map_instance_id="A", floor_id="A", blocks=[stair]
+        ))
+        b = Observation.model_validate(make_observation(
+            width=2, height=1, map_instance_id="B", floor_id="B", blocks=[]
+        ))
+        label = BlockLabel(
+            id=stair["id"], cls=stair["cls"], trigger=stair["trigger"],
+            category="stair", passable=False, boundary=True, fast_path=False,
+        )
+        initial_scan = {
+            "phase": "discover", "anchor_map_instance_id": "A",
+            "current_map_instance_id": "A", "scanned_map_instance_ids": ["A"],
+            "pending_exits": [], "traversed_transitions": [], "reason": "initial",
+        }
+        planner = Planner()
+        opaque = planner.plan(
+            a, {label.identity: label},
+            action_id_factory=lambda: "AUTO-0000000000000003", registry_entries=[],
+            world_context={"map_facts": [map_fact(a)], "transitions": []},
+            scan_state=initial_scan,
+        )
+        self.assertEqual(opaque.action_kind, "SCAN_OPAQUE_EXIT")
+
+        established = planner.refresh_scan_state(
+            a, {label.identity: label},
+            {
+                "map_facts": [map_fact(a), map_fact(b)],
+                "transitions": [{
+                    "from_map_instance_id": "A", "to_map_instance_id": "B",
+                    "from_x": 1, "from_y": 0, "to_x": 0, "to_y": 0,
+                }],
+            },
+            {
+                **initial_scan, "phase": "sweep", "scanned_map_instance_ids": ["A", "B"],
+                "traversed_transitions": [{
+                    "from_map_instance_id": "A", "from_x": 1, "from_y": 0,
+                    "to_map_instance_id": "B", "to_x": 0, "to_y": 0,
+                }],
+            },
+        )
+        self.assertEqual(established["phase"], "complete")
+        self.assertEqual(established["pending_exits"], [])
+
+    def test_auto3_auto4_auto5_sequence_targets_red_door_instead_of_ping_pong(self) -> None:
+        down = make_block(
+            x=1, y=0, block_id="downFloor", cls="terrains", trigger="changeFloor"
+        )
+        up = make_block(
+            x=1, y=0, block_id="upFloor", cls="terrains", trigger="changeFloor"
+        )
+        red_door = make_block(
+            x=2, y=1, block_id="redDoor", cls="terrains", trigger="openDoor"
+        )
+        mt1 = Observation.model_validate(make_observation(
+            width=3, height=2, x=1, y=1, red=1,
+            map_instance_id="MT1", floor_id="MT1", blocks=[down, red_door],
+        ))
+        mt0 = Observation.model_validate(make_observation(
+            width=2, height=1, x=0, y=0, red=1,
+            map_instance_id="MT0", floor_id="MT0", blocks=[up],
+        ))
+        labels = {}
+        for stair in (down, up):
+            label = BlockLabel(
+                id=stair["id"], cls=stair["cls"], trigger=stair["trigger"],
+                category="stair", passable=False, boundary=True, fast_path=False,
+            )
+            labels[label.identity] = label
+        door_label = BlockLabel(
+            id=red_door["id"], cls=red_door["cls"], trigger=red_door["trigger"],
+            category="door", passable=False, boundary=True, fast_path=False,
+            expected_delta={"keys": {"red": -1}},
+        )
+        labels[door_label.identity] = door_label
+        planner = Planner(planning_budget=32)
+        auto3 = planner.plan(
+            mt1, labels, action_id_factory=lambda: "AUTO-0000000000000003",
+            registry_entries=[],
+            world_context={"map_facts": [map_fact(mt1)], "transitions": []},
+            scan_state={
+                "phase": "sweep", "anchor_map_instance_id": "MT0",
+                "current_map_instance_id": "MT1", "scanned_map_instance_ids": ["MT1"],
+                "pending_exits": [], "traversed_transitions": [], "reason": "scan",
+            },
+        )
+        self.assertEqual(auto3.action_kind, "SCAN_OPAQUE_EXIT")
+        self.assertEqual(auto3.operations[-1].x, 1)
+        self.assertEqual(auto3.operations[-1].y, 0)
+
+        context = {
+            "map_facts": [map_fact(mt0), map_fact(mt1)],
+            "transitions": [
+                {"from_map_instance_id": "MT1", "to_map_instance_id": "MT0",
+                 "from_x": 1, "from_y": 0, "to_x": 0, "to_y": 0},
+                {"from_map_instance_id": "MT0", "to_map_instance_id": "MT1",
+                 "from_x": 1, "from_y": 0, "to_x": 1, "to_y": 1},
+            ],
+        }
+        completed_scan = planner.refresh_scan_state(
+            mt0, labels, context,
+            {
+                "phase": "sweep", "anchor_map_instance_id": "MT0",
+                "current_map_instance_id": "MT0",
+                "scanned_map_instance_ids": ["MT0", "MT1"],
+                "pending_exits": [],
+                "traversed_transitions": [{
+                    "from_map_instance_id": "MT1", "from_x": 1, "from_y": 0,
+                    "to_map_instance_id": "MT0", "to_x": 0, "to_y": 0,
+                }],
+                "reason": "AUTO-3 completed",
+            },
+        )
+        self.assertEqual(completed_scan["phase"], "complete")
+
+        auto4 = planner.plan(
+            mt0, labels, action_id_factory=lambda: "AUTO-0000000000000004",
+            registry_entries=[], world_context=context, scan_state=completed_scan,
+        )
+        self.assertEqual(auto4.action_kind, "MOVE_TO_STAIR")
+        self.assertIn("redDoor", auto4.reason)
+
+        auto5 = planner.plan(
+            mt1, labels, action_id_factory=lambda: "AUTO-0000000000000005",
+            registry_entries=[], world_context=context,
+            scan_state={**completed_scan, "current_map_instance_id": "MT1"},
+        )
+        self.assertEqual(auto5.action_kind, "OPEN_DOOR")
+        self.assertEqual((auto5.operations[-1].x, auto5.operations[-1].y), (2, 1))
+
+    def test_completed_opaque_transition_restart_keeps_verified_identity_and_zero_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = make_settings(Path(directory), rate_limit_per_second=0)
+            stair = make_block(
+                x=1, y=0, block_id="portal", cls="terrains", trigger="changeFloor"
+            )
+            for floor_id in ("A", "B"):
+                mark_floor(settings, floor_id=floor_id, name=floor_id)
+            label_block(settings, stair, category="stair")
+            pre = make_observation(
+                floor_id="A", map_instance_id="A", width=2, height=1,
+                x=0, y=0, blocks=[stair], session_id="restart-transition",
+            )
+            post = make_observation(
+                floor_id="B", map_instance_id="B", width=2, height=1,
+                x=0, y=0, blocks=[], session_id="restart-transition",
+                captured_at=1234567891,
+            )
+            coordinator = CycleCoordinator(settings)
+            try:
+                issued = coordinator.cycle(CycleRequest.model_validate(make_request(pre)))
+                self.assertEqual(issued["action_kind"], "SCAN_OPAQUE_EXIT")
+                completed = make_request(
+                    post,
+                    completed_action_id=issued["action_id"],
+                    recovery={
+                        "phase": "completed",
+                        "pending_action_id": issued["action_id"],
+                        "pre_fingerprint": observation_fingerprint(
+                            Observation.model_validate(pre)
+                        ),
+                        "current_fingerprint": observation_fingerprint(
+                            Observation.model_validate(post)
+                        ),
+                        "detail_code": None,
+                    },
+                )
+                ack = coordinator.cycle(CycleRequest.model_validate(completed))
+                self.assertEqual(ack["acknowledged_action_id"], issued["action_id"])
+            finally:
+                coordinator.store.close()
+
+            restarted = CycleCoordinator(settings)
+            try:
+                repeated = restarted.cycle(CycleRequest.model_validate(completed))
+                self.assertEqual(repeated["acknowledged_action_id"], issued["action_id"])
+                next_request = make_request(post)
+                next_request["session"] = {
+                    "mode": "resume_existing_ledger", "command": "observe"
+                }
+                settled = restarted.cycle(CycleRequest.model_validate(next_request))
+                self.assertEqual(settled["status"], "idle")
+                self.assertEqual(settled["scan_state"]["phase"], "complete")
+                self.assertEqual(
+                    restarted.store._connection.execute(
+                        "SELECT COUNT(*) FROM actions"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(len(restarted.store.transitions_for_session("restart-transition")), 1)
+            finally:
+                restarted.store.close()
+
     def test_coordinator_scan_action_is_idempotent_and_same_floor_completion_builds_edge(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = make_settings(Path(directory), rate_limit_per_second=0)
@@ -998,8 +1346,10 @@ class SessionWorldAndCorsTests(unittest.TestCase):
         self.assertFalse(exhausted)
         self.assertIsNotNone(result)
         self.assertEqual(result.first.boundary.block.id, "upFloor")
+        self.assertEqual(result.target.boundary.block.id, "remotePotion")
+        self.assertEqual(result.target_map_instance_id, "B")
         self.assertGreaterEqual(result.path_length, 2)
-        self.assertGreater(result.score, 300)
+        self.assertEqual(result.score, 309.5)
 
         stale_result, _ = planner._world_search(
             first,
@@ -1073,9 +1423,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
             },
         )
         self.assertFalse(exhausted)
-        self.assertIsNotNone(result)
-        self.assertEqual(result.first.boundary.block.id, "upFloor")
-        self.assertEqual(result.path_length, 1)
+        self.assertIsNone(result)
 
         with_key = Observation.model_validate(make_observation(
             width=2, height=1, blocks=[stair], map_instance_id="A", floor_id="A",
@@ -1143,9 +1491,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
             },
         )
         self.assertFalse(exhausted)
-        self.assertIsNotNone(result)
-        self.assertEqual(result.first.boundary.block.id, "upFloor")
-        self.assertEqual(result.path_length, 1)
+        self.assertIsNone(result)
 
         blocked_stair = make_block(
             x=2, y=0, block_id="upFloor", cls="terrains", trigger="changeFloor"
@@ -1283,9 +1629,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
         )
 
         self.assertFalse(exhausted)
-        self.assertIsNotNone(result)
-        self.assertEqual(result.first.boundary.block.id, "portalA")
-        self.assertLess(result.score, 1000.0)
+        self.assertIsNone(result)
 
     def test_world_search_live_root_enemy_is_a_terminal_atomic_candidate(self) -> None:
         enemy = make_enemy_block(x=1, y=0, damage=10, block_id="liveEnemy")
@@ -1428,10 +1772,9 @@ class SessionWorldAndCorsTests(unittest.TestCase):
                 "pending_exits": [], "traversed_transitions": [], "reason": "scan",
             },
         )
-        self.assertEqual(response.action_kind, "SCAN_VERIFIED_TRANSITION")
-        self.assertEqual((response.operations[-1].x, response.operations[-1].y), (0, 1))
-        self.assertEqual(response.expected_delta.map_instance_id, "C")
-        self.assertEqual(response.expected_delta.floor_id, "same")
+        self.assertEqual(response.status, "idle")
+        self.assertEqual(response.scan_state.phase, "complete")
+        self.assertNotIn("action_id", response.model_dump(mode="json", exclude_unset=True))
 
     def test_ordinary_verified_transition_binds_exact_target_and_ambiguous_exit_pauses(self) -> None:
         stair = make_block(x=1, y=0, block_id="portal", cls="terrains", trigger="changeFloor")
@@ -1465,15 +1808,8 @@ class SessionWorldAndCorsTests(unittest.TestCase):
             action_id_factory=lambda: "AUTO-0000000000000001", registry_entries=[],
             world_context=context, scan_state=scan,
         )
-        self.assertEqual(exact.status, "execute")
-        self.assertEqual(exact.expected_delta.map_instance_id, "B")
-        self.assertEqual(exact.expected_delta.floor_id, "same")
-        self.assertTrue(validate_expected_delta(
-            a, b, exact.expected_delta, action_kind=exact.action_kind,
-        ).matches)
-        self.assertFalse(validate_expected_delta(
-            a, c, exact.expected_delta, action_kind=exact.action_kind,
-        ).matches)
+        self.assertEqual(exact.status, "idle")
+        self.assertNotIn("action_id", exact.model_dump(mode="json", exclude_unset=True))
 
         ambiguous_context = copy.deepcopy(context)
         ambiguous_context["transitions"].append({

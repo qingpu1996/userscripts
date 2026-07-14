@@ -30,4 +30,6 @@ canonical tools 零钥匙省略恢复证据：[`runs/2026-07-14-zero-key-omissio
 
 `getDamage()` undefined fail-closed 验收整改证据：[`runs/2026-07-14-damage-undefined-fail-closed/`](runs/2026-07-14-damage-undefined-fail-closed/)。覆盖 undefined 在攻防不可穿透/可穿透两种情况下均暂停、raw type 证据、非法 damage 矩阵、明确 null/`???` 分支、浏览器零 wire/零行动，以及服务 required damage 与非负 schema；完整离线 QA 为 `220/220`。
 
+verified stair 循环整改证据：[`runs/2026-07-14-verified-stair-cycle/`](runs/2026-07-14-verified-stair-cycle/)。覆盖 opaque 首次发现、verified edge 不重复扫描、零收益中间边、successor 入队前支配剪枝、互返楼梯 idle、当前 redDoor 优先、远端实际 frontier 导航、AUTO3/4/5 synthetic 序列和 completed/ack 重启零重放。
+
 本轮明确 `not-run`：真实游戏页面、真实存档、真实移动/换图、内置浏览器注入和外网。离线 fake core 结果不得冒充现场验证。
