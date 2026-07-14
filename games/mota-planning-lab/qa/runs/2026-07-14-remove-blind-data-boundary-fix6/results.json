@@ -1,0 +1,40 @@
+{
+  "suite": "remove-blind-data-boundary-fix6",
+  "status": "pass",
+  "assurance": "controlled-project-source-audit-not-a-javascript-sandbox",
+  "tests": {
+    "javascript": 127,
+    "python": 116,
+    "integration": 1,
+    "total": 244
+  },
+  "production_audit": {
+    "browser_sources": 19,
+    "service_sources": 16,
+    "dist_artifacts": 2,
+    "status": "pass",
+    "unclassified_engine_apis": 0,
+    "direct_authoritative_mutations": 0
+  },
+  "engine_api_inventory": {
+    "read": [
+      "canMoveDirectly",
+      "getDamage",
+      "getEnemyInfo",
+      "getMapBlocksObj",
+      "isMoving"
+    ],
+    "action": [
+      "moveDirectly",
+      "setAutomaticRoute",
+      "stopAutomaticRoute"
+    ]
+  },
+  "full_cycle_authority_instrumentation": "pass",
+  "userscript_sha256": "c68d80acd0bc648ace9a6f3893d0d9e8a4758910bc589be1aa51d6fd594485f9",
+  "direct_mount_sha256": "fad256fe1f62da57421e0d822c08542204325dbeb474b36f7c7b2faba3f91ef3",
+  "offline_qa": "pass",
+  "real_browser": "not-run",
+  "real_game": "not-run",
+  "port_18724": "not-touched"
+}

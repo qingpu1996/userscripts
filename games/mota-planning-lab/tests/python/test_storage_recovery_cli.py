@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mota_lab.__main__ import main as cli_main
+from mota_lab.__main__ import _parser, main as cli_main
 from mota_lab.api import CycleCoordinator, ServiceError
 from mota_lab.labels import list_pauses
 from mota_lab.models import BlockLabel, CycleRequest, Observation
@@ -647,6 +647,13 @@ class LabelCliTests(unittest.TestCase):
     def test_serve_rejects_non_loopback_host(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             cli_main(["serve", "--host", "0.0.0.0"])
+
+    def test_serve_default_port_contract_remains_18724(self) -> None:
+        self.assertEqual(_parser().parse_args(["serve"]).port, 18724)
+
+    def test_serve_rejects_out_of_range_port(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli_main(["serve", "--port", "0"])
 
 
 if __name__ == "__main__":

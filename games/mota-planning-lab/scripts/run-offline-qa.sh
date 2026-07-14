@@ -43,6 +43,9 @@ node "$PROJECT_DIR/scripts/build-direct-mount.mjs" >/dev/null
 test "$FIRST_USERSCRIPT_HASH" = "$(shasum -a 256 dist/mota-planning-lab.user.js | awk '{print $1}')"
 test "$FIRST_DIRECT_HASH" = "$(shasum -a 256 dist/mota-planning-lab.direct-mount.js | awk '{print $1}')"
 node "$PROJECT_DIR/scripts/static-compliance.mjs"
+node "$PROJECT_DIR/scripts/production-integrity-audit.mjs"
+node "$PROJECT_DIR/scripts/test-production-engine-api-injection.mjs"
+node "$PROJECT_DIR/scripts/production-integrity-audit.mjs"
 node "$PROJECT_DIR/scripts/validate-docs.mjs"
 git diff --check
 

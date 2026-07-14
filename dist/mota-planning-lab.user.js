@@ -2,7 +2,7 @@
 // @name         魔塔规划实验室运行态代理
 // @namespace    local.mota-planning-lab.userscripts
 // @version      0.2.0
-// @description  严格盲玩边界内的 H5 魔塔当前运行态代理。
+// @description  读取游戏权威数据进行本地规划，并通过正常引擎接口执行的 H5 魔塔代理。
 // @match        https://h5mota.com/games/24/*
 // @grant        unsafeWindow
 // @grant        GM_getValue
@@ -3270,6 +3270,15 @@
       throw new TypeError("A request implementation is required");
     }
     const timeout = MotaLab.isFiniteInteger(options.timeoutMs) ? options.timeoutMs : 10000;
+    const endpoint = options.cycleEndpoint || MotaLab.CYCLE_ENDPOINT;
+    const endpointMatch = /^http:\/\/127\.0\.0\.1:([1-9]\d{0,4})\/cycle$/u.exec(endpoint);
+    if (!endpointMatch) {
+      throw new TypeError("cycleEndpoint must be an explicit 127.0.0.1 HTTP /cycle URL");
+    }
+    const endpointPort = Number(endpointMatch[1]);
+    if (endpointPort < 1 || endpointPort > 65535) {
+      throw new TypeError("cycleEndpoint port must be between 1 and 65535");
+    }
     let connected = false;
 
     function serviceError(detailCode, cause) {
@@ -3291,7 +3300,7 @@
         try {
           requestImplementation({
             method: "POST",
-            url: MotaLab.CYCLE_ENDPOINT,
+            url: endpoint,
             headers: {
               "Content-Type": "application/json",
               "X-Mota-Lab": "1",

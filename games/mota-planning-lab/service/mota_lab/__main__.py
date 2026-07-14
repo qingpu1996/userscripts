@@ -95,14 +95,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command == "serve":
             if args.host != "127.0.0.1":
                 parser.error("serve only permits --host 127.0.0.1")
-            if args.port != 18724:
-                parser.error("serve only permits --port 18724")
+            if not 1 <= args.port <= 65535:
+                parser.error("serve --port must be between 1 and 65535")
             import uvicorn
 
             from .api import create_app
 
             settings = replace(settings, direct_mount_origin=args.allow_direct_mount_origin)
-            uvicorn.run(create_app(settings), host="127.0.0.1", port=18724)
+            uvicorn.run(create_app(settings), host="127.0.0.1", port=args.port)
             return 0
 
         if args.labels_command == "list":

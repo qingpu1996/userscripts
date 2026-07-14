@@ -109,9 +109,55 @@ function makePoisonCore(options = {}) {
     stop: 0,
     saveLoad: 0,
     forbidden: [],
+    authoritativeWrites: [],
+    illegalWrites: [],
   };
+  const instrumentAuthority = options.instrumentAuthority === true;
+  let activeActionApi = null;
+  const proxyCache = new WeakMap();
+  function authorityWrite(pathLabel, operation, callback, legacyMessage) {
+    if (!instrumentAuthority) throw new Error(legacyMessage);
+    const evidence = { api: activeActionApi, path: pathLabel, operation };
+    if (!activeActionApi) {
+      calls.illegalWrites.push(evidence);
+      throw new Error(`authoritative state ${operation} outside public action API: ${pathLabel}`);
+    }
+    calls.authoritativeWrites.push(evidence);
+    return callback();
+  }
+  function authorityProxy(value, pathLabel) {
+    if (!instrumentAuthority || !value || typeof value !== "object") return value;
+    if (proxyCache.has(value)) return proxyCache.get(value);
+    const proxy = new Proxy(value, {
+      get(target, key) {
+        return authorityProxy(Reflect.get(target, key), `${pathLabel}.${String(key)}`);
+      },
+      set(target, key, next) {
+        const path = `${pathLabel}.${String(key)}`;
+        return authorityWrite(path, "set", () => Reflect.set(target, key, next), "runtime write");
+      },
+      deleteProperty(target, key) {
+        const path = `${pathLabel}.${String(key)}`;
+        return authorityWrite(path, "delete", () => Reflect.deleteProperty(target, key), "runtime delete");
+      },
+      defineProperty(target, key, descriptor) {
+        const path = `${pathLabel}.${String(key)}`;
+        return authorityWrite(path, "define", () => Reflect.defineProperty(target, key, descriptor), "runtime define");
+      },
+    });
+    proxyCache.set(value, proxy);
+    return proxy;
+  }
+  function withActionApi(api, callback) {
+    assertNoNestedAction();
+    activeActionApi = api;
+    try { return callback(); } finally { activeActionApi = null; }
+  }
+  function assertNoNestedAction() {
+    if (activeActionApi) throw new Error(`nested public action API: ${activeActionApi}`);
+  }
   const currentFloorId = options.floorId || "synthetic-floor-4";
-  const hero = options.hero || {
+  const heroSeed = options.hero || {
     hp: 208,
     atk: 23,
     def: 21,
@@ -120,12 +166,26 @@ function makePoisonCore(options = {}) {
     loc: { x: 8, y: 3, direction: "down" },
     items: { keys: { yellowKey: 4, blueKey: 1, redKey: 0 } },
   };
-  const currentMap = Object.assign({ title: "4F", width: 11, height: 11 }, options.currentMap || {});
-  const maps = new Proxy({}, {
-    get(_target, key) {
+  const hero = authorityProxy(instrumentAuthority
+    ? JSON.parse(JSON.stringify(heroSeed)) : heroSeed, "hero");
+  const currentMapSeed = Object.assign({ title: "4F", width: 11, height: 11 }, options.currentMap || {});
+  const currentMap = authorityProxy(instrumentAuthority
+    ? JSON.parse(JSON.stringify(currentMapSeed)) : currentMapSeed, "maps.current");
+  const mapsTarget = {};
+  const maps = new Proxy(mapsTarget, {
+    get(target, key) {
       calls.mapKeys.push(String(key));
       if (String(key) !== String(currentFloorId)) throw new Error(`poison map read: ${String(key)}`);
       return currentMap;
+    },
+    set(target, key, next) {
+      return authorityWrite(`maps.${String(key)}`, "set", () => Reflect.set(target, key, next), "runtime maps write");
+    },
+    deleteProperty(target, key) {
+      return authorityWrite(`maps.${String(key)}`, "delete", () => Reflect.deleteProperty(target, key), "runtime maps delete");
+    },
+    defineProperty(target, key, descriptor) {
+      return authorityWrite(`maps.${String(key)}`, "define", () => Reflect.defineProperty(target, key, descriptor), "runtime maps define");
     },
   });
   const statusTarget = {
@@ -140,9 +200,20 @@ function makePoisonCore(options = {}) {
       if (!Reflect.has(target, key)) throw new Error(`poison status read: ${String(key)}`);
       return target[key];
     },
-    set() { throw new Error("runtime status write"); },
+    set(target, key, next) {
+      return authorityWrite(`status.${String(key)}`, "set", () => Reflect.set(target, key, next), "runtime status write");
+    },
+    deleteProperty(target, key) {
+      return authorityWrite(`status.${String(key)}`, "delete", () => Reflect.deleteProperty(target, key), "runtime status delete");
+    },
+    defineProperty(target, key, descriptor) {
+      return authorityWrite(`status.${String(key)}`, "define", () => Reflect.defineProperty(target, key, descriptor), "runtime status define");
+    },
   });
-  const blocks = options.blocks || [];
+  const blocksSeed = options.blocks || [];
+  const blocks = authorityProxy(instrumentAuthority
+    ? JSON.parse(JSON.stringify(blocksSeed)) : blocksSeed, "blocks");
+  const authority = Object.freeze({ hero, blocks, currentMap });
   const allowed = {
     status,
     getMapBlocksObj(floorId, includeDisabled) {
@@ -155,8 +226,10 @@ function makePoisonCore(options = {}) {
     },
     getEnemyInfo(id, heroArgument, x, y, floorId) {
       calls.enemyInfo.push({ id, heroArgument, x, y, floorId });
-      return (options.enemyInfo && options.enemyInfo[id])
+      const info = (options.enemyInfo && options.enemyInfo[id])
         || { hp: 100, atk: 10, def: 5, money: 5, experience: 4, special: [] };
+      return authorityProxy(instrumentAuthority
+        ? JSON.parse(JSON.stringify(info)) : info, `enemies.${String(id)}`);
     },
     getDamage(id, x, y, floorId) {
       calls.damage.push({ id, x, y, floorId });
@@ -169,12 +242,14 @@ function makePoisonCore(options = {}) {
     },
     moveDirectly(x, y) {
       calls.direct.push({ x, y });
-      if (options.onDirect) options.onDirect(x, y, hero);
+      if (options.onDirect) withActionApi("moveDirectly", () => options.onDirect(x, y, hero, authority));
       return true;
     },
     setAutomaticRoute(x, y, suffix) {
       calls.route.push({ x, y, suffix });
-      if (options.onRoute) options.onRoute(x, y, hero);
+      if (options.onRoute) {
+        withActionApi("setAutomaticRoute", () => options.onRoute(x, y, hero, authority));
+      }
       return true;
     },
     stopAutomaticRoute() { calls.stop += 1; },
@@ -188,9 +263,17 @@ function makePoisonCore(options = {}) {
       }
       return target[key];
     },
-    set() { throw new Error("runtime write"); },
+    set(target, key, next) {
+      return authorityWrite(`core.${String(key)}`, "set", () => Reflect.set(target, key, next), "runtime write");
+    },
+    deleteProperty(target, key) {
+      return authorityWrite(`core.${String(key)}`, "delete", () => Reflect.deleteProperty(target, key), "runtime delete");
+    },
+    defineProperty(target, key, descriptor) {
+      return authorityWrite(`core.${String(key)}`, "define", () => Reflect.defineProperty(target, key, descriptor), "runtime define");
+    },
   });
-  return { scope: { core }, calls, hero };
+  return { scope: { core }, calls, hero, authority };
 }
 
 module.exports = {

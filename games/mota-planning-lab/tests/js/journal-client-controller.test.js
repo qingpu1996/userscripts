@@ -202,6 +202,25 @@ test("localhost client 固定 endpoint、headers、POST 与最小 request 根字
   assert.equal(client.isConnected(), true);
 });
 
+test("localhost client 允许显式隔离端口但拒绝非 loopback endpoint", async () => {
+  let captured;
+  const client = lab.createLocalhostClient((request) => {
+    captured = request;
+    request.onload({ status: 200, responseText: JSON.stringify({ status: "idle", reason: "ok" }) });
+  }, { cycleEndpoint: "http://127.0.0.1:34567/cycle" });
+  await client.postCycle({});
+  assert.equal(captured.url, "http://127.0.0.1:34567/cycle");
+  for (const endpoint of [
+    "http://localhost:34567/cycle",
+    "http://0.0.0.0:34567/cycle",
+    "https://127.0.0.1:34567/cycle",
+    "http://127.0.0.1:34567/other",
+    "http://127.0.0.1:70000/cycle",
+  ]) {
+    assert.throws(() => lab.createLocalhostClient(() => {}, { cycleEndpoint: endpoint }), /cycleEndpoint/iu);
+  }
+});
+
 test("localhost 断开、500、非法 JSON 与非法响应都安全拒绝", async () => {
   for (const implementation of [
     (request) => request.onerror(new Error("offline")),

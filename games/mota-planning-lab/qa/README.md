@@ -32,4 +32,22 @@ canonical tools 零钥匙省略恢复证据：[`runs/2026-07-14-zero-key-omissio
 
 verified stair 循环整改证据：[`runs/2026-07-14-verified-stair-cycle/`](runs/2026-07-14-verified-stair-cycle/)。覆盖 opaque 首次发现、verified edge 不重复扫描、零收益中间边、successor 入队前支配剪枝、互返楼梯 idle、当前 redDoor 优先、远端实际 frontier 导航、AUTO3/4/5 synthetic 序列和 completed/ack 重启零重放。
 
+策略数据边界重置初始证据：[`runs/2026-07-14-remove-blind-data-boundary/`](runs/2026-07-14-remove-blind-data-boundary/)。覆盖撤销 floors/maps/material/source/save structure 读取禁令、完整游戏数据只读正例、全 runtime 权威对象 mutation 反例和初始隔离 integration；完整离线 QA 为 `228/228`。
+
+策略数据边界重置第一轮修复证据：[`runs/2026-07-14-remove-blind-data-boundary-fix1/`](runs/2026-07-14-remove-blind-data-boundary-fix1/)。补齐 carrier/function/Object/Reflect/container mutator 数据流门禁，并让 integration 通过生产 `python -m mota_lab serve --port <random>` 链启动、client 使用同一显式 endpoint；默认 `18724` 契约独立受测，完整离线 QA 为 `234/234`。
+
+策略数据边界重置第二轮修复证据：[`runs/2026-07-14-remove-blind-data-boundary-fix2/`](runs/2026-07-14-remove-blind-data-boundary-fix2/)。补齐 array spread、返回型 mutator、rest/spread 函数、method alias、dynamic/loop/Reflect/Object/Map/Set carrier，加入 taint-signature 函数摘要与 source/step/call-depth fail-closed 预算，并清理 TASK 历史架构误导；完整离线 QA 为 `237/237`。
+
+策略数据边界重置第三轮修复证据：[`runs/2026-07-14-remove-blind-data-boundary-fix3/`](runs/2026-07-14-remove-blind-data-boundary-fix3/)。修复嵌套 closure 摘要跨实例及预分析/真实调用串污：scope identity、binding revision 与深层 container owner revision 共同隔离缓存；覆盖 local/runtime 双顺序、深层 taint、递归门禁和 depth 22/40 DAG，完整离线 QA 为 `239/239`。
+
+策略数据边界重置第四轮修复证据：[`runs/2026-07-14-remove-blind-data-boundary-fix4/`](runs/2026-07-14-remove-blind-data-boundary-fix4/)。修复 mutable function return memo clone 丢失 captured container alias：heap-producing return 改为每次重分析，同时保留 scalar/runtime DAG 摘要；覆盖 object/array/Map/Set、nested closure、同/异函数 alias 与 fresh-container 反例，完整离线 QA 为 `240/240`。
+
+策略数据边界重置第五轮修复证据：[`runs/2026-07-14-remove-blind-data-boundary-fix5/`](runs/2026-07-14-remove-blind-data-boundary-fix5/)。修复 callable return 跨调用复用首个 closure allocation：heap 与 callable identity-bearing return 均不缓存，只缓存安全 scalar/runtime immutable 摘要；覆盖同表达式多实例、相同结构实参、顺序、nested closure、closure-returning-closure、bound callable 和 2000 allocation 性能/预算，完整离线 QA 为 `241/241`。
+
+策略数据边界重置第六轮方向纠正证据：[`runs/2026-07-14-remove-blind-data-boundary-fix6/`](runs/2026-07-14-remove-blind-data-boundary-fix6/)。静态分析重新定位为受控项目源码 lint；交付保证改由实际 production tree 审计、adapter engine API allowlist 与 full-cycle 权威写入 instrumentation 共同提供。`this`/user constructor/identity callback 作为 unsupported lint syntax fail closed，不再把理论 snippet 完备性当成 sandbox 门槛。
+
+策略数据边界重置第七轮实际生产完整性整改证据：[`runs/2026-07-14-remove-blind-data-boundary-fix7/`](runs/2026-07-14-remove-blind-data-boundary-fix7/)。覆盖递归 production source discovery 与 userscript manifest 精确一致、runtime/core/scope/globalThis 及解构/成员/bound alias 的 engine API inventory、临时 actual-adapter 注入与未知 API fail closed、全部权威 root/container 的 set/delete/defineProperty 动态负向矩阵，以及 full-cycle 每次权威变化的公开行动 API 归因；完整离线 QA 为 `251/251`。
+
+策略数据边界重置第八轮 engine API inventory 修复证据：[`runs/2026-07-14-remove-blind-data-boundary-fix8/`](runs/2026-07-14-remove-blind-data-boundary-fix8/)。覆盖 direct/static-bracket/dynamic-bracket engine member、member alias 的直接调用与 `call/apply/bind`，点名三个 Acceptance8 漏报全部 fail closed；完整 QA 临时注入实际 adapter、重建双 dist、要求 production audit 非零退出，再恢复源码与制品，最终为 `252/252`。
+
 本轮明确 `not-run`：真实游戏页面、真实存档、真实移动/换图、内置浏览器注入和外网。离线 fake core 结果不得冒充现场验证。

@@ -9,7 +9,7 @@
 | --- | --- | --- |
 | `NEW_OBJECT_OR_MECHANISM` | 新 block identity、trigger、NPC/机关，或边界标签缺少可验证 postcondition | `UNKNOWN_BLOCK`、`UNKNOWN_TRIGGER`、`UNKNOWN_NPC`、`UNKNOWN_MECHANISM`、`INCOMPLETE_LABEL` |
 | `UNKNOWN_DAMAGE` | 当前可见怪物 damage 不是有限非负整数、严格 null 或 `???`，或 null/`???` 无法由本轮实时 hero attack 与当前坐标 enemy defense 解释 | `DAMAGE_UNEXPLAINED` |
-| `UNKNOWN_FLOOR` | 当前 floorId 尚无合法模型 | `FLOOR_MODEL_MISSING` |
+| `UNKNOWN_FLOOR` | 完整游戏 floors/maps/source definitions 仍无法为当前 floorId 建立合法模型 | `FLOOR_MODEL_MISSING` |
 | `EXPECTED_DELTA_MISMATCH` | 实际资源/block/floor 差分不符，或恢复/ledger identity 无法安全解释 | `RESOURCE_DELTA_MISMATCH`、`RECOVERY_STATE_AMBIGUOUS`、`RECOVERY_JOURNAL_LEDGER_MISMATCH`、`RECONNECT_UNRESOLVED_ACTION` |
 | `GUARD_MISMATCH` | 行动前现场与 guard 不同；首次现场与用户基线不同 | `PRE_ACTION_GUARD_MISMATCH`、`INITIAL_BASELINE_MISMATCH` |
 | `UNSUPPORTED_INTERACTION` | 剧情、选择菜单、商店等尚未实现的交互 | `STORY_EVENT`、`CHOICE_MENU`、`SHOP` |
@@ -38,13 +38,13 @@
 
 1. 调用兼容的 `stopAutomaticRoute()`；失败只记录能力错误，不使用私有写入。
 2. 关闭自动循环，不再请求或执行下一行动。
-3. 保存引发暂停的本轮当前层白名单 observation 与 fingerprint；采集期未知战损会先完成所有当前层 blocks，再携带 observation 暂停。
+3. 保存引发暂停的本轮 Protocol observation 与 fingerprint；采集期未知战损会先完成所有当前层 blocks，再携带 observation 暂停。
 4. 保存当前 action、guard、expected_delta、实际差分及恢复 journal 摘要。
 5. 未知 block 额外保留 `x/y/numeric_id/id/cls/trigger/damage`；未知战损同时保留安全标量化的 `raw_damage`、`normalized_damage` 和怪物字段证据。
 6. 在控制台输出结构化对象，在悬浮面板显示 pause_kind 与简短原因。
 7. 服务侧如可用，将证据写入本地 pause 包，等待人工标签。
 
-暂停证据不得包含截图、Canvas、Cookie、存档原文、完整引擎对象或未访问楼层。
+暂停证据不得包含 Cookie、登录凭据或无关个人数据。完整引擎定义、存档结构和未到达楼层可以作为本地诊断/策略证据，但应记录来源并避免无意复制整份个人存档。
 
 ## 稳定等待超时归因
 

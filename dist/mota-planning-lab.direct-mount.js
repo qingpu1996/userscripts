@@ -3221,6 +3221,15 @@ MotaLab.createLocalhostClient = function createLocalhostClient(requestImplementa
     throw new TypeError("A request implementation is required");
   }
   const timeout = MotaLab.isFiniteInteger(options.timeoutMs) ? options.timeoutMs : 10000;
+  const endpoint = options.cycleEndpoint || MotaLab.CYCLE_ENDPOINT;
+  const endpointMatch = /^http:\/\/127\.0\.0\.1:([1-9]\d{0,4})\/cycle$/u.exec(endpoint);
+  if (!endpointMatch) {
+    throw new TypeError("cycleEndpoint must be an explicit 127.0.0.1 HTTP /cycle URL");
+  }
+  const endpointPort = Number(endpointMatch[1]);
+  if (endpointPort < 1 || endpointPort > 65535) {
+    throw new TypeError("cycleEndpoint port must be between 1 and 65535");
+  }
   let connected = false;
 
   function serviceError(detailCode, cause) {
@@ -3242,7 +3251,7 @@ MotaLab.createLocalhostClient = function createLocalhostClient(requestImplementa
       try {
         requestImplementation({
           method: "POST",
-          url: MotaLab.CYCLE_ENDPOINT,
+          url: endpoint,
           headers: {
             "Content-Type": "application/json",
             "X-Mota-Lab": "1",

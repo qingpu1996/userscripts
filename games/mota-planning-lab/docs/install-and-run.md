@@ -12,7 +12,7 @@ python -m pip install -r service/requirements.lock
 PYTHONPATH=service python -m mota_lab serve
 ```
 
-服务只监听 `127.0.0.1:18724`。`MOTA_LAB_STATE_DIR` 是 session、action_id、世界图和恢复链的持久身份根，不是 cache；正常重启和升级必须复用同一完整绝对路径。pending 时禁止删除、迁移或切空目录。`MOTA_LAB_KNOWLEDGE_DIR` 只保存人工标签，不能替代 ledger。
+服务只监听 `127.0.0.1`，默认端口为 `18724`。`serve --port <1..65535>` 只用于同机隔离实例或 QA；浏览器客户端必须显式配置同一个 `http://127.0.0.1:<port>/cycle`，且仍拒绝非 loopback、HTTPS 或其他 path。`MOTA_LAB_STATE_DIR` 是 session、action_id、世界图和恢复链的持久身份根，不是 cache；正常重启和升级必须复用同一完整绝对路径。pending 时禁止删除、迁移或切空目录。`MOTA_LAB_KNOWLEDGE_DIR` 只保存人工标签，不能替代 ledger。
 
 Protocol v2 数据库使用 `PRAGMA user_version=2`，但版本号不是唯一凭据。空白或合法 v2 导入入口会先一致复制 main/WAL/SHM 到 state dir 私有 candidate，schema/CHECK/AUTOINCREMENT 探针只操作 candidate；通过后原子发布 `.mota-lab.sqlite3.manifest.json` 与 `.mota-lab.sqlite3.generations/gen-*`。之后入口文件只作 identity witness，当前账本以 manifest 指向的 generation 为准。WAL/SHM 缺一、framing/size 异常、双读不稳定、rename/swap、legacy/future/unknown schema 或 manifest 损坏都会安全拒绝。详见 [SQLite generation 与恢复](storage.md)。
 

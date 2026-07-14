@@ -43,7 +43,7 @@
 
 enemy combat fact 的有效域比 map fact 更窄：仅本轮原始 live root 可使用，且只能产生一个终端原子候选。任何已模拟边界都会使旧 enemy stats/damage 失效；同一 map id 上的资源后继和跨图返回都不能重新消费，必须等待新的 observation。历史 enemy 字段仍可留作审计，但不进入 future-state 数值模拟。
 
-`source=engine_current_map/confidence=confirmed` 表示当前 map 明确声明；`runtime_observed/inferred` 表示只从当前动态 grid 形状推导。无法可靠解释时暂停，不猜测未到达区域。
+`source=engine_current_map/confidence=confirmed` 表示当前 map 明确声明；`runtime_observed/inferred` 表示从当前动态 grid 形状推导。这些字段描述当前 Protocol observation 的来源，不限制策略层读取完整 floors/maps/material/source definitions；策略层可预建未到达区域模型，但执行时仍以 fresh runtime guard 和真实差分结算。
 
 ## Map identity
 

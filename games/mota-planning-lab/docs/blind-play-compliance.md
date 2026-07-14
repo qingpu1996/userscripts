@@ -1,47 +1,34 @@
-# 严格盲玩合规
+# 策略数据与执行安全边界
 
-## 读取边界
+## 唯一盲玩限制
 
-浏览器唯一运行态入口是 `src/engine-adapter.js`。每轮先读取当前 floorId，之后只读取 hero 白名单、`status.maps[currentFloorId]`、`getMapBlocksObj(currentFloorId,true)` 和当前可见怪物坐标的 enemy info/damage。dimensions 与 valid cells 只从这一个当前动态 map 获得。
+本项目不得搜索、读取、导入或使用《魔塔24层》的攻略、标准路线、通关录像，或其他人为整理的针对性解法资料。不得把这类资料转写成启发式、fixture、标签、bundled data 或默认决策。
 
-怪物属性不建立本地数据库。`atk/attack`、`def/defense`、`money/gold`、`exp/experience` 只在本次同步采集内严格归一；own property 显式非法不能伪装成缺席，别名冲突、非法值和无法解释的 damage 均 fail closed。只有 `getDamage()` 原始返回严格 null/`???` 且可由当前 hero 攻击不穿透当前 enemy 防御解释时，才仅形成不可穿越边界；`undefined` 等非协议值保留 raw evidence 后在采集边界暂停，不发送给服务，不触发攻略查询、历史 stats 回填或人工“模型补全”。历史 observation 中为审计保留的 enemy 字段不参与任何 simulated node 的战斗数值；只有 untouched live root 的直接战斗可作为终端候选，同图状态变化或 A→B→A 后也必须等 fresh observation。
+这条限制不适用于游戏自身数据。为了构建策略模型，代理可以读取和分析游戏页面与本地游戏工程已经提供的任何数据，包括完整运行态、`core.floors`、`core.status.maps`、`material`、物品/怪物/事件定义、地图源码和存档结构，也包括尚未由英雄进入的楼层或地图。地图、怪物、钥匙和资源语义应优先从这些游戏权威定义与实时状态通用解析，不得靠逐对象 ID 硬编码维护另一份事实库。
 
-同一次采集在读取 map/blocks/怪物前后核对当前 floor、hero/keys/位置和最小 busy 围栏；不一致则整份丢弃，不会混合两个时刻。钥匙必须来自已登记布局：canonical `hero.items.tools` 容器存在时，只有被引擎省略的零计数字段按 `0` 归一；其他容器残缺、显式非法值、别名冲突或多布局冲突不会用零兜底。
+## 读取不等于篡改
 
-禁止读取 floor catalogue、非 current map、完整 maps、全量素材、工程地图源码、存档原文、攻略或路线资料。出口后的布局保持 opaque，只有英雄正常转移进入后才采集。
+游戏自身数据可读，不代表可以直接改写。脚本不得通过赋值、`delete`、`Object.assign`、`Object.defineProperty`、`Reflect.set` 等方式篡改 hero 数值、地图或 block、怪物、事件、存档及其他游戏权威对象。移动、战斗、开门、拾取、换图和经用户授权的存取档都必须调用游戏正常接口，使触发器、录像和存档状态由引擎自己更新。
 
-不使用图像输入、像素提取或识别；网络只向固定 localhost 发送当前 observation。adapter 逐字段复制，不传 core/status/map 原对象。
+执行前继续核对 guard；每次只执行一个可校验的原子状态边界；执行后等待稳定并用 fresh runtime 计算真实差分。读取到未来地图或完整定义不能成为跳过 guard、直接改现场或一次跨越多个未校验边界的理由。
 
-## 写入边界
+## 本地数据流
 
-不直接赋值 hero、map、block、enemy 或 event。只 capability-probe 并调用 `moveDirectly`、`setAutomaticRoute`、`stopAutomaticRoute`。物理 save/load 默认禁用且没有内置槽位，不调用 `doSL`。
+浏览器运行态入口仍集中在 `src/engine-adapter.js`，便于统一做快照一致性与能力探测；集中入口不是读取白名单。Protocol v2 现有 `/cycle` observation 仍以当前执行现场为结算载体，完整游戏定义可以在本机解析为规划输入或派生模型，不需要伪装成当前 block observation。
 
-接管扫描只允许安全空走廊和一个已登记楼梯/传送边界；扫描未 complete 前硬排除怪物、门、资源、NPC 和机关。opaque 出口执行后必须重新观察，不能在旧地图上继续推演。每次最多一个状态边界；行动后完整重读、稳定两轮并核对真实差分。
+运行通信只允许到配置中的 `http://127.0.0.1:<port>/cycle`，生产默认端口是 `18724`；隔离 QA 可显式选择其他合法端口，但 client 与 `python -m mota_lab serve --port` 必须使用同一配置。构建物不得包含非 loopback 运行端点、自动更新 URL、Cookie 或登录凭据。读取完整游戏数据不会自动授权把它发送到非 localhost 服务；日志和暂停包也应只保留诊断所需内容，避免无意复制整份游戏工程或个人存档。
 
-## 世界模型来源
+## 执行完整性保证
 
-SQLite 的 map instances、snapshots、frontiers、scan state/audit 和 transitions 全部来自历史上合法收到的 observation。transition 只从实际 completed change-map 的 pre/post 建立，不预测未走过出口目标。显示楼层数字不作为身份；同 floorId 的不同 map instance 独立建模。可逆性要求精确端点反向观察。
+禁止直接 mutation 是执行完整性不变式，不是盲玩数据读取边界。当前保证由四层共同组成：
 
-当前 hero/resources/keys/current blocks 的唯一权威是本轮请求 observation。完整历史 snapshot 仅为 action recovery 和审计证据；传给 planner 前投影成不含 hero/keys/busy 的 `HistoricalMapFact`。跨图搜索只把本轮 live resource vector 带入历史 topology/blocks，不能用旧面板补足当前资源。可达性、路线与排名每轮重算，不是持久当前状态。
+- 实际 production source、service 和双 dist 每次完整扫描；`engine-adapter.js` 另做权威 alias 清单与 engine API 调用清单审计；
+- 改变游戏现场的调用只允许 `moveDirectly`、`setAutomaticRoute`、`stopAutomaticRoute`，读取接口与行动接口在审计结果中分开列出，未分类调用 fail closed；
+- collector、client 和 service 没有直接写 page runtime 的职责，浏览器 page core 入口继续只存在于 adapter；
+- localhost full-cycle fake core 对 hero、maps、blocks 和 enemy 定义加写入代理；完整观察、通信、规划期间任何写都会抛错，测试确认所有实际权威变化只发生在模拟公开行动 API 的动态作用域内。
 
-浏览器 v1 journal 必须先专用归档并显式处置，普通控制不能绕过。构建 marker 明确区分 userscript/direct；userscript 缺 GM API 不会读取 direct namespace。A/B generation envelope 无单点 pointer，物理写永远落到非当前最高槽；旧完整槽在 candidate 截断/变形/no-op/throw 时仍可恢复，完整 candidate 则携带 pending 或 completed/ack 证据成为新最高。旧单 key 只读 witness 的任何改写都会重新 quarantine。pending 未验证持久前行动 API 调用数必须为零。
+`scripts/static-compliance.mjs` 和 `scripts/ast-runtime-compliance.mjs` 仍保留为受控项目源码的工程 lint 与防回归样本。它允许 `core.floors`、完整 maps、`material`、地图/事件/存档定义的只读分析，并对项目中已经出现或明确禁止的常见直接写法给出诊断；它不是 JavaScript sandbox，也不声称证明任意 alias、closure、`this`、constructor、callback、Proxy、`eval` 或动态代码生成的完整语义安全。超出支持子集的 bound `this`、user-defined constructor 和 identity-producing collection callback 会返回 `UNSAFE_RUNTIME_MUTATION_ANALYSIS`，而不是被静默当作安全。新增生产代码若需要新的高阶语义，必须先扩展实际 source 审计与 integration instrumentation，不能仅增加一个理论 snippet 后宣称完整覆盖。
 
-服务在接受前不以任何 SQLite URI/连接模式打开导入 path。main/WAL/SHM 经过成对检查、WAL framing、SHM size、双读 identity/stat/hash 与分类后复核，只复制到私有 candidate generation 进行 schema/行为 probe；通过后以原子 manifest 发布，并且只连接该已分类 generation。导入 witness 和 generation 在发布、connect 后都再次核对；拒绝时被换入的 legacy/future/unknown main 与 sidecar 不被 DDL/WAL 改写。
+userscript metadata 继续限制页面匹配和 `@connect 127.0.0.1`，生成物只允许既定 localhost endpoint。`setAutomaticRoute`、`moveDirectly` 等正常引擎行动调用不会因为读取范围扩大而被禁止。
 
-行动恢复同样 fail closed：服务按 session 而非当前 fingerprint 查唯一 unresolved action，同 pre 只重发原 ID；completed 通过独立显式 ack 结算后，下一轮才签下一 ID。`intent=reconnect_only` 是 no-issue 路径，不进入 planner 或 issuance；错误 execute 在浏览器被持久隔离并零执行。
-
-## Direct mount
-
-direct mount 构建物与 userscript 使用相同采集和执行模块。它只使用项目 namespace 内的旧 witness、v1 quarantine 与两个 A/B slot，不枚举其他 localStorage；CORS 默认关闭，显式模式也只允许精确目标 origin 和必要 headers/method。没有外网 URL或自动更新入口。
-
-## 自动化证明
-
-- Proxy fake core 对未知 status/map/runtime 读取和所有写入投毒。
-- 静态扫描覆盖 src、service、userscript 和 direct-mount 构建物。
-- 固定 vendored Acorn 8.16.0 AST 扫描先校验 parser、MIT LICENSE 与 provenance hash，再按词法 scope/binding identity 做传播。只有未 shadow 的真实 global root，或可静态解析的 IIFE/简单本地函数调用实参，才传播为 runtime；函数参数不会因名称恰好是 `core/runtime` 而升级。规则覆盖 Parenthesized/Sequence/Chain/Member、声明与赋值 destructure/default/rest/computed pattern、assignment/update/delete、常量 `+`/template、global root，以及 Object/Reflect `call/apply/bind`；真实 global runtime 被禁止，局部参数/变量 shadow、Object-like 与 detached copy 正例必须通过。
-- 11×11、13×13、7×19 和异形空洞走同一通用代码。
-- v1 journal/协议、legacy/future SQLite、dimensions/grid 冲突、未知 topology、未知伤害、guard/delta mismatch 全部 fail closed。
-- localhost + fake core 集成只使用 synthetic fixtures。
-- canonical `hero.items.tools` 全量与零字段省略形状 fixture、显式非法值、key layout 冲突、torn snapshot、历史资源污染和重访 revision 均有 fail-closed 回归；门后黄钥匙字段删除的 pending/reload 测试证明 completed/ack 且引擎 API 调用数为零。
-
-本轮没有访问真实游戏、存档或外网，也没有执行真实行动；离线 QA 不能替代后续用户授权的现场验证。
+外部攻略禁令通过开发来源声明、代码审查和 QA provenance 执行，不能靠扫描 `floors`、`material` 等合法游戏标识符来冒充合规检查。

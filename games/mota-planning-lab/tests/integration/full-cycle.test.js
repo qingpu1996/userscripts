@@ -16,11 +16,25 @@ const {
 
 const MotaLab = loadRuntime();
 const HOST = "127.0.0.1";
-const PORT = 18724;
+let port = null;
+
+function findFreePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, HOST, () => {
+      const address = server.address();
+      server.close((error) => {
+        if (error) reject(error);
+        else resolve(address.port);
+      });
+    });
+  });
+}
 
 function canConnect() {
   return new Promise((resolve) => {
-    const socket = net.createConnection({ host: HOST, port: PORT });
+    const socket = net.createConnection({ host: HOST, port });
     socket.once("connect", () => {
       socket.destroy();
       resolve(true);
@@ -41,14 +55,14 @@ async function waitUntilReady(child, stderr) {
     if (await canConnect()) return;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  throw new Error(`decision service did not open ${HOST}:${PORT}: ${stderr.join("")}`);
+  throw new Error(`decision service did not open ${HOST}:${port}: ${stderr.join("")}`);
 }
 
 function gmRequest(options) {
   const url = new URL(options.url);
   const request = http.request({
     host: url.hostname,
-    port: Number(url.port),
+    port: url.port,
     path: url.pathname,
     method: options.method,
     headers: options.headers,
@@ -123,7 +137,8 @@ async function terminate(child) {
 test("fake core → localhost service → atomic execution → settled report is end-to-end safe", {
   timeout: 30000,
 }, async (t) => {
-  assert.equal(await canConnect(), false, `${HOST}:${PORT} must be free before integration QA`);
+  port = await findFreePort();
+  assert.equal(await canConnect(), false, `${HOST}:${port} must be free before integration QA`);
 
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mota-lab-integration-"));
   const stateDir = path.join(temporaryRoot, "state");
@@ -138,14 +153,13 @@ test("fake core → localhost service → atomic execution → settled report is
     process.env.PYTHONPATH,
   ].filter(Boolean).join(path.delimiter);
   const stderr = [];
-  const child = spawn(python, [
-    "-m", "mota_lab",
-    "--state-dir", stateDir,
-    "--knowledge-dir", knowledgeDir,
-    "serve",
-  ], {
+  const child = spawn(python, ["-m", "mota_lab", "serve", "--host", HOST, "--port", String(port)], {
     cwd: projectDir,
-    env: Object.assign({}, process.env, { PYTHONPATH: pythonPath }),
+    env: Object.assign({}, process.env, {
+      PYTHONPATH: pythonPath,
+      MOTA_LAB_STATE_DIR: stateDir,
+      MOTA_LAB_KNOWLEDGE_DIR: knowledgeDir,
+    }),
     stdio: ["ignore", "pipe", "pipe"],
   });
   child.stderr.on("data", (chunk) => stderr.push(String(chunk)));
@@ -180,6 +194,7 @@ test("fake core → localhost service → atomic execution → settled report is
     },
   ];
   const fake = makePoisonCore({
+    instrumentAuthority: true,
     floorId: "synthetic-floor-4",
     currentMap: { title: "Synthetic 4F", width: 11, height: 11 },
     blocks: rawBlocks,
@@ -198,10 +213,10 @@ test("fake core → localhost service → atomic execution → settled report is
       hero.loc.x = x;
       hero.loc.y = y;
     },
-    onRoute(x, y, hero) {
-      const index = rawBlocks.findIndex((block) => block.x === x && block.y === y);
+    onRoute(x, y, hero, authority) {
+      const index = authority.blocks.findIndex((block) => block.x === x && block.y === y);
       assert.notEqual(index, -1, "automatic route must stop at a current known boundary");
-      const [block] = rawBlocks.splice(index, 1);
+      const [block] = authority.blocks.splice(index, 1);
       hero.loc.x = x;
       hero.loc.y = y;
       if (block.event.id === "syntheticRedPotion") hero.hp += 200;
@@ -213,9 +228,13 @@ test("fake core → localhost service → atomic execution → settled report is
     },
   });
   const adapter = MotaLab.createEngineAdapter(fake.scope);
-  const client = MotaLab.createLocalhostClient(gmRequest, { timeoutMs: 3000 });
+  const cycleEndpoint = `http://${HOST}:${port}/cycle`;
+  const client = MotaLab.createLocalhostClient(gmRequest, { timeoutMs: 3000, cycleEndpoint });
 
   const firstObservation = MotaLab.collectObservation(adapter, () => 1234567890);
+  assert.deepEqual(fake.calls.authoritativeWrites, [],
+    "collector must not write authoritative runtime state");
+  assert.deepEqual(fake.calls.illegalWrites, []);
   firstObservation.session_id = "SESSION-INTEGRATION-0001";
   const firstRequest = MotaLab.createCycleRequest({
     observation: firstObservation,
@@ -309,6 +328,8 @@ test("fake core → localhost service → atomic execution → settled report is
   assert.equal(initialized.verified, true);
   assert.equal(initialized.auto_started, false);
   assert.equal(fake.calls.direct.length + fake.calls.route.length, 0);
+  assert.deepEqual(fake.calls.authoritativeWrites, [],
+    "client/service/initialization must not write authoritative runtime state");
 
   const resource = await controller.start();
   assert.equal(resource.completed, true, JSON.stringify(resource));
@@ -317,7 +338,7 @@ test("fake core → localhost service → atomic execution → settled report is
   assert.equal(fake.calls.direct.length, 1, "safe empty approach must use moveDirectly");
   assert.equal(fake.calls.route.length, 1, "resource is one state boundary");
   assert.equal(fake.hero.hp, 408);
-  assert.equal(rawBlocks.length, 1);
+  assert.equal(fake.authority.blocks.length, 1);
 
   const resourceAck = await controller.runSingleCycle();
   assert.equal(resourceAck.idle, true);
@@ -328,7 +349,7 @@ test("fake core → localhost service → atomic execution → settled report is
   assert.equal(fake.hero.hp, 384);
   assert.equal(fake.hero.money, 21);
   assert.equal(fake.hero.experience, 67);
-  assert.equal(rawBlocks.length, 0);
+  assert.equal(fake.authority.blocks.length, 0);
 
   const enemyAck = await controller.runSingleCycle();
   assert.equal(enemyAck.idle, true);
@@ -340,6 +361,17 @@ test("fake core → localhost service → atomic execution → settled report is
     journal.snapshot().last_completed_action.action_id);
   assert.equal(fake.calls.saveLoad, 0);
   assert.deepEqual(fake.calls.forbidden, []);
+  assert.deepEqual(fake.calls.illegalWrites, []);
+  assert.ok(fake.calls.authoritativeWrites.length > 0);
+  assert.deepEqual([...new Set(fake.calls.authoritativeWrites.map((item) => item.api))].sort(), [
+    "moveDirectly", "setAutomaticRoute",
+  ]);
+  assert.ok(fake.calls.authoritativeWrites.every((item) => (
+    item.api !== null
+      && ["moveDirectly", "setAutomaticRoute"].includes(item.api)
+      && ["set", "delete", "define"].includes(item.operation)
+      && (item.path.startsWith("hero.") || item.path.startsWith("blocks."))
+  )), JSON.stringify(fake.calls.authoritativeWrites));
   assert.ok(panelUpdates.length > 0);
 
   const manifestPath = path.join(stateDir, ".mota-lab.sqlite3.manifest.json");
