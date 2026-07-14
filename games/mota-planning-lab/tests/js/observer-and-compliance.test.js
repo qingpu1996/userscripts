@@ -11,6 +11,19 @@ const {
 
 const lab = loadRuntime();
 
+test("自动寻路步间 isMoving 短暂为 false 时仍报告 busy", () => {
+  const fake = makePoisonCore({
+    moving: false,
+    automaticRoute: { autoHeroMove: true },
+  });
+  const adapter = lab.createEngineAdapter(fake.scope);
+  assert.deepEqual(JSON.parse(JSON.stringify(adapter.readBusy())), {
+    moving: true,
+    lock_control: false,
+    event_active: false,
+  });
+});
+
 test("adapter 延迟解析页面运行时，未就绪时 stop 也不会掩盖暂停", () => {
   const scope = {};
   const adapter = lab.createEngineAdapter(scope);

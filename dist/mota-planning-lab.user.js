@@ -890,8 +890,14 @@
           { api: "isMoving" },
         );
       }
+      // H5 Mota's isMoving() only covers heroStop/heroMoving.  Between two
+      // automatic-route grid steps heroMoving briefly returns to zero while
+      // autoHeroMove remains active.  Treat that gap as busy too; otherwise a
+      // route ending at a door/enemy/item can be mistaken for complete on the
+      // adjacent cell before the final trigger step runs.
       return {
-        moving: runtime.isMoving() === true,
+        moving: runtime.isMoving() === true
+          || (runtime.status.automaticRoute || {}).autoHeroMove === true,
         lock_control: runtime.status.lockControl === true,
         event_active: eventIsActive(runtime),
       };

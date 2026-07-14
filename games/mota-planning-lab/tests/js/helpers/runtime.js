@@ -194,6 +194,7 @@ function makePoisonCore(options = {}) {
     maps,
     lockControl: options.lockControl === true,
     event: options.event || null,
+    automaticRoute: options.automaticRoute || { autoHeroMove: false },
   };
   const status = new Proxy(statusTarget, {
     get(target, key) {
