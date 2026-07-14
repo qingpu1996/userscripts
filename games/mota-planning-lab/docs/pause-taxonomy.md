@@ -16,6 +16,8 @@
 | `DECISION_SERVICE_UNAVAILABLE` | localhost 不可达、响应非法、仅重连错误签发 execute 或持续返回不安全计划 | `CONNECTION_FAILED`、`INVALID_RESPONSE`、`RECONNECT_UNEXPECTED_EXECUTE`、`UNSAFE_MULTI_BOUNDARY_RESPONSE` |
 | `ENGINE_API_INCOMPATIBLE` | 必需公开 API/GM API 缺失、journal storage 不稳定、签名不兼容或稳定状态无法可靠判断 | `MISSING_API`、`USERSCRIPT_API_UNAVAILABLE`、`JOURNAL_STORAGE_UNSTABLE`、`SIGNATURE_MISMATCH`、`STABILITY_TIMEOUT` |
 
+`UNSUPPORTED_REGISTERED_INTERACTION` 只在普通规划没有任何资源可承担的 supported 进展、但存在当前可达的已登记 unsupported boundary 时使用。unsupported boundary 本身永远不可穿越；旁支可绕开时保留为 frontier 并继续比较其他合法候选，不能因为它存在就全局暂停。多个可达 unsupported 的证据按距离、坐标和 block identity 稳定选择。
+
 ## 不允许人工暂停的情况
 
 知识已经登记且 schema/guard/delta 完整时，下列情况必须由决策器自动处理：

@@ -70,3 +70,5 @@ completed action 的 pre/post map instance 不同才建立 transition，同 floo
 ## 暂停
 
 暂停会停止自动路线、关闭 autopilot、保存完整当前 observation 和结构化 evidence。未知对象、伤害、交互、guard、差分、API、session 和规划预算都 fail closed。只有用户明确启动或重连才能离开暂停态。
+
+普通规划中的已登记 unsupported boundary 先作为不可穿越 frontier 留在图中。存在其他独立可达、标签完整且资源可承担的 supported 候选时不会进入 `PAUSED`；没有合法 supported 进展而仍有可达 unsupported 时，才进入 `UNSUPPORTED_INTERACTION / UNSUPPORTED_REGISTERED_INTERACTION`。这不改变 unknown block、unknown damage、incomplete label、busy、guard、recovery 或 delta 的优先 fail-closed 行为。

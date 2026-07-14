@@ -104,6 +104,38 @@ class Planner:
             registry_entries=registry_entries,
         )
 
+    def _pause_for_unsupported(
+        self,
+        boundaries: List[Boundary],
+        registry_entries: List[RegistryEntry],
+    ) -> PauseResponse:
+        """Pause on the deterministic nearest unresolved interaction frontier."""
+
+        boundary = min(
+            boundaries,
+            key=lambda item: (
+                item.distance,
+                item.block.y,
+                item.block.x,
+                item.block.id,
+                item.block.cls,
+                item.block.trigger or "",
+            ),
+        )
+        return self._pause(
+            PauseKind.UNSUPPORTED_INTERACTION,
+            "UNSUPPORTED_REGISTERED_INTERACTION",
+            f"坐标 ({boundary.block.x},{boundary.block.y}) 的已登记交互尚未实现。",
+            registry_entries,
+            block={
+                "x": boundary.block.x,
+                "y": boundary.block.y,
+                "id": boundary.block.id,
+                "cls": boundary.block.cls,
+                "trigger": boundary.block.trigger,
+            },
+        )
+
     def _expected_for(self, boundary: Boundary) -> ExpectedDelta:
         block = boundary.block
         label = boundary.label
@@ -778,23 +810,16 @@ class Planner:
 
         graph = CurrentFloorGraph(observation, labels)
         boundaries = graph.reachable_boundaries()
+        unsupported = [boundary for boundary in boundaries if not boundary.label.supported]
         planned: List[PlannedBoundary] = []
         for boundary in boundaries:
             label = boundary.label
             if not label.supported:
-                return self._pause(
-                    PauseKind.UNSUPPORTED_INTERACTION,
-                    "UNSUPPORTED_REGISTERED_INTERACTION",
-                    f"坐标 ({boundary.block.x},{boundary.block.y}) 的已登记交互尚未实现。",
-                    registry_entries,
-                    block={
-                        "x": boundary.block.x,
-                        "y": boundary.block.y,
-                        "id": boundary.block.id,
-                        "cls": boundary.block.cls,
-                        "trigger": boundary.block.trigger,
-                    },
-                )
+                # An unsupported boundary is an impassable unresolved frontier,
+                # not a global veto.  CurrentFloorGraph already excludes it
+                # from every corridor, so other independently reachable and
+                # executable boundaries may still be considered.
+                continue
             if block_label_execution_error(label) is not None:
                 return self._pause(
                     PauseKind.NEW_OBJECT_OR_MECHANISM,
@@ -841,6 +866,8 @@ class Planner:
             )
 
         if not planned:
+            if unsupported:
+                return self._pause_for_unsupported(unsupported, registry_entries)
             return IdleResponse(
                 status="idle",
                 reason="当前已观察层没有可达的已知状态变化边界。",
@@ -852,15 +879,6 @@ class Planner:
         # observed topology; world_context supplies persisted map/transition
         # facts and the bounded scoring pass considers each currently exposed
         # frontier exactly once.
-        if len(planned) > self.planning_budget:
-            return self._pause(
-                PauseKind.PLANNING_BUDGET_EXHAUSTED,
-                "WORLD_SEARCH_BUDGET_EXHAUSTED",
-                "已探索世界的当前 frontier 超出规划预算，保持现场不行动。",
-                registry_entries,
-                planning_budget=self.planning_budget,
-                frontier_count=len(planned),
-            )
         initial = ResourceState.from_observation(observation)
         scored = []
         transitions = [] if world_context is None else list(world_context.get("transitions", []))
@@ -886,10 +904,21 @@ class Planner:
                 score += 25.0
             scored.append((score, -candidate.distance, item))
         if not scored:
+            if unsupported:
+                return self._pause_for_unsupported(unsupported, registry_entries)
             return IdleResponse(
                 status="idle",
                 reason="当前已知边界都会导致生命归零或资源不足，保持现场不行动。",
                 registry_entries=registry_entries,
+            )
+        if len(scored) > self.planning_budget:
+            return self._pause(
+                PauseKind.PLANNING_BUDGET_EXHAUSTED,
+                "WORLD_SEARCH_BUDGET_EXHAUSTED",
+                "已探索世界的当前可执行 frontier 超出规划预算，保持现场不行动。",
+                registry_entries,
+                planning_budget=self.planning_budget,
+                frontier_count=len(scored),
             )
         world_result = None
         if world_context is not None and world_context.get("map_facts"):

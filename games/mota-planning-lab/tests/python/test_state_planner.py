@@ -238,6 +238,228 @@ class PlannerCycleTests(unittest.TestCase):
         response = self.cycle(make_observation(blocks=[npc]))
         self.assertEqual(response["pause_kind"], "UNSUPPORTED_INTERACTION")
 
+    def test_optional_unsupported_boundary_does_not_block_supported_door(self) -> None:
+        npc = make_block(
+            x=5, y=9, block_id="optionalNpc", cls="npcs", trigger="action",
+        )
+        door = make_block(
+            x=6, y=8, block_id="yellowDoor", cls="terrains", trigger="openDoor",
+        )
+        mark_floor(self.settings, floor_id="ENTRY", name="序章 synthetic")
+        label_block(self.settings, npc, category="npc", supported=False)
+        label_block(
+            self.settings,
+            door,
+            category="door",
+            expected_delta={"keys": {"yellow": -1}},
+        )
+
+        response = self.cycle(make_observation(
+            floor_id="ENTRY",
+            floor_name="序章 synthetic",
+            floor_number=0,
+            map_instance_id="entry-map",
+            width=13,
+            height=13,
+            x=6,
+            y=10,
+            yellow=1,
+            blocks=[npc, door],
+        ))
+
+        self.assertEqual(response["status"], "execute")
+        self.assertEqual(response["action_kind"], "OPEN_DOOR")
+        self.assertEqual(response["expected_delta"]["keys"]["yellow"], -1)
+        self.assertEqual(response["operations"][-1], {"type": "grid", "x": 6, "y": 8})
+        self.assertNotIn(
+            (5, 9),
+            {(operation["x"], operation["y"]) for operation in response["operations"]},
+        )
+
+    def test_unsupported_boundary_blocking_only_corridor_pauses_without_crossing(self) -> None:
+        npc = make_block(
+            x=6, y=9, block_id="blockingNpc", cls="npcs", trigger="action",
+        )
+        door = make_block(
+            x=6, y=8, block_id="yellowDoor", cls="terrains", trigger="openDoor",
+        )
+        mark_floor(self.settings)
+        label_block(self.settings, npc, category="npc", supported=False)
+        label_block(
+            self.settings,
+            door,
+            category="door",
+            expected_delta={"keys": {"yellow": -1}},
+        )
+
+        response = self.cycle(make_observation(
+            width=13,
+            height=13,
+            x=6,
+            y=10,
+            yellow=1,
+            valid_cells=[{"x": 6, "y": y} for y in (8, 9, 10)],
+            blocks=[door, npc],
+        ))
+
+        self.assertEqual(response["status"], "pause")
+        self.assertEqual(response["pause_kind"], "UNSUPPORTED_INTERACTION")
+        self.assertEqual(response["detail_code"], "UNSUPPORTED_REGISTERED_INTERACTION")
+        self.assertEqual(response["details"]["block"]["id"], "blockingNpc")
+        self.assertNotIn("action_id", response)
+
+    def test_only_optional_unsupported_boundary_still_pauses(self) -> None:
+        npc = make_block(
+            x=2, y=0, block_id="optionalNpc", cls="npcs", trigger="action",
+        )
+        mark_floor(self.settings)
+        label_block(self.settings, npc, category="npc", supported=False)
+
+        response = self.cycle(make_observation(blocks=[npc]))
+
+        self.assertEqual(response["status"], "pause")
+        self.assertEqual(response["pause_kind"], "UNSUPPORTED_INTERACTION")
+        self.assertEqual(response["details"]["block"]["id"], "optionalNpc")
+        self.assertNotIn("action_id", response)
+
+    def test_unaffordable_supported_boundary_falls_back_to_unsupported_pause(self) -> None:
+        npc = make_block(
+            x=1, y=0, block_id="optionalNpc", cls="npcs", trigger="action",
+        )
+        door = make_block(
+            x=0, y=1, block_id="yellowDoor", cls="terrains", trigger="openDoor",
+        )
+        mark_floor(self.settings)
+        label_block(self.settings, npc, category="npc", supported=False)
+        label_block(
+            self.settings,
+            door,
+            category="door",
+            expected_delta={"keys": {"yellow": -1}},
+        )
+
+        response = self.cycle(make_observation(yellow=0, blocks=[door, npc]))
+
+        self.assertEqual(response["status"], "pause")
+        self.assertEqual(response["pause_kind"], "UNSUPPORTED_INTERACTION")
+        self.assertEqual(response["details"]["block"]["id"], "optionalNpc")
+        self.assertNotIn("action_id", response)
+
+    def test_multiple_unsupported_boundaries_choose_deterministic_evidence(self) -> None:
+        lower = make_block(
+            x=0, y=1, block_id="npcLower", cls="npcs", trigger="action",
+        )
+        upper = make_block(
+            x=1, y=0, block_id="npcUpper", cls="npcs", trigger="action",
+        )
+        mark_floor(self.settings)
+        label_block(self.settings, lower, category="npc", supported=False)
+        label_block(self.settings, upper, category="npc", supported=False)
+
+        first = self.cycle(make_observation(x=1, y=1, blocks=[lower, upper]))
+        second_settings = make_settings(
+            Path(self.temporary.name) / "deterministic-reordered",
+            rate_limit_per_second=0,
+        )
+        self.settings = second_settings
+        mark_floor(self.settings)
+        label_block(self.settings, lower, category="npc", supported=False)
+        label_block(self.settings, upper, category="npc", supported=False)
+        second = self.cycle(make_observation(
+            session_id="reordered-session",
+            x=1,
+            y=1,
+            blocks=[upper, lower],
+        ))
+
+        for response in (first, second):
+            self.assertEqual(response["status"], "pause")
+            self.assertEqual(response["details"]["block"]["id"], "npcUpper")
+            self.assertEqual(
+                (response["details"]["block"]["x"], response["details"]["block"]["y"]),
+                (1, 0),
+            )
+
+    def test_optional_unsupported_does_not_hide_hard_fail_closed_errors(self) -> None:
+        npc = make_block(
+            x=1, y=0, block_id="optionalNpc", cls="npcs", trigger="action",
+        )
+        unknown = make_block(x=0, y=1, block_id="unknownBlock")
+        mark_floor(self.settings)
+        label_block(self.settings, npc, category="npc", supported=False)
+
+        unknown_response = self.cycle(make_observation(blocks=[npc, unknown]))
+        self.assertEqual(unknown_response["pause_kind"], "NEW_OBJECT_OR_MECHANISM")
+        self.assertEqual(unknown_response["detail_code"], "UNKNOWN_BLOCK")
+
+        other_settings = make_settings(
+            Path(self.temporary.name) / "unknown-damage",
+            rate_limit_per_second=0,
+        )
+        self.settings = other_settings
+        enemy = make_enemy_block(x=0, y=1, damage=None)
+        mark_floor(self.settings)
+        label_block(self.settings, npc, category="npc", supported=False)
+        label_block(self.settings, enemy, category="enemy")
+        damage_response = self.cycle(make_observation(
+            session_id="unknown-damage-session",
+            blocks=[npc, enemy],
+        ))
+        self.assertEqual(damage_response["pause_kind"], "UNKNOWN_DAMAGE")
+
+        incomplete_settings = make_settings(
+            Path(self.temporary.name) / "incomplete-label",
+            rate_limit_per_second=0,
+        )
+        self.settings = incomplete_settings
+        incomplete = make_block(
+            x=0, y=1, block_id="incompleteBoundary", cls="terrains", trigger=None,
+        )
+        mark_floor(self.settings)
+        self.settings.labels_path.write_text(
+            json.dumps(
+                {
+                    "protocol": 1,
+                    "labels": [
+                        {
+                            "id": npc["id"],
+                            "cls": npc["cls"],
+                            "trigger": npc["trigger"],
+                            "category": "npc",
+                            "passable": False,
+                            "boundary": True,
+                            "fast_path": False,
+                            "supported": False,
+                            "expected_delta": None,
+                            "source": "human",
+                            "version": 1,
+                        },
+                        {
+                            "id": incomplete["id"],
+                            "cls": incomplete["cls"],
+                            "trigger": incomplete["trigger"],
+                            "category": "other",
+                            "passable": False,
+                            "boundary": True,
+                            "fast_path": False,
+                            "supported": True,
+                            "expected_delta": {},
+                            "source": "human",
+                            "version": 1,
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        incomplete_response = self.cycle(make_observation(
+            session_id="incomplete-label-session",
+            blocks=[npc, incomplete],
+        ))
+        self.assertEqual(incomplete_response["pause_kind"], "NEW_OBJECT_OR_MECHANISM")
+        self.assertEqual(incomplete_response["detail_code"], "INCOMPLETE_LABEL")
+
     def test_legacy_other_boundary_without_postcondition_pauses_instead_of_executes(self) -> None:
         boundary = make_block(
             x=1,

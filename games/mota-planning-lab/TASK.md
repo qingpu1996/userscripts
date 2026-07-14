@@ -1,6 +1,6 @@
 # 魔塔规划实验室运行态代理：实施规划
 
-> v2 状态（2026-07-14）：第八轮 `192/192` 基线后的现场验证发现钥匙真实布局为 `hero.items.tools.*Key`，并推动“游戏当前运行态是唯一当前状态权威”的设计重构。本轮将浏览器采集改为前后围栏的一致快照，把服务规划输入收紧为不含历史 hero/resources 的 map facts，并保留完整 observation 仅作 action/recovery 审计。完成后仍须由主会话派发全新只读验收。下方 v0.1 章节仅作历史原型记录。
+> v2 状态（2026-07-14）：`196/196` 当前运行态权威重构后的真实序章测试发现，可绕开的已登记 unsupported NPC 会被错误当作全局否决。本轮把 unsupported 收紧为不可穿越 frontier：存在其他合法 supported 进展时跳过，只有没有合法进展时才确定性暂停；unknown/damage/incomplete 等硬门禁保持 fail closed。完成后仍须由主会话派发全新只读验收。下方 v0.1 章节仅作历史原型记录。
 
 ## Protocol v2 重构任务
 
@@ -108,6 +108,15 @@
 - [x] **F259 回归与文档**：覆盖 tools key bug、torn snapshot、API 前现场变化零执行、历史资源污染、重访 map revision，并新增当前权威专题文档及 README/protocol/world/state/compliance 说明。
 - [x] **F260 完整离线 QA 与双构建证据**：`104 JS + 91 Python + 1 integration = 196/196`；协议/schema/compile、双 dist 确定性、Acorn 静态盲玩、docs/JSON、diff 和隔离 prospective staged 检查全绿，证据位于 `qa/runs/2026-07-14-live-runtime-authority/`。
 - [ ] **F261 全新只读验收**：由主会话在本开发 Agent 结束后新建未参与开发的验收 Agent；本 Agent 不自验替代。
+
+## Optional unsupported frontier 修复
+
+- [x] **F262 根因与红灯**：真实序章同形 synthetic case 证明可绕开 NPC 会在黄门候选前触发全局 `UNSUPPORTED_REGISTERED_INTERACTION`。
+- [x] **F263 frontier 语义**：`supported=false` boundary 保持图级阻挡和未解决审计事实；有资源可承担的 supported 候选时跳过，不进入路线或 world-search 模拟。
+- [x] **F264 无合法进展暂停**：唯一通路被 unsupported 阻挡、只有 unsupported、或其他 supported 候选资源不可承担时，稳定选择最近 evidence 并暂停。
+- [x] **F265 硬门禁与原子性回归**：unknown block、unknown damage、incomplete label 仍优先 fail closed；operations 不触碰 unsupported，每次仍只有一个末端状态变化边界。
+- [x] **F266 完整离线 QA 与证据**：`104 JS + 97 Python + 1 integration = 202/202`；双 dist hash、静态盲玩、协议/schema、compile/syntax、docs/JSON、diff 与隔离 prospective index 全绿，证据位于 `qa/runs/2026-07-14-optional-unsupported-frontier/`。
+- [ ] **F267 全新只读验收**：由主会话在本修复 Agent 结束后新建未参与修复的只读验收 Agent；本 Agent 不自验替代。
 
 ## v0.1 历史原型记录（不适用于 v2 运行逻辑）
 

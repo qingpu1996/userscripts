@@ -74,4 +74,6 @@
 
 一次响应最多包含“安全空走廊到边界前 + 一个末端状态变化边界”。门、怪物、资源、NPC、机关和楼梯不能在同一行动中跨越两个。行动后必须取得改变且连续两轮一致的 observation，校验非位置 postcondition，再结算 action。下一边界只能由下一轮实时 observation 重新规划。
 
+已登记但尚未支持的边界也属于不可跨越集合。实时重规划可以跳过一个可绕开的 optional unsupported frontier，选择另一个独立可达且当前资源可承担的 supported 边界；不能把 unsupported 当作可通行地形，也不能在没有其他合法进展时返回 idle 或尝试穿越。
+
 刷新时不能简单丢弃 pre observation：如果当前 fingerprint 等于 pre，证明尚未执行并重发同一 action ID；如果真实现场满足 expected post，补记 completed；否则暂停为恢复歧义。该审计链与“游戏现场是当前权威”并不冲突——账本只解释动作历史，永远不能把旧面板写回或覆盖现场。

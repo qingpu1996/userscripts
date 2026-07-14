@@ -1048,8 +1048,9 @@ class SessionWorldAndCorsTests(unittest.TestCase):
         stair = make_block(x=1, y=0, block_id="upFloor", cls="terrains", trigger="changeFloor")
         resource = make_block(x=0, y=1, block_id="hugeAttack", cls="items", trigger="getItem")
         door = make_block(x=2, y=1, block_id="yellowDoor", cls="terrains", trigger="openDoor")
+        npc = make_block(x=2, y=0, block_id="optionalNpc", cls="npcs", trigger="action")
         observation = Observation.model_validate(make_observation(
-            width=3, height=2, blocks=[stair, resource, door], map_instance_id="A",
+            width=3, height=2, blocks=[stair, resource, door, npc], map_instance_id="A",
         ))
         labels = {}
         for block, category, delta in (
@@ -1063,6 +1064,12 @@ class SessionWorldAndCorsTests(unittest.TestCase):
                 expected_delta=delta,
             )
             labels[label.identity] = label
+        npc_label = BlockLabel(
+            id=npc["id"], cls=npc["cls"], trigger=npc["trigger"],
+            category="npc", passable=False, boundary=True, fast_path=False,
+            supported=False,
+        )
+        labels[npc_label.identity] = npc_label
         scan_state = {
             "phase": "discover", "anchor_map_instance_id": "A",
             "current_map_instance_id": "A", "scanned_map_instance_ids": ["A"],
@@ -1084,7 +1091,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
         self.assertIn("scan", response.reason.lower())
 
         no_exit = Observation.model_validate(make_observation(
-            width=3, height=2, blocks=[resource, door], map_instance_id="A",
+            width=3, height=2, blocks=[resource, door, npc], map_instance_id="A",
         ))
         completed = Planner().plan(
             no_exit, labels,
