@@ -169,6 +169,45 @@ class Observation(StrictModel):
         return self
 
 
+class HistoricalMapFact(StrictModel):
+    """Planning-safe projection of a legally observed map revision.
+
+    Hero panel values and keys are intentionally absent.  `observed_anchor` is
+    historical geometry evidence (the position from which this map snapshot was
+    observed), never a claim about the hero's current location.
+    """
+
+    snapshot_fingerprint: Fingerprint
+    session_id: constr(strict=True, min_length=1, max_length=128)
+    floor_id: NonEmptyString
+    floor_name: Optional[constr(strict=True, max_length=128)]
+    floor_number: Optional[StrictInt]
+    dimensions: Dimensions
+    topology: Topology
+    topology_fingerprint: Fingerprint
+    map_instance_id: constr(strict=True, min_length=1, max_length=256)
+    observed_anchor: Position
+    blocks: List[Block] = Field(max_length=8192)
+    captured_at: NonNegativeInt
+
+    @model_validator(mode="after")
+    def coordinates_match_topology(self) -> "HistoricalMapFact":
+        width, height = self.dimensions.width, self.dimensions.height
+        coordinates = [(self.observed_anchor.x, self.observed_anchor.y)] + [
+            (block.x, block.y) for block in self.blocks
+        ]
+        if any(x >= width or y >= height for x, y in coordinates):
+            raise ValueError("historical map fact coordinate is outside dimensions")
+        block_coordinates = [(block.x, block.y) for block in self.blocks]
+        if len(block_coordinates) != len(set(block_coordinates)):
+            raise ValueError("historical map fact blocks must have unique coordinates")
+        if self.topology.valid_cells is not None:
+            valid = {(cell.x, cell.y) for cell in self.topology.valid_cells}
+            if any(coordinate not in valid for coordinate in coordinates):
+                raise ValueError("historical map fact coordinate is outside valid topology")
+        return self
+
+
 SessionMode = Literal["new_game", "handoff_expected_guard", "resume_existing_ledger"]
 
 

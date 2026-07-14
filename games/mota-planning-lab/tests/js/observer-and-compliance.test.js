@@ -24,6 +24,74 @@ test("adapter 延迟解析页面运行时，未就绪时 stop 也不会掩盖暂
   assert.equal(lab.collectObservation(adapter).hero.hp, 208);
 });
 
+test("真实 hero.items.tools 钥匙布局读取 1/1/1，缺失、残缺或冲突都 fail closed", () => {
+  const fixture = JSON.parse(fs.readFileSync(
+    path.join(projectDir, "tests/fixtures/runtime-hero-shapes-v2.json"),
+    "utf8",
+  ));
+  const liveCase = fixture.cases.find((item) => item.name === "h5mota-24-live-tools-layout");
+  const liveShape = makePoisonCore({
+    hero: liveCase.hero,
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      lab.collectObservation(lab.createEngineAdapter(liveShape.scope)).keys,
+    )),
+    liveCase.expected_keys,
+  );
+
+  const cases = [
+    {
+      code: "MISSING_KEY_LAYOUT",
+      hero: { hp: 10, atk: 1, def: 1, money: 0, exp: 0,
+        loc: { x: 1, y: 1, direction: "up" } },
+    },
+    {
+      code: "INCOMPLETE_KEY_LAYOUT",
+      hero: { hp: 10, atk: 1, def: 1, money: 0, exp: 0,
+        loc: { x: 1, y: 1, direction: "up" },
+        items: { tools: { yellowKey: 1 } } },
+    },
+    {
+      code: "CONFLICTING_KEY_LAYOUT",
+      hero: { hp: 10, atk: 1, def: 1, money: 0, exp: 0,
+        loc: { x: 1, y: 1, direction: "up" },
+        items: {
+          tools: { yellowKey: 1, blueKey: 1, redKey: 1 },
+          keys: { yellowKey: 2, blueKey: 1, redKey: 1 },
+        } },
+    },
+  ];
+  for (const sample of cases) {
+    const fake = makePoisonCore({ hero: sample.hero });
+    assert.throws(
+      () => lab.collectObservation(lab.createEngineAdapter(fake.scope)),
+      (error) => error.pause_kind === "ENGINE_API_INCOMPATIBLE"
+        && error.detail_code === sample.code,
+    );
+  }
+});
+
+test("同步采集用运行态前后围栏重试瞬时变化并拒绝持续 torn snapshot", () => {
+  const once = makePoisonCore({
+    onBlocks(call, hero) { if (call === 1) hero.loc.x = 7; },
+  });
+  const recovered = lab.collectObservation(lab.createEngineAdapter(once.scope));
+  assert.equal(recovered.hero.loc.x, 7);
+  assert.equal(once.calls.blocks, 2);
+
+  const unstable = makePoisonCore({
+    onBlocks(_call, hero) { hero.loc.x = hero.loc.x === 8 ? 7 : 8; },
+  });
+  assert.throws(
+    () => lab.collectObservation(lab.createEngineAdapter(unstable.scope)),
+    (error) => error.pause_kind === "ENGINE_API_INCOMPATIBLE"
+      && error.detail_code === "RUNTIME_SNAPSHOT_UNSTABLE"
+      && error.details.attempts.length === 3,
+  );
+  assert.equal(unstable.calls.blocks, 3);
+});
+
 test("毒值运行时只读取当前层白名单并序列化 11x11 观察", () => {
   const enemy = {
     x: 9,

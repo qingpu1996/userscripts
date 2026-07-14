@@ -43,6 +43,16 @@ assert.deepEqual(topologies.cases.map((entry) => [
 ]), [[11, 11], [13, 13], [7, 19], [5, 4]]);
 assert.ok(topologies.cases.at(-1).valid_cells.length < 20);
 
+const heroShapes = read("tests/fixtures/runtime-hero-shapes-v2.json");
+assert.equal(heroShapes.protocol, 2);
+const liveTools = heroShapes.cases.find(
+  (entry) => entry.name === "h5mota-24-live-tools-layout",
+);
+assert.deepEqual(liveTools.hero.items.tools, {
+  yellowKey: 1, blueKey: 1, redKey: 1,
+});
+assert.deepEqual(liveTools.expected_keys, { yellow: 1, blue: 1, red: 1 });
+
 for (const schemaName of [
   "observation.schema.json",
   "cycle-request.schema.json",
@@ -52,4 +62,4 @@ for (const schemaName of [
   assert.equal(schema.$schema, "https://json-schema.org/draft/2020-12/schema");
 }
 
-console.log("Fixture and schema provenance: PASS (7 active JSON fixtures; v0.1 handoff archived)");
+console.log("Fixture and schema provenance: PASS (8 active JSON fixtures; v0.1 handoff archived)");

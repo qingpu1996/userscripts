@@ -218,6 +218,27 @@ test("guard 不符时所有行动 API 调用数为零", async () => {
   assert.equal(adapter.calls.direct.length + adapter.calls.route.length, 0);
 });
 
+test("pending 落盘后行动 API 前再次读取现场，变化即零执行", async () => {
+  const before = makeObservation();
+  const changed = makeObservation({ hero: { hp: before.hero.hp - 1 } });
+  const adapter = makeAdapter();
+  await assert.rejects(
+    lab.executeAction({
+      action: makeAction(before, [{ type: "grid", x: 10, y: 3 }], {
+        position: { x: 10, y: 3 },
+      }),
+      initialObservation: before,
+      registry: lab.createBlockRegistry(),
+      adapter,
+      observe: () => changed,
+      stabilityOptions: fastStability,
+    }),
+    (error) => error.pause_kind === "GUARD_MISMATCH"
+      && ["PRE_ACTION_GUARD_MISMATCH", "PRE_ACTION_RUNTIME_CHANGED"].includes(error.detail_code),
+  );
+  assert.equal(adapter.calls.direct.length + adapter.calls.route.length, 0);
+});
+
 test("稳定判定要求 fingerprint 改变、非 busy 且连续两次一致", async () => {
   const before = makeObservation();
   const changedBusy = makeObservation({ hero: { loc: { x: 9, y: 3 } }, busy: true });

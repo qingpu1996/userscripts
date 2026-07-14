@@ -144,15 +144,34 @@ MotaLab.executeAction = async function executeAction({
   observe,
   stabilityOptions = {},
 }) {
-  const guardResult = MotaLab.compareGuard(initialObservation, action.guard);
+  // The observation used to request the decision is evidence, not a lease on
+  // mutable game state.  Re-read the complete current runtime immediately
+  // before the first engine API call and require it to be byte-equivalent under
+  // the protocol fingerprint.  This closes the journal-persistence window
+  // between the controller guard check and actual execution.
+  const executionObservation = observe();
+  const guardResult = MotaLab.compareGuard(executionObservation, action.guard);
   if (!guardResult.ok) {
     throw MotaLab.createPauseError(
       "GUARD_MISMATCH",
       "PRE_ACTION_GUARD_MISMATCH",
-      { differences: guardResult.differences },
+      { differences: guardResult.differences, observation: executionObservation },
     );
   }
-  const plan = MotaLab.planOperations(action, initialObservation, registry, adapter);
+  const expectedFingerprint = MotaLab.fingerprintObservation(initialObservation);
+  const executionFingerprint = MotaLab.fingerprintObservation(executionObservation);
+  if (executionFingerprint !== expectedFingerprint) {
+    throw MotaLab.createPauseError(
+      "GUARD_MISMATCH",
+      "PRE_ACTION_RUNTIME_CHANGED",
+      {
+        expected_fingerprint: expectedFingerprint,
+        actual_fingerprint: executionFingerprint,
+        observation: executionObservation,
+      },
+    );
+  }
+  const plan = MotaLab.planOperations(action, executionObservation, registry, adapter);
   const allowUnknownFloor = action.expected_delta.floor_id === null
     && plan.length > 0 && plan[plan.length - 1].category === "stair";
   const allowUnknownMapInstance = action.expected_delta.map_instance_id === null
@@ -160,11 +179,11 @@ MotaLab.executeAction = async function executeAction({
   MotaLab.validateExpectedDelta(action.expected_delta, {
     allowUnknownFloor,
     allowUnknownMapInstance,
-    dimensions: initialObservation.dimensions,
-    topology: initialObservation.topology,
+    dimensions: executionObservation.dimensions,
+    topology: executionObservation.topology,
   });
-  let beforeStep = initialObservation;
-  let beforeFingerprint = MotaLab.fingerprintObservation(beforeStep);
+  let beforeStep = executionObservation;
+  let beforeFingerprint = executionFingerprint;
 
   for (let index = 0; index < plan.length; index += 1) {
     const step = plan[index];

@@ -359,11 +359,12 @@ test("Tampermonkey storage 以 key existence 区分 absent 与真实损坏值", 
   assert.equal(listFailed.environment.storage.inspect(v2Key).status, "storage_unstable");
 });
 
-test("运行态尺寸驱动 13x13 与 7x19，且 hero.exp/缺失钥匙归一化", () => {
+test("运行态尺寸驱动 13x13 与 7x19，且 hero.exp/显式钥匙归一化", () => {
   for (const [width, height] of [[13, 13], [7, 19]]) {
     const hero = {
       hp: 1000, atk: 10, def: 10, money: 0, exp: 7,
       loc: { x: width - 1, y: height - 1, direction: "up" },
+      items: { keys: { yellowKey: 0, blueKey: 0, redKey: 0 } },
     };
     const fake = makePoisonCore({
       floorId: `runtime-${width}x${height}`,
@@ -387,6 +388,7 @@ test("异形 current dynamic grid 产生 valid_cells，寻路不穿过空洞", (
     hero: {
       hp: 10, atk: 1, def: 1, money: 0, exp: 0,
       loc: { x: 2, y: 0, direction: "left" },
+      items: { keys: { yellowKey: 0, blueKey: 0, redKey: 0 } },
     },
   });
   const observation = lab.collectObservation(lab.createEngineAdapter(fake.scope));
@@ -552,7 +554,8 @@ test("dimensions 与动态 grid 联合校验：ragged/缺行/短行转 valid_cel
       floorId: item.name,
       currentMap: { title: item.name, width: 3, height: 3, map: item.grid },
       hero: { hp: 10, atk: 1, def: 1, money: 0, exp: 0,
-        loc: { x: 0, y: 0, direction: "down" } },
+        loc: { x: 0, y: 0, direction: "down" },
+        items: { keys: { yellowKey: 0, blueKey: 0, redKey: 0 } } },
     });
     const observation = lab.collectObservation(lab.createEngineAdapter(fake.scope));
     assert.equal(observation.topology.kind, "valid_cells", item.name);
@@ -563,7 +566,8 @@ test("dimensions 与动态 grid 联合校验：ragged/缺行/短行转 valid_cel
     currentMap: { title: "full", width: 3, height: 3,
       map: [[0, 0, 0], [0, 0, 0], [0, 0, 0]] },
     hero: { hp: 10, atk: 1, def: 1, money: 0, exp: 0,
-      loc: { x: 0, y: 0, direction: "down" } },
+      loc: { x: 0, y: 0, direction: "down" },
+      items: { keys: { yellowKey: 0, blueKey: 0, redKey: 0 } } },
   });
   assert.deepEqual(
     JSON.parse(JSON.stringify(lab.collectObservation(lab.createEngineAdapter(full.scope)).topology)),
@@ -573,7 +577,8 @@ test("dimensions 与动态 grid 联合校验：ragged/缺行/短行转 valid_cel
     currentMap: { title: "conflict", width: 3, height: 3,
       map: [[0, 0, 0], [0, 0, 0], [0, 0, 0]], valid_cells: [{ x: 0, y: 0 }] },
     hero: { hp: 10, atk: 1, def: 1, money: 0, exp: 0,
-      loc: { x: 0, y: 0, direction: "down" } },
+      loc: { x: 0, y: 0, direction: "down" },
+      items: { keys: { yellowKey: 0, blueKey: 0, redKey: 0 } } },
   });
   assert.throws(
     () => lab.collectObservation(lab.createEngineAdapter(conflict.scope)),
@@ -699,6 +704,7 @@ test("direct mount fake core完成只读初始化且只使用隔离的 witness/A
     hero: {
       hp: 100, atk: 10, def: 10, money: 0, exp: 0,
       loc: { x: 6, y: 10, direction: "up" },
+      items: { tools: { yellowKey: 1, blueKey: 1, redKey: 1 } },
     },
   });
   const journal = lab.createJournal(environment.storage);

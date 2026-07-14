@@ -31,6 +31,10 @@
 }
 ```
 
+浏览器必须在一次同步采集内生成整份 observation。读取当前 map、blocks 和可见怪物前后，至少核对 floorId、hero 完整面板/位置/keys 与 moving/lock/event 围栏；前后不一致则丢弃并同步重试，持续不稳定以 `RUNTIME_SNAPSHOT_UNSTABLE` 暂停。服务不能逐字段回调页面 JS，也不能用上一轮 observation 回填本轮缺失字段。
+
+三色钥匙不允许缺失后默认为零。适配器支持 `hero.items.tools`、`hero.items.keys` 和 `hero.keys` 三种显式布局；每个候选必须完整，多个候选同时存在时数值必须一致，否则以 `ENGINE_API_INCOMPATIBLE` 暂停。
+
 `rectangle` 必须省略 `valid_cells`；`valid_cells` 必须非空、唯一并位于 dimensions 内。英雄、block、operation、guard 坐标均需同时位于 dimensions 和有效格。浏览器最多发送 8192 个 block；轴上限 256。
 
 当前动态 map 同时提供 `dimensions` 与 `grid` 时，两者必须联合校验：完整无洞且每行等长才可确认为 `rectangle`；空行、缺尾行、短行或稀疏洞必须降为从实际 grid 单元推导的 `valid_cells`；grid 越界或显式 valid cells 与 grid 冲突则拒绝观察。不能因声明了 dimensions 就把 ragged grid 补成矩形。
@@ -56,6 +60,8 @@
 ## Execute response
 
 guard 必须包含：`session_id`、`map_instance_id`、`dimensions`、`topology_fingerprint`、`floor_id/floor`、完整位置面板和 keys。浏览器在行动 API 前重读并精确核对。
+
+决策请求 observation、controller guard capture 与行动 API 前 capture 是三个 fresh current-runtime 检查点。pending 先持久化；真正调用引擎 API 前仍须再次读取，fingerprint 或 guard 已变化则零执行。行动后的 observation 同样来自 fresh capture，并要求相同 fingerprint 稳定两轮。
 
 operations 最多两段，末段最多一个状态变化边界。所有坐标必须位于 guard dimensions；浏览器还用当前 topology 复核。边界必须有可验证的非位置 postcondition；门、资源、怪物必须声明目标 block 移除。
 

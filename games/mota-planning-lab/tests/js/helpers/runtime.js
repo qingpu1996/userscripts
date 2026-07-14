@@ -101,6 +101,7 @@ function makeGuard(observation = makeObservation()) {
 function makePoisonCore(options = {}) {
   const calls = {
     mapKeys: [],
+    blocks: 0,
     enemyInfo: [],
     damage: [],
     direct: [],
@@ -148,6 +149,8 @@ function makePoisonCore(options = {}) {
       if (String(floorId) !== String(currentFloorId) || includeDisabled !== true) {
         throw new Error("wrong current block request");
       }
+      calls.blocks += 1;
+      if (options.onBlocks) options.onBlocks(calls.blocks, hero);
       return blocks;
     },
     getEnemyInfo(id, heroArgument, x, y, floorId) {

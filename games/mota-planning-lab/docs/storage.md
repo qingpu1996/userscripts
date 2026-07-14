@@ -1,5 +1,7 @@
 # SQLite generation 与恢复
 
+SQLite 是历史知识与行动审计库，不是游戏当前状态缓存。`observations`/`map_snapshots` 中的完整 payload 为 fingerprint、pending/completed 恢复、expected-delta 和暂停取证保留；规划查询必须经 `latest_map_facts()` 投影，删除历史 hero、keys 与 busy，只暴露 revisioned topology、blocks 和 observed anchor。当前资源永远来自本轮 cycle observation。
+
 ## 浏览器 journal A/B generation
 
 SQLite ledger 之外，userscript/direct mount journal 是 at-most-once 身份链的浏览器端一半。它不再覆盖单一 active key，也没有权威 pointer。两个槽分别保存完整 envelope：`storage_protocol`、单调 `generation`、`previous_generation`、`previous_commit_hash`、完整 v2 state、`state_hash`、首次导入 witness 与 `commit_hash`。

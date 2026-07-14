@@ -1,6 +1,6 @@
 # 魔塔规划实验室运行态代理：实施规划
 
-> v2 状态（2026-07-14）：以第七轮 `188/188` 离线基线为起点，第八轮独立只读验收提出的 2 个 P1 与 1 个 P2 已由第八个全新一次性修复完成；AST 现按词法 binding 与可解析调用传播，journal envelope 强制自身相邻前代，扩展离线 QA 为 `192/192`。下一步必须由主会话派发全新只读复验。下方 v0.1 章节仅作历史原型记录。
+> v2 状态（2026-07-14）：第八轮 `192/192` 基线后的现场验证发现钥匙真实布局为 `hero.items.tools.*Key`，并推动“游戏当前运行态是唯一当前状态权威”的设计重构。本轮将浏览器采集改为前后围栏的一致快照，把服务规划输入收紧为不含历史 hero/resources 的 map facts，并保留完整 observation 仅作 action/recovery 审计。完成后仍须由主会话派发全新只读验收。下方 v0.1 章节仅作历史原型记录。
 
 ## Protocol v2 重构任务
 
@@ -97,6 +97,17 @@
 - [x] **F251 journal 前代自证**：generation 1 固定 `previous_generation=0` 且 previous commit 为 null；generation >1 必须在单 envelope 内满足 `previous_generation=generation-1`，安全整数溢出 fail closed；双槽仍继续校验相邻 commit hash。
 - [x] **F252 第八轮完整离线 QA 与证据**：从第七轮 `188/188` 基线扩展到 `101 JS + 90 Python + 1 integration = 192/192`；targeted、双 dist 重建、协议/schema/compile/static/deterministic/docs/JSON/diff 与隔离 prospective index 全绿，fix-8 evidence 已固化。
 - [ ] **F253 第八轮全新只读复验**：由主会话在本修复 Agent 结束后新建未参与修复的验收 Agent；本 Agent 不自验替代。
+
+## 当前运行态唯一权威重构
+
+- [x] **F254 live observation 一致采集**：当前 map/blocks/怪物采集前后核对 floor、完整 hero/keys 与 moving/lock/event 围栏；瞬时变化重试，持续变化 `RUNTIME_SNAPSHOT_UNSTABLE` fail closed。
+- [x] **F255 钥匙布局显式兼容**：支持 `hero.items.tools`、`hero.items.keys`、`hero.keys`；真实 tools fixture 为 `1/1/1`，缺失、残缺、别名冲突和多布局冲突均禁止默认为零。
+- [x] **F256 三处 fresh runtime 门禁**：cycle 起点、guard/plan 前和 pending durable 后行动 API 前均重采；行动后继续要求改变且稳定两轮的完整 observation，再做 expected delta。
+- [x] **F257 历史地图事实投影**：SQLite 完整 observation 只保留作恢复/审计；planner 只接收 revisioned `HistoricalMapFact`，其中无 hero、keys、busy，跨图模拟的资源向量只来自本轮 live observation。
+- [x] **F258 实时原子重规划**：每次仍只签一个状态边界，空走廊不跨边界；可达性、路线、估值和世界搜索队列每轮重算，未增加 current-state mirror 或持久派生 route cache。
+- [x] **F259 回归与文档**：覆盖 tools key bug、torn snapshot、API 前现场变化零执行、历史资源污染、重访 map revision，并新增当前权威专题文档及 README/protocol/world/state/compliance 说明。
+- [x] **F260 完整离线 QA 与双构建证据**：`104 JS + 91 Python + 1 integration = 196/196`；协议/schema/compile、双 dist 确定性、Acorn 静态盲玩、docs/JSON、diff 和隔离 prospective staged 检查全绿，证据位于 `qa/runs/2026-07-14-live-runtime-authority/`。
+- [ ] **F261 全新只读验收**：由主会话在本开发 Agent 结束后新建未参与开发的验收 Agent；本 Agent 不自验替代。
 
 ## v0.1 历史原型记录（不适用于 v2 运行逻辑）
 

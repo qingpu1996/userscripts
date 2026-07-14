@@ -17,7 +17,12 @@ from threading import RLock
 from typing import Any, Dict, Iterator, Mapping, Optional
 
 from .models import Guard, Observation, SessionMode
-from .state import canonical_json, observation_fingerprint, observation_payload
+from .state import (
+    canonical_json,
+    historical_map_fact_payload,
+    observation_fingerprint,
+    observation_payload,
+)
 
 
 class LedgerError(RuntimeError):
@@ -1172,19 +1177,24 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def latest_map_observations(self, session_id: str) -> list[Dict[str, Any]]:
-        """Return one latest legally observed snapshot for every map instance."""
+    def latest_map_facts(self, session_id: str) -> list[Dict[str, Any]]:
+        """Return latest revisioned map facts without historical hero/resources."""
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT map_instance_id,payload_json FROM map_snapshots
+                SELECT fingerprint,map_instance_id,payload_json FROM map_snapshots
                 WHERE session_id=? ORDER BY captured_at DESC,rowid DESC
                 """,
                 (session_id,),
             ).fetchall()
         latest: Dict[str, Dict[str, Any]] = {}
         for row in rows:
-            latest.setdefault(row["map_instance_id"], json.loads(row["payload_json"]))
+            if row["map_instance_id"] in latest:
+                continue
+            observation = Observation.model_validate(json.loads(row["payload_json"]))
+            latest[row["map_instance_id"]] = historical_map_fact_payload(
+                observation, str(row["fingerprint"])
+            )
         return list(latest.values())
 
     def close(self) -> None:

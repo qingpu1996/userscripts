@@ -19,7 +19,11 @@ from mota_lab.guards import guard_from_observation
 from mota_lab.models import CycleRequest, ExpectedDelta, Observation
 from mota_lab.models import BlockLabel
 from mota_lab.planner import Planner
-from mota_lab.state import CurrentFloorGraph, observation_fingerprint
+from mota_lab.state import (
+    CurrentFloorGraph,
+    historical_map_fact_payload,
+    observation_fingerprint,
+)
 from mota_lab.deltas import validate_expected_delta
 from mota_lab.storage import (
     ActionConflict,
@@ -37,6 +41,12 @@ from mota_test_support import (
     make_settings,
     mark_floor,
 )
+
+
+def map_fact(observation: Observation) -> dict:
+    return historical_map_fact_payload(
+        observation, observation_fingerprint(observation)
+    )
 
 
 class ProtocolV2TopologyTests(unittest.TestCase):
@@ -101,6 +111,22 @@ class ProtocolV2TopologyTests(unittest.TestCase):
                 rows = store.map_instances_for_session(first.session_id)
                 self.assertEqual({row["map_instance_id"] for row in rows}, {"F1-main", "F1-side", "F1-side-engine"})
                 self.assertEqual({row["floor_number"] for row in rows}, {1})
+                revisited = Observation.model_validate(make_observation(
+                    map_instance_id="F1-main", hp=1, yellow=0,
+                    blocks=[make_block(x=1, y=0, block_id="revisitBlock")],
+                    captured_at=first.captured_at + 100,
+                ))
+                revisited_fp = store.record_observation(revisited)
+                store.record_world_snapshot(revisited, revisited_fp)
+                facts = store.latest_map_facts(first.session_id)
+                main_fact = next(
+                    fact for fact in facts if fact["map_instance_id"] == "F1-main"
+                )
+                self.assertNotIn("hero", main_fact)
+                self.assertNotIn("keys", main_fact)
+                self.assertNotIn("busy", main_fact)
+                self.assertEqual(main_fact["snapshot_fingerprint"], revisited_fp)
+                self.assertEqual([block["id"] for block in main_fact["blocks"]], ["revisitBlock"])
                 version = store._connection.execute("PRAGMA user_version").fetchone()[0]
                 self.assertEqual(version, 2)
                 illegal_raw = make_observation(map_instance_id="F1-main")
@@ -884,10 +910,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
             first,
             {stair_label.identity: stair_label, resource_label.identity: resource_label},
             {
-                "observations": [
-                    first.model_dump(mode="json", exclude_unset=True),
-                    second.model_dump(mode="json", exclude_unset=True),
-                ],
+                "map_facts": [map_fact(first), map_fact(second)],
                 "transitions": [{
                     "from_map_instance_id": "A", "to_map_instance_id": "B",
                     "from_x": 1, "from_y": 0, "to_x": 0, "to_y": 0,
@@ -904,10 +927,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
             first,
             {stair_label.identity: stair_label, resource_label.identity: resource_label},
             {
-                "observations": [
-                    first.model_dump(mode="json", exclude_unset=True),
-                    second.model_dump(mode="json", exclude_unset=True),
-                ],
+                "map_facts": [map_fact(first), map_fact(second)],
                 "map_instances": [
                     {
                         "map_instance_id": "A", "floor_id": "A",
@@ -930,6 +950,74 @@ class SessionWorldAndCorsTests(unittest.TestCase):
         self.assertEqual(stale_result.path_length, 1)
         self.assertLess(stale_result.score, 300)
 
+    def test_world_search_uses_only_live_resources_not_historical_map_state(self) -> None:
+        stair = make_block(
+            x=1, y=0, block_id="upFloor", cls="terrains", trigger="changeFloor"
+        )
+        door = make_block(
+            x=1, y=0, block_id="yellowDoor", cls="terrains", trigger="openDoor"
+        )
+        resource = make_block(
+            x=2, y=0, block_id="remoteAttack", cls="items", trigger="getItem"
+        )
+        current = Observation.model_validate(make_observation(
+            width=2, height=1, blocks=[stair], map_instance_id="A", floor_id="A",
+            yellow=0, hp=20,
+        ))
+        historical_remote = Observation.model_validate(make_observation(
+            width=3, height=1, blocks=[door, resource], map_instance_id="B", floor_id="B",
+            yellow=99, hp=9999,
+        ))
+        stair_label = BlockLabel(
+            id=stair["id"], cls=stair["cls"], trigger=stair["trigger"],
+            category="stair", passable=False, boundary=True, fast_path=False,
+        )
+        door_label = BlockLabel(
+            id=door["id"], cls=door["cls"], trigger=door["trigger"],
+            category="door", passable=False, boundary=True, fast_path=False,
+            expected_delta={"keys": {"yellow": -1}},
+        )
+        resource_label = BlockLabel(
+            id=resource["id"], cls=resource["cls"], trigger=resource["trigger"],
+            category="resource", passable=False, boundary=True, fast_path=False,
+            expected_delta={"attack": 10},
+        )
+        result, exhausted = Planner(planning_budget=32)._world_search(
+            current,
+            {stair_label.identity: stair_label, door_label.identity: door_label,
+             resource_label.identity: resource_label},
+            {
+                "map_facts": [map_fact(current), map_fact(historical_remote)],
+                "transitions": [{
+                    "from_map_instance_id": "A", "to_map_instance_id": "B",
+                    "from_x": 1, "from_y": 0, "to_x": 0, "to_y": 0,
+                }],
+            },
+        )
+        self.assertFalse(exhausted)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.first.boundary.block.id, "upFloor")
+        self.assertEqual(result.path_length, 1)
+
+        with_key = Observation.model_validate(make_observation(
+            width=2, height=1, blocks=[stair], map_instance_id="A", floor_id="A",
+            yellow=1, hp=20,
+        ))
+        unlocked, _ = Planner(planning_budget=32)._world_search(
+            with_key,
+            {stair_label.identity: stair_label, door_label.identity: door_label,
+             resource_label.identity: resource_label},
+            {
+                "map_facts": [map_fact(with_key), map_fact(historical_remote)],
+                "transitions": [{
+                    "from_map_instance_id": "A", "to_map_instance_id": "B",
+                    "from_x": 1, "from_y": 0, "to_x": 0, "to_y": 0,
+                }],
+            },
+        )
+        self.assertIsNotNone(unlocked)
+        self.assertGreaterEqual(unlocked.path_length, 3)
+
     def test_unknown_exit_is_opaque_and_never_scores_resource_behind_it(self) -> None:
         stair = make_block(x=1, y=0, block_id="upFloor", cls="terrains", trigger="changeFloor")
         resource = make_block(x=2, y=0, block_id="behindStair", cls="items", trigger="getItem")
@@ -948,7 +1036,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
         result, exhausted = Planner(planning_budget=32)._world_search(
             observation,
             {stair_label.identity: stair_label, resource_label.identity: resource_label},
-            {"observations": [observation.model_dump(mode="json", exclude_unset=True)], "transitions": []},
+            {"map_facts": [map_fact(observation)], "transitions": []},
         )
         self.assertFalse(exhausted)
         self.assertIsNotNone(result)
@@ -985,7 +1073,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
             observation, labels,
             action_id_factory=lambda: "AUTO-0000000000000001",
             registry_entries=[],
-            world_context={"observations": [observation.model_dump(mode="json", exclude_unset=True)], "transitions": []},
+            world_context={"map_facts": [map_fact(observation)], "transitions": []},
             scan_state=scan_state,
         )
         self.assertEqual(response.status, "execute")
@@ -1002,7 +1090,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
             no_exit, labels,
             action_id_factory=lambda: "AUTO-0000000000000002",
             registry_entries=[],
-            world_context={"observations": [no_exit.model_dump(mode="json", exclude_unset=True)], "transitions": []},
+            world_context={"map_facts": [map_fact(no_exit)], "transitions": []},
             scan_state=scan_state,
         )
         self.assertEqual(completed.status, "idle")
@@ -1030,7 +1118,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
             action_id_factory=lambda: "AUTO-0000000000000001",
             registry_entries=[],
             world_context={
-                "observations": [item.model_dump(mode="json", exclude_unset=True) for item in (a, b, c)],
+                "map_facts": [map_fact(item) for item in (a, b, c)],
                 "transitions": [
                     {"from_map_instance_id": "A", "to_map_instance_id": "B", "from_x": 1, "from_y": 0, "to_x": 0, "to_y": 0},
                     {"from_map_instance_id": "A", "to_map_instance_id": "C", "from_x": 0, "from_y": 1, "to_x": 0, "to_y": 0},
@@ -1068,7 +1156,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
             "pending_exits": [], "traversed_transitions": [], "reason": "complete",
         }
         context = {
-            "observations": [item.model_dump(mode="json", exclude_unset=True) for item in (a, b, c)],
+            "map_facts": [map_fact(item) for item in (a, b, c)],
             "transitions": [{
                 "from_map_instance_id": "A", "to_map_instance_id": "B",
                 "from_x": 1, "from_y": 0, "to_x": 0, "to_y": 0,
@@ -1143,10 +1231,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
             "pending_exits": [], "traversed_transitions": traversed, "reason": "scan",
         }
         base_context = {
-            "observations": [
-                a.model_dump(mode="json", exclude_unset=True),
-                b.model_dump(mode="json", exclude_unset=True),
-            ],
+            "map_facts": [map_fact(a), map_fact(b)],
             "transitions": [{
                 "from_map_instance_id": "A", "to_map_instance_id": "B",
                 "from_x": 1, "from_y": 0, "to_x": 0, "to_y": 0,
@@ -1161,10 +1246,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
         self.assertEqual(paused.scan_state.phase, "paused")
 
         reversible_context = copy.deepcopy(base_context)
-        reversible_context["observations"] = [
-            a.model_dump(mode="json", exclude_unset=True),
-            b_with_return.model_dump(mode="json", exclude_unset=True),
-        ]
+        reversible_context["map_facts"] = [map_fact(a), map_fact(b_with_return)]
         reversible_context["transitions"].append({
             "from_map_instance_id": "B", "to_map_instance_id": "A",
             "from_x": 1, "from_y": 0, "to_x": 1, "to_y": 0,
@@ -1199,7 +1281,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
                 pre, {label.identity: label},
                 action_id_factory=lambda: "AUTO-0000000000000001",
                 registry_entries=[],
-                world_context={"observations": [pre.model_dump(mode="json", exclude_unset=True)], "transitions": []},
+                world_context={"map_facts": [map_fact(pre)], "transitions": []},
                 scan_state=store.get_scan_state(pre.session_id),
             )
             wire = response.model_dump(mode="json", exclude_unset=True)

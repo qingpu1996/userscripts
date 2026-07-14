@@ -14,6 +14,7 @@ from .models import (
     ExecuteResponse,
     ExpectedDelta,
     GridOperation,
+    HistoricalMapFact,
     IdleResponse,
     Observation,
     PauseKind,
@@ -24,7 +25,13 @@ from .models import (
     expected_delta_has_verifiable_non_position_postcondition,
 )
 from .search import SearchCandidate
-from .state import Boundary, CurrentFloorGraph, canonical_json
+from .state import (
+    Boundary,
+    CurrentFloorGraph,
+    canonical_json,
+    historical_map_fact_payload,
+    observation_fingerprint,
+)
 from .valuation import ResourceState, apply_delta, value_delta
 
 
@@ -173,26 +180,29 @@ class Planner:
         )
 
     @staticmethod
-    def _world_bases(
+    def _world_facts(
         observation: Observation, world_context: Mapping[str, object]
-    ) -> Dict[str, Observation]:
-        bases: Dict[str, Observation] = {}
-        for payload in world_context.get("observations", []):
+    ) -> Dict[str, HistoricalMapFact]:
+        facts: Dict[str, HistoricalMapFact] = {}
+        for payload in world_context.get("map_facts", []):
             try:
-                item = Observation.model_validate(payload)
+                item = HistoricalMapFact.model_validate(payload)
             except Exception:
                 continue
-            if item.session_id == observation.session_id and not item.busy:
-                bases[item.map_instance_id] = item
-        bases[observation.map_instance_id] = observation
+            if item.session_id == observation.session_id:
+                facts[item.map_instance_id] = item
+        live_fact = HistoricalMapFact.model_validate(
+            historical_map_fact_payload(observation, observation_fingerprint(observation))
+        )
+        facts[observation.map_instance_id] = live_fact
         instance_rows = {
             str(row.get("map_instance_id")): row
             for row in world_context.get("map_instances", [])
             if isinstance(row, Mapping)
         }
         if instance_rows:
-            bases = {
-                map_id: item for map_id, item in bases.items()
+            facts = {
+                map_id: item for map_id, item in facts.items()
                 if map_id in instance_rows and (
                     instance_rows[map_id].get("floor_id") == item.floor_id
                     and instance_rows[map_id].get("topology_fingerprint")
@@ -201,7 +211,61 @@ class Planner:
                     == canonical_json(item.dimensions.model_dump(mode="json"))
                 )
             }
-        return bases
+        return facts
+
+    @staticmethod
+    def _fact_observation(
+        fact: HistoricalMapFact,
+        live: Observation,
+        resources: ResourceState,
+        position: Tuple[int, int],
+    ) -> Observation:
+        """Materialize topology for simulation with only live-derived resources."""
+
+        return Observation.model_validate({
+            "protocol": live.protocol,
+            "page": live.page,
+            "session_id": fact.session_id,
+            "floor_id": fact.floor_id,
+            "floor_name": fact.floor_name,
+            "floor_number": fact.floor_number,
+            "dimensions": fact.dimensions.model_dump(mode="json"),
+            "topology": fact.topology.model_dump(mode="json", exclude_unset=True),
+            "topology_fingerprint": fact.topology_fingerprint,
+            "map_instance_id": fact.map_instance_id,
+            "hero": {
+                "hp": resources.hp,
+                "attack": resources.attack,
+                "defense": resources.defense,
+                "gold": resources.gold,
+                "experience": resources.experience,
+                "loc": {
+                    "x": position[0],
+                    "y": position[1],
+                    "direction": live.hero.loc.direction,
+                },
+            },
+            "keys": {
+                "yellow": resources.yellow,
+                "blue": resources.blue,
+                "red": resources.red,
+            },
+            "busy": False,
+            "blocks": [block.model_dump(mode="json") for block in fact.blocks],
+            "captured_at": fact.captured_at,
+        })
+
+    def _fact_base_observation(
+        self, fact: HistoricalMapFact, live: Observation
+    ) -> Observation:
+        if fact.map_instance_id == live.map_instance_id:
+            return live
+        return self._fact_observation(
+            fact,
+            live,
+            ResourceState.from_observation(live),
+            (fact.observed_anchor.x, fact.observed_anchor.y),
+        )
 
     @staticmethod
     def _valid_position(observation: Observation, x: object, y: object) -> bool:
@@ -220,7 +284,7 @@ class Planner:
         world_context: Mapping[str, object],
     ) -> tuple[str, Optional[Dict[str, Any]]]:
         """Return opaque, exact, or ambiguous for one observed exit endpoint."""
-        bases = self._world_bases(observation, world_context)
+        facts = self._world_facts(observation, world_context)
         candidates: Dict[tuple[str, str, int, int], Dict[str, Any]] = {}
         for edge in world_context.get("transitions", []):
             if not isinstance(edge, Mapping) \
@@ -229,7 +293,7 @@ class Planner:
                     or edge.get("from_y") != getattr(block, "y", None):
                 continue
             target_id = edge.get("to_map_instance_id")
-            target = bases.get(str(target_id))
+            target = facts.get(str(target_id))
             if target is None or not self._valid_position(target, edge.get("to_x"), edge.get("to_y")):
                 continue
             key = (target.map_instance_id, target.floor_id, int(edge["to_x"]), int(edge["to_y"]))
@@ -253,7 +317,7 @@ class Planner:
     ) -> Dict[str, Any]:
         """Rebuild the auditable scan frontier from legally observed snapshots."""
 
-        bases = self._world_bases(observation, world_context)
+        facts = self._world_facts(observation, world_context)
         scanned = set(str(item) for item in scan_state.get("scanned_map_instance_ids", []))
         scanned.add(observation.map_instance_id)
         traversed = list(scan_state.get("traversed_transitions", []))
@@ -265,11 +329,13 @@ class Planner:
         ]
         pending: List[Dict[str, Any]] = []
         for map_id in sorted(scanned):
-            base = bases.get(map_id)
-            if base is None:
+            fact = facts.get(map_id)
+            if fact is None:
                 continue
             try:
-                graph = CurrentFloorGraph(base, labels)
+                graph = CurrentFloorGraph(
+                    self._fact_base_observation(fact, observation), labels
+                )
                 boundaries = graph.reachable_boundaries()
             except (KeyError, ValueError):
                 continue
@@ -296,7 +362,7 @@ class Planner:
                 valid_targets = []
                 for edge in matching:
                     target_id = str(edge.get("to_map_instance_id"))
-                    target = bases.get(target_id)
+                    target = facts.get(target_id)
                     if target is None:
                         continue
                     try:
@@ -382,19 +448,21 @@ class Planner:
                 scan_state=wire,
             )
 
-        bases = self._world_bases(observation, world_context)
+        facts = self._world_facts(observation, world_context)
         transitions = [
             item for item in world_context.get("transitions", []) if isinstance(item, Mapping)
         ]
 
         def boundaries_for(map_id: str) -> Dict[Tuple[int, int], Boundary]:
-            base = bases.get(map_id)
-            if base is None:
+            fact = facts.get(map_id)
+            if fact is None:
                 return {}
             try:
                 return {
                     (item.block.x, item.block.y): item
-                    for item in CurrentFloorGraph(base, labels).reachable_boundaries()
+                    for item in CurrentFloorGraph(
+                        self._fact_base_observation(fact, observation), labels
+                    ).reachable_boundaries()
                     if self._stair_is_scan_safe(item.label)
                 }
             except (KeyError, ValueError):
@@ -433,10 +501,10 @@ class Planner:
                         continue
                     coordinate = (edge.get("from_x"), edge.get("from_y"))
                     target_id = str(edge.get("to_map_instance_id"))
-                    if coordinate not in reachable or target_id not in bases or target_id in visited:
+                    if coordinate not in reachable or target_id not in facts or target_id in visited:
                         continue
                     if not self._valid_position(
-                        bases[target_id], edge.get("to_x"), edge.get("to_y")
+                        facts[target_id], edge.get("to_x"), edge.get("to_y")
                     ):
                         continue
                     visited.add(target_id)
@@ -447,8 +515,8 @@ class Planner:
                         "block_id": reachable[coordinate].block.id,
                         "to_map_instance_id": target_id,
                         "to_x": edge.get("to_x"), "to_y": edge.get("to_y"),
-                        "target_floor_id": bases[target_id].floor_id,
-                        "target_floor_number_hint": bases[target_id].floor_number,
+                        "target_floor_id": facts[target_id].floor_id,
+                        "target_floor_number_hint": facts[target_id].floor_number,
                     }
                     queue.append((target_id, first_edge or edge_choice))
         if selected is None or selected["from_map_instance_id"] != observation.map_instance_id:
@@ -523,31 +591,21 @@ class Planner:
             scan_state=wire,
         )
 
-    @staticmethod
     def _state_observation(
-        base: Observation,
+        self,
+        fact: HistoricalMapFact,
+        live: Observation,
         resources: ResourceState,
         position: Tuple[int, int],
         removed: FrozenSet[Tuple[str, int, int, str]],
     ) -> Observation:
-        payload = base.model_dump(mode="json", exclude_unset=True)
+        payload = self._fact_observation(fact, live, resources, position).model_dump(
+            mode="json", exclude_unset=True
+        )
         payload["blocks"] = [
             block for block in payload["blocks"]
-            if (base.map_instance_id, block["x"], block["y"], block["id"]) not in removed
+            if (fact.map_instance_id, block["x"], block["y"], block["id"]) not in removed
         ]
-        payload["hero"].update(
-            hp=resources.hp,
-            attack=resources.attack,
-            defense=resources.defense,
-            gold=resources.gold,
-            experience=resources.experience,
-        )
-        payload["hero"]["loc"].update(x=position[0], y=position[1])
-        payload["keys"] = {
-            "yellow": resources.yellow,
-            "blue": resources.blue,
-            "red": resources.red,
-        }
         return Observation.model_validate(payload)
 
     def _world_search(
@@ -563,7 +621,7 @@ class Planner:
         from a real completed action.  The returned action is still only the
         first atomic boundary of the best audited path.
         """
-        bases = self._world_bases(observation, world_context)
+        facts = self._world_facts(observation, world_context)
         transitions: Dict[Tuple[str, int, int], List[Mapping[str, Any]]] = {}
         for row in world_context.get("transitions", []):
             if not isinstance(row, Mapping):
@@ -596,10 +654,12 @@ class Planner:
                 continue
             seen.add(state_key)
             explored += 1
-            base = bases.get(map_id)
-            if base is None:
+            fact = facts.get(map_id)
+            if fact is None:
                 continue
-            simulated = self._state_observation(base, resources, position, removed)
+            simulated = self._state_observation(
+                fact, observation, resources, position, removed
+            )
             graph = CurrentFloorGraph(simulated, labels)
             for boundary in graph.reachable_boundaries():
                 label = boundary.label
@@ -639,10 +699,10 @@ class Planner:
                 if transition_rows:
                     for edge in transition_rows:
                         target_id = str(edge.get("to_map_instance_id"))
-                        if target_id not in bases:
+                        if target_id not in facts:
                             continue
                         target_position = (int(edge.get("to_x")), int(edge.get("to_y")))
-                        if not self._valid_position(bases[target_id], *target_position):
+                        if not self._valid_position(facts[target_id], *target_position):
                             continue
                         queue.append((target_id, target_position, next_resources, removed,
                                       next_score + 25.0, first_candidate, path_length))
@@ -832,7 +892,7 @@ class Planner:
                 registry_entries=registry_entries,
             )
         world_result = None
-        if world_context is not None and world_context.get("observations"):
+        if world_context is not None and world_context.get("map_facts"):
             world_result, exhausted = self._world_search(observation, labels, world_context)
             if exhausted:
                 return self._pause(

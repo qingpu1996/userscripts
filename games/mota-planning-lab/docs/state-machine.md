@@ -13,6 +13,8 @@ STOPPED
 
 首次 observation 只展示。用户显式确认后浏览器 journal 保存 session_id、mode、baseline 摘要；服务收到 `command=confirm` 前保持 `SESSION_CONFIRMATION_REQUIRED`。启动是与确认分开的第二个用户动作。
 
+`OBSERVING` 不是读取浏览器缓存：每轮都从当前页面 JS 同步重采。采样前后围栏不一致时整轮 observation 作废；不会用 journal baseline、上轮 observation 或 SQLite snapshot 填补当前 hero、keys 或 blocks。
+
 ## Journal v2
 
 持久字段包括 protocol、session_id/mode/baseline、service confirmation、scan state、pending、completed、ack、seen action IDs、registry 和 pause evidence。只要固定 v1 key 仍存在且未留下专用处置审计，即使已有 v2 journal 也只会触发 `JOURNAL_V1_MIGRATION_REQUIRED`；普通 baseline 确认、启动和重连都不能绕过。
@@ -32,6 +34,7 @@ response schema
  -> session/map/dimensions/topology/full-panel guard
  -> current topology route proof
  -> verified durable pending journal before API
+ -> fresh current-runtime observation 与 guard/pre fingerprint 再核对
  -> one public engine action
  -> moving/lock/event all clear
  -> changed fingerprint stable twice
@@ -55,6 +58,8 @@ SQLite 状态机是 `IMPORT_WITNESS -> CONSISTENT_PRIVATE_SNAPSHOT -> CANDIDATE_
 fingerprint 包含 session、map instance、dimensions、topology、英雄面板、keys 和当前 blocks；忽略时间和 busy。
 
 state dir 与 journal 共同组成身份链。`UNKNOWN_ACTION_ID` 不能解释为“没执行”；恢复原目录并只读核对。删除 state dir 属于用户明确授权的状态重置，不是重启。
+
+pending 中的 pre observation 是恢复证据，不是可恢复进游戏的当前状态。恢复分类永远拿 fresh live observation 与它比较；任何代码都不得把 pre hero/resources 或 blocks 覆盖回现场，也不得把它当作新 cycle 的 current observation。
 
 ## 换图
 

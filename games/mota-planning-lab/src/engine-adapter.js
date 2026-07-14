@@ -28,6 +28,72 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
     return value;
   }
 
+  function readKeyLayout(container, path) {
+    if (!container || typeof container !== "object") return null;
+    const aliases = {
+      yellow: ["yellowKey", "yellow"],
+      blue: ["blueKey", "blue"],
+      red: ["redKey", "red"],
+    };
+    const present = Object.values(aliases).some((names) => (
+      names.some((name) => Object.prototype.hasOwnProperty.call(container, name))
+    ));
+    if (!present) return null;
+    const values = {};
+    for (const [color, names] of Object.entries(aliases)) {
+      const available = names.filter((name) => (
+        Object.prototype.hasOwnProperty.call(container, name)
+      ));
+      if (available.length === 0) {
+        throw MotaLab.createPauseError(
+          "ENGINE_API_INCOMPATIBLE",
+          "INCOMPLETE_KEY_LAYOUT",
+          { layout: path, missing_color: color },
+        );
+      }
+      const candidates = available.map((name) => readNumber(container[name], `${path}.${name}`));
+      if (candidates.some((value) => value !== candidates[0])) {
+        throw MotaLab.createPauseError(
+          "ENGINE_API_INCOMPATIBLE",
+          "CONFLICTING_KEY_LAYOUT",
+          { layout: path, color },
+        );
+      }
+      values[color] = candidates[0];
+    }
+    return { path, values };
+  }
+
+  function readKeys(hero) {
+    const items = hero.items && typeof hero.items === "object" ? hero.items : null;
+    const candidates = [
+      readKeyLayout(items && items.tools, "hero.items.tools"),
+      readKeyLayout(items && items.keys, "hero.items.keys"),
+      readKeyLayout(hero.keys, "hero.keys"),
+    ].filter(Boolean);
+    if (candidates.length === 0) {
+      throw MotaLab.createPauseError(
+        "ENGINE_API_INCOMPATIBLE",
+        "MISSING_KEY_LAYOUT",
+        { supported_layouts: ["hero.items.tools", "hero.items.keys", "hero.keys"] },
+      );
+    }
+    const selected = candidates[0];
+    const conflict = candidates.find((candidate) => (
+      ["yellow", "blue", "red"].some((color) => (
+        candidate.values[color] !== selected.values[color]
+      ))
+    ));
+    if (conflict) {
+      throw MotaLab.createPauseError(
+        "ENGINE_API_INCOMPATIBLE",
+        "CONFLICTING_KEY_LAYOUT",
+        { layouts: candidates.map((candidate) => candidate.path) },
+      );
+    }
+    return selected.values;
+  }
+
   function readHero(runtime) {
     const hero = runtime.status.hero;
     if (!hero || typeof hero !== "object") {
@@ -37,12 +103,7 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
     if (!loc || typeof loc !== "object") {
       throw MotaLab.createPauseError("ENGINE_API_INCOMPATIBLE", "MISSING_HERO_LOCATION");
     }
-    const items = hero.items;
-    const itemKeys = items && typeof items === "object" ? items.keys : null;
-    const directKeys = hero.keys;
-    const keys = itemKeys && typeof itemKeys === "object"
-      ? itemKeys
-      : directKeys && typeof directKeys === "object" ? directKeys : {};
+    const keys = readKeys(hero);
 
     return {
       hp: readNumber(hero.hp, "hero.hp"),
@@ -59,18 +120,9 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
         direction: typeof loc.direction === "string" ? loc.direction : null,
       },
       keys: {
-        yellow: readNumber(
-          keys.yellowKey !== undefined ? keys.yellowKey : keys.yellow !== undefined ? keys.yellow : 0,
-          "hero.keys.yellow",
-        ),
-        blue: readNumber(
-          keys.blueKey !== undefined ? keys.blueKey : keys.blue !== undefined ? keys.blue : 0,
-          "hero.keys.blue",
-        ),
-        red: readNumber(
-          keys.redKey !== undefined ? keys.redKey : keys.red !== undefined ? keys.red : 0,
-          "hero.keys.red",
-        ),
+        yellow: keys.yellow,
+        blue: keys.blue,
+        red: keys.red,
       },
     };
   }
@@ -264,30 +316,70 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
     };
   }
 
-  function readRuntimeSnapshot() {
-    const runtime = requireRuntime();
+  function readRuntimeFence(runtime) {
     const currentFloorId = runtime.status.floorId;
     if (typeof currentFloorId !== "string" && typeof currentFloorId !== "number") {
       throw MotaLab.createPauseError("ENGINE_API_INCOMPATIBLE", "MISSING_FLOOR_ID");
     }
-    const floorId = String(currentFloorId);
-    const blocks = listRawBlocks(runtime, currentFloorId)
-      .map(readBlock)
-      .filter(Boolean)
-      .map((block) => {
-        if (!block.disabled && isEnemyBlock(block)) {
-          const enemyResult = readEnemy(runtime, currentFloorId, block);
-          return Object.assign(block, enemyResult);
-        }
-        return Object.assign(block, { damage: null, enemy: null });
-      });
     return {
-      floor_id: floorId,
-      map: readMapMeta(runtime, currentFloorId),
+      runtime,
+      current_floor_id: currentFloorId,
+      floor_id: String(currentFloorId),
       hero: readHero(runtime),
-      blocks,
       busy: readBusy(runtime),
     };
+  }
+
+  function fenceProjection(fence) {
+    return {
+      floor_id: fence.floor_id,
+      hero: fence.hero,
+      busy: fence.busy,
+    };
+  }
+
+  function readRuntimeSnapshot() {
+    const attempts = [];
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const runtime = requireRuntime();
+      const before = readRuntimeFence(runtime);
+      const blocks = listRawBlocks(runtime, before.current_floor_id)
+        .map(readBlock)
+        .filter(Boolean)
+        .map((block) => {
+          if (!block.disabled && isEnemyBlock(block)) {
+            const enemyResult = readEnemy(runtime, before.current_floor_id, block);
+            return Object.assign(block, enemyResult);
+          }
+          return Object.assign(block, { damage: null, enemy: null });
+        });
+      const map = readMapMeta(runtime, before.current_floor_id);
+      const after = readRuntimeFence(runtime);
+      const sameRuntime = after.runtime === runtime && currentCore() === runtime;
+      const beforeProjection = fenceProjection(before);
+      const afterProjection = fenceProjection(after);
+      if (sameRuntime
+        && MotaLab.canonicalize(beforeProjection) === MotaLab.canonicalize(afterProjection)) {
+        return {
+          floor_id: before.floor_id,
+          map,
+          hero: before.hero,
+          blocks,
+          busy: before.busy,
+        };
+      }
+      attempts.push({
+        attempt,
+        runtime_changed: !sameRuntime,
+        before: beforeProjection,
+        after: afterProjection,
+      });
+    }
+    throw MotaLab.createPauseError(
+      "ENGINE_API_INCOMPATIBLE",
+      "RUNTIME_SNAPSHOT_UNSTABLE",
+      { attempts },
+    );
   }
 
   function capabilities() {

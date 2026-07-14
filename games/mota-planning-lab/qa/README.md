@@ -20,4 +20,6 @@
 
 第八轮独立验收整改证据：[`runs/2026-07-14-runtime-v2-fix-8/`](runs/2026-07-14-runtime-v2-fix-8/)。覆盖 AST 词法 binding、assignment destructure、IIFE/本地调用实参传播、src/双 dist 内存注入，以及 journal envelope 自身相邻前代、base/overflow/gap 对抗；真实页面仍为 `not-run`。
 
+当前运行态唯一权威重构证据：[`runs/2026-07-14-live-runtime-authority/`](runs/2026-07-14-live-runtime-authority/)。覆盖真实 tools key shape、key layout fail-closed、同步采集围栏、行动 API 前 fresh guard、历史 map fact 去 hero/resources、重访 revision、单边界重规划与 `196/196` 完整离线 QA。
+
 本轮明确 `not-run`：真实游戏页面、真实存档、真实移动/换图、内置浏览器注入和外网。离线 fake core 结果不得冒充现场验证。

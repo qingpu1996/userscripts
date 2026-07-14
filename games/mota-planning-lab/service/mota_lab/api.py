@@ -583,7 +583,10 @@ class CycleCoordinator:
             else:
                 world_context = {
                     "map_instances": self.store.map_instances_for_session(observation.session_id),
-                    "observations": self.store.latest_map_observations(observation.session_id),
+                    # Full observations are retained for action recovery/audit,
+                    # but the planner receives only history-safe map facts.  Its
+                    # current hero/resource vector always comes from this request.
+                    "map_facts": self.store.latest_map_facts(observation.session_id),
                     "transitions": self.store.transitions_for_session(observation.session_id),
                     "frontiers": self.store.frontiers_for_session(observation.session_id),
                 }

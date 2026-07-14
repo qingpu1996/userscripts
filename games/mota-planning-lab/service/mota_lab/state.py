@@ -29,6 +29,34 @@ def observation_payload(observation: Observation, *, include_timestamp: bool = T
     return payload
 
 
+def historical_map_fact_payload(observation: Observation, fingerprint: str) -> dict:
+    """Project an observation into revisioned map facts safe for planning.
+
+    Full observations remain action/recovery evidence in the ledger.  World
+    planning receives this narrower shape so a historical hero panel or key
+    vector cannot accidentally become current state.
+    """
+
+    payload = observation_payload(observation)
+    return {
+        "snapshot_fingerprint": fingerprint,
+        "session_id": payload["session_id"],
+        "floor_id": payload["floor_id"],
+        "floor_name": payload["floor_name"],
+        "floor_number": payload["floor_number"],
+        "dimensions": payload["dimensions"],
+        "topology": payload["topology"],
+        "topology_fingerprint": payload["topology_fingerprint"],
+        "map_instance_id": payload["map_instance_id"],
+        "observed_anchor": {
+            "x": payload["hero"]["loc"]["x"],
+            "y": payload["hero"]["loc"]["y"],
+        },
+        "blocks": payload["blocks"],
+        "captured_at": payload["captured_at"],
+    }
+
+
 def fingerprint_payload(observation: Observation) -> dict:
     payload = observation_payload(observation, include_timestamp=False)
     return {
