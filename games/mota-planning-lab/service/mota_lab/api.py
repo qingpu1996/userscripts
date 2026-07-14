@@ -371,16 +371,14 @@ class CycleCoordinator:
             response = self._response_payload(completion_pause)
             self._log_response(request, response)
             return response
-        if request.completed_action_id is not None:
-            acknowledged = IdleResponse(
-                status="idle",
-                reason="已明确接收并结算 completed_action_id；下一轮再签发后续原子行动。",
-                registry_entries=self.knowledge.registry_entries(observation),
-                acknowledged_action_id=request.completed_action_id,
-            )
-            response = self._response_payload(acknowledged)
-            self._log_response(request, response, "completed_action_acknowledged")
-            return response
+        acknowledged_action_id = request.completed_action_id
+
+        def with_ack(response: Dict[str, Any]) -> Dict[str, Any]:
+            if acknowledged_action_id is None:
+                return response
+            result = dict(response)
+            result["acknowledged_action_id"] = acknowledged_action_id
+            return result
 
         try:
             unresolved = self.store.issued_action_for_session(observation.session_id)
@@ -416,7 +414,7 @@ class CycleCoordinator:
                 )
                 response = self._response_payload(paused)
                 self._log_response(request, response, "reconnect_only_unresolved")
-                return response
+                return with_ack(response)
             if recovery_request is not None and recovery_request.pending_action_id is not None:
                 paused = self._pause(
                     request,
@@ -431,7 +429,7 @@ class CycleCoordinator:
                 )
                 response = self._response_payload(paused)
                 self._log_response(request, response, "reconnect_only_identity_mismatch")
-                return response
+                return with_ack(response)
             idle = IdleResponse(
                 status="idle",
                 reason="localhost 已连接；仅重连观察模式不会签发或执行新行动。",
@@ -439,12 +437,12 @@ class CycleCoordinator:
             )
             response = self._response_payload(idle)
             self._log_response(request, response, "reconnect_only_idle")
-            return response
+            return with_ack(response)
         if unresolved is not None:
             if recovery_request is None or recovery_request.phase == "none":
                 if observation_fp == unresolved.pre_fingerprint:
                     self._log_response(request, unresolved.response, "unresolved_action_replayed")
-                    return unresolved.response
+                    return with_ack(unresolved.response)
                 pause = self._pause(
                     request,
                     kind=PauseKind.EXPECTED_DELTA_MISMATCH,
@@ -459,7 +457,7 @@ class CycleCoordinator:
                 )
                 response = self._response_payload(pause)
                 self._log_response(request, response)
-                return response
+                return with_ack(response)
             if recovery_request.pending_action_id != unresolved.action_id:
                 pause = self._pause(
                     request,
@@ -475,7 +473,7 @@ class CycleCoordinator:
                 )
                 response = self._response_payload(pause)
                 self._log_response(request, response)
-                return response
+                return with_ack(response)
 
         try:
             recovery = classify_recovery(
@@ -501,7 +499,7 @@ class CycleCoordinator:
             )
             response = self._response_payload(pause)
             self._log_response(request, response)
-            return response
+            return with_ack(response)
 
         if recovery.kind == "pending":
             idle = IdleResponse(
@@ -511,11 +509,11 @@ class CycleCoordinator:
             )
             response = self._response_payload(idle)
             self._log_response(request, response)
-            return response
+            return with_ack(response)
 
         if recovery.kind == "replay" and recovery.action is not None:
             self._log_response(request, recovery.action.response, "unresolved_action_replayed")
-            return recovery.action.response
+            return with_ack(recovery.action.response)
 
         authority = self._derive_engine_authority(observation)
         persisted_knowledge_fp = self.knowledge.fingerprint()
@@ -552,7 +550,7 @@ class CycleCoordinator:
                 current = self._latest_replacement(action)
                 if current.status != "completed":
                     self._log_response(request, current.response, "decision_replayed")
-                    return current.response
+                    return with_ack(current.response)
                 # A completed action may legitimately lead back to the exact
                 # same observation later.  Continue planning so this visit can
                 # either idle (for a no-progress stair round-trip) or receive a
@@ -561,7 +559,7 @@ class CycleCoordinator:
                 # this one cache row.
             else:
                 self._log_response(request, existing, "decision_replayed")
-                return existing
+                return with_ack(existing)
 
         # A normal retry and an explicit not_executed recovery both replay the
         # byte-equivalent same action ID.  Protocol v2 never signs a replacement
@@ -570,7 +568,7 @@ class CycleCoordinator:
             issued = self.store.issued_action_for_prestate(observation_fp)
             if issued is not None:
                 self._log_response(request, issued.response, "decision_replayed")
-                return issued.response
+                return with_ack(issued.response)
 
         labels = self.knowledge.labels()
         labels.update(authority.labels)
@@ -691,7 +689,7 @@ class CycleCoordinator:
         except LedgerError as exc:
             raise ServiceError(exc.code, str(exc)) from exc
         self._log_response(request, persisted)
-        return persisted
+        return with_ack(persisted)
 
 
 def _error(

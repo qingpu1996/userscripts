@@ -1171,7 +1171,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
                     },
                 )
                 acknowledged = coordinator.cycle(CycleRequest.model_validate(completed))
-                self.assertEqual(acknowledged["status"], "idle")
+                self.assertEqual(acknowledged["status"], "pause")
                 self.assertEqual(acknowledged["acknowledged_action_id"], issued["action_id"])
                 self.assertEqual(coordinator.store.get_action(issued["action_id"]).status, "completed")
                 events = [
@@ -1179,11 +1179,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
                     for line in settings.log_path.read_text(encoding="utf-8").splitlines()
                     if line.strip()
                 ]
-                self.assertLess(
-                    max(index for index, event in enumerate(events) if event == "action_completed"),
-                    max(index for index, event in enumerate(events)
-                        if event == "completed_action_acknowledged"),
-                )
+                self.assertIn("action_completed", events)
                 self.assertEqual(
                     coordinator.cycle(CycleRequest.model_validate(completed)), acknowledged,
                 )
@@ -1193,7 +1189,7 @@ class SessionWorldAndCorsTests(unittest.TestCase):
             restarted = CycleCoordinator(settings)
             try:
                 repeated = restarted.cycle(CycleRequest.model_validate(completed))
-                self.assertEqual(repeated["status"], "idle")
+                self.assertEqual(repeated["status"], "pause")
                 self.assertEqual(repeated["acknowledged_action_id"], issued["action_id"])
                 self.assertEqual(
                     restarted.store._connection.execute(

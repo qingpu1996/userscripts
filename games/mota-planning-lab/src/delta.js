@@ -140,8 +140,9 @@ MotaLab.compareExpectedDelta = function compareExpectedDelta(before, after, expe
   if (expected.inventory) {
     const flatten = (observation) => {
       const result = {};
-      const classes = observation.engine_model && observation.engine_model.inventory
-        && observation.engine_model.inventory.classes;
+      const inventory = observation.recovery_inventory
+        || (observation.engine_model && observation.engine_model.inventory);
+      const classes = inventory && inventory.classes;
       if (!classes || typeof classes !== "object") return result;
       for (const items of Object.values(classes)) {
         if (!items || typeof items !== "object") continue;

@@ -84,9 +84,9 @@ operations 最多两段，末段最多一个状态变化边界。所有坐标必
 
 execute、pause、idle 可携带 `scan_state`：phase、anchor/current map instance、已扫描实例、pending/traversed/frontier 数量与原因。字段可省略但不能为 null，浏览器 parser、Schema 和 Pydantic 共同严格校验。
 
-服务成功结算请求中的 `completed_action_id` 时，不在同一响应签发下一行动，而返回独立 `idle`，并携带完全相同的 `acknowledged_action_id`。该字段可省略但不能为 null；浏览器只有在 status/identity 都匹配时才清除 pending 并记录 ack。
+服务成功结算普通 cycle 请求中的 `completed_action_id` 后，可在同一响应携带完全相同的 `acknowledged_action_id` 并直接返回下一 `execute`、`idle` 或规划暂停。该字段可省略但不能为 null；浏览器先核对并持久结算旧 ID，之后才消费同响应的新行动。`reconnect_only` 仍禁止签发行动，只返回 idle ACK。
 
-新 map observation 中存在可解释的当前不可战斗怪物不影响这条顺序：浏览器仍先发送旧 action 的 `completed_action_id`，服务事务性校验 change-map delta 并记录 `action_completed`，随后返回 ack；只有下一 cycle 才根据新现场重新规划。刷新或重连不会因为怪物 damage 为 null 而重放楼梯 action。
+新 map observation 中存在可解释的当前不可战斗怪物不影响这条顺序：服务先事务性校验 change-map delta 并记录 `action_completed`，再用同一 observation 规划后续响应并附加 ACK。刷新或重连不会因为怪物 damage 为 null 而重放楼梯 action。
 
 ## Transition 与恢复
 

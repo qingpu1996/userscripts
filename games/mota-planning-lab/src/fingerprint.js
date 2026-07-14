@@ -138,3 +138,73 @@ MotaLab.fingerprintRuntimeObservation = function fingerprintRuntimeObservation(o
   delete projection.engine_model_hash;
   return `sha256:${MotaLab.sha256(MotaLab.canonicalize(projection))}`;
 };
+
+// A fast snapshot intentionally omits the cross-floor engine catalog.  Safety
+// checks performed between a complete observation and a fast snapshot must
+// therefore compare only the runtime facts represented by both shapes.  Keep
+// this projection separate from fingerprintProjection: the latter must still
+// notice catalog/model changes when both complete observations are compared.
+MotaLab.runtimeStateProjectionIgnoringPosition = function runtimeStateProjectionIgnoringPosition(
+  observation,
+) {
+  const projection = MotaLab.fingerprintProjection(observation);
+  delete projection.catalog_hash;
+  delete projection.engine_model_hash;
+  projection.hero.loc = { x: 0, y: 0, direction: null };
+  return projection;
+};
+
+MotaLab.runtimeStateChangedBeyondPosition = function runtimeStateChangedBeyondPosition(
+  before,
+  after,
+) {
+  const project = (observation) => MotaLab.canonicalize(
+    MotaLab.runtimeStateProjectionIgnoringPosition(observation),
+  );
+  return project(before) !== project(after);
+};
+
+// Durable recovery needs the current runtime facts that participate in guard
+// and delta checks, not the (potentially megabyte-sized) cross-floor engine
+// catalog.  Inventory is the only engine_model field used by delta recovery.
+MotaLab.recoveryObservationProjection = function recoveryObservationProjection(observation) {
+  if (!observation) return null;
+  const projected = {
+    protocol: observation.protocol,
+    page: observation.page,
+    session_id: observation.session_id,
+    floor_id: observation.floor_id,
+    floor_name: observation.floor_name,
+    floor_number: observation.floor_number,
+    dimensions: MotaLab.cloneJsonValue(observation.dimensions),
+    topology: MotaLab.cloneJsonValue(observation.topology),
+    topology_fingerprint: observation.topology_fingerprint,
+    map_instance_id: observation.map_instance_id,
+    hero: MotaLab.cloneJsonValue(observation.hero),
+    keys: MotaLab.cloneJsonValue(observation.keys),
+    busy: observation.busy === true,
+    blocks: MotaLab.cloneJsonValue(observation.blocks || []),
+    captured_at: observation.captured_at,
+  };
+  const inventory = observation.engine_model && observation.engine_model.inventory;
+  if (inventory) projected.recovery_inventory = MotaLab.cloneJsonValue(inventory);
+  return projected;
+};
+
+MotaLab.compactJournalDetails = function compactJournalDetails(value, depth = 0) {
+  if (depth > 8) return "[truncated]";
+  if (Array.isArray(value)) {
+    return value.slice(0, 256).map((item) => MotaLab.compactJournalDetails(item, depth + 1));
+  }
+  if (!value || typeof value !== "object") return value;
+  const result = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (["engine_model", "catalog", "floors"].includes(key)) continue;
+    if (key === "observation") {
+      result.observation = MotaLab.recoveryObservationProjection(item);
+    } else {
+      result[key] = MotaLab.compactJournalDetails(item, depth + 1);
+    }
+  }
+  return result;
+};

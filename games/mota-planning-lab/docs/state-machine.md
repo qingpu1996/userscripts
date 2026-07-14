@@ -17,7 +17,7 @@ STOPPED
 
 ## Journal v2
 
-持久字段包括 protocol、session_id/mode/baseline、service confirmation、scan state、pending、completed、ack、seen action IDs、registry 和 pause evidence。只要固定 v1 key 仍存在且未留下专用处置审计，即使已有 v2 journal 也只会触发 `JOURNAL_V1_MIGRATION_REQUIRED`；普通 baseline 确认、启动和重连都不能绕过。
+持久字段包括 protocol、session_id/mode/baseline 摘要、service confirmation、scan state、pending 最小恢复投影、completed/ack 身份、seen action IDs、当前 registry 和压缩 pause evidence。完整 observation、跨层 catalog 与 engine_model 不进入 journal；当前游戏现场始终是权威数据。只要固定 v1 key 仍存在且未留下专用处置审计，即使已有 v2 journal 也只会触发 `JOURNAL_V1_MIGRATION_REQUIRED`；普通 baseline 确认、启动和重连都不能绕过。
 
 所有会改变这些身份字段的 mutation 都写入 A/B 中非当前最高的 generation 槽。base envelope 固定 `generation=1, previous_generation=0, previous_commit_hash=null`；后续 envelope 必须在自身内部声明 `previous_generation=generation-1`，并携带 previous committed hash、完整 state/hash、commit hash 与导入 witness。安全整数溢出、单槽内部 gap、双槽链断都 fail closed。完整双读并从两槽重新选出唯一最高前，状态机不能进入下一阶段。pending generation 可验证后才能进入 `EXECUTING`；mark-completed 或 ack 的 candidate 不完整时保留旧 pending/completed，candidate 已完整但 API 报错时刷新选择新 generation，仍不会丢失“未执行/已执行待 ack”身份。clear/abandon/archive/disposition 同样是新 generation，不物理删除唯一证据。
 
@@ -51,7 +51,7 @@ response schema
 - 符合 expected post 且边界确有非位置变化：补记 completed。
 - 两者都不满足：`RECOVERY_STATE_AMBIGUOUS` 暂停。
 
-`reconnectOnly` 走同一分类并携带 phase/action ID/pre/current fingerprint，同时明确发送 `intent=reconnect_only`。服务在该 intent 下禁止进入 planner、decision cache 或 action issuance；无 unresolved 返回 idle，有 unresolved 返回同 identity 暂停。浏览器若收到违反门禁的 execute，持久保存 action ID/guard/response hash 并进入 `RECONNECT_UNEXPECTED_EXECUTE`，绝不执行。completed 分类在发送前只形成 recovery report，不清 pending；服务成功结算后必须用独立 idle + 同 ID `acknowledged_action_id` 明确确认。
+`reconnectOnly` 走同一分类并携带 phase/action ID/pre/current fingerprint，同时明确发送 `intent=reconnect_only`。服务在该 intent 下禁止进入 planner、decision cache 或 action issuance；无 unresolved 返回 idle，有 unresolved 返回同 identity 暂停。浏览器若收到违反门禁的 execute，持久保存 action ID/guard/response hash 并进入 `RECONNECT_UNEXPECTED_EXECUTE`，绝不执行。普通 cycle 的 completed 分类可在一个响应中完成 ACK 与下一决策；`reconnect_only` 仍必须用 idle + 同 ID `acknowledged_action_id` 明确确认。
 
 fresh observation 在恢复分类前先按运行态数据模型归一钥匙：canonical `hero.items.tools` 中被引擎省略的零计数字段变成 `0`。因此门动作后的 `1 -> 字段删除` 可被 expected delta 判为 `1 -> 0`；若目标 block 也按声明消失，则 pending 进入 completed。这个过程只解释已发生的正常引擎动作，刷新、`reconnect_only` 和再次 reload 都不会重放行动 API。显式非法值或布局冲突在恢复分类前即 fail closed。
 

@@ -1,6 +1,8 @@
 MotaLab.createMemoryStorage = function createMemoryStorage(seed = {}) {
   const values = new Map(Object.entries(seed));
+  let revision = 0;
   return {
+    getRevision() { return revision; },
     inspect(key) {
       if (!values.has(key)) return { status: "absent", key };
       const raw = values.get(key);
@@ -19,11 +21,13 @@ MotaLab.createMemoryStorage = function createMemoryStorage(seed = {}) {
     set(key, value) {
       const clone = MotaLab.cloneJsonValue(value);
       values.set(key, clone);
+      revision += 1;
       return Object.freeze({ verified: true, key,
         canonical_hash: `sha256:${MotaLab.sha256(MotaLab.canonicalize(clone))}` });
     },
     delete(key) {
       values.delete(key);
+      revision += 1;
       return Object.freeze({ verified: true, key, absent: true });
     },
   };
@@ -59,6 +63,16 @@ MotaLab.createJournal = function createJournal(storage) {
     "commit_hash", "generation", "import_witness", "previous_commit_hash",
     "previous_generation", "state", "state_hash", "storage_protocol",
   ].sort());
+  let cachedContext = null;
+  let cachedState = null;
+  let cachedRevision = null;
+  let externallyInvalidated = false;
+  const diagnostics = { cold_load_ms: 0, snapshots: 0, snapshot_ms: 0, writes: [] };
+  const now = () => (globalThis.performance && typeof globalThis.performance.now === "function"
+    ? globalThis.performance.now() : Date.now());
+  if (storage && typeof storage.subscribeChanges === "function") {
+    storage.subscribeChanges(() => { externallyInvalidated = true; });
+  }
 
   function pauseStorage(operation, details = {}) {
     return MotaLab.createPauseError(
@@ -347,12 +361,64 @@ MotaLab.createJournal = function createJournal(storage) {
       result.corruption_required = true;
     }
     if (result.corruption_required) result.autopilot_enabled = false;
+    if (result.pending_action && result.pending_action.pre_observation) {
+      result.pending_action.pre_observation = MotaLab.recoveryObservationProjection(
+        result.pending_action.pre_observation,
+      );
+    }
+    if (result.last_completed_action) delete result.last_completed_action.observation;
+    if (result.last_pause) {
+      if (result.last_pause.observation) {
+        result.last_pause.observation = MotaLab.recoveryObservationProjection(
+          result.last_pause.observation,
+        );
+      }
+      if (result.last_pause.details) {
+        result.last_pause.details = MotaLab.compactJournalDetails(result.last_pause.details);
+      }
+    }
     return result;
   }
 
-  function read() { return stateFromContext(loadStableContext()); }
+  function ensureCache() {
+    if (externallyInvalidated) {
+      throw pauseStorage("journal-cache", { reason: "external-storage-change" });
+    }
+    const currentRevision = storage && typeof storage.getRevision === "function"
+      ? storage.getRevision() : null;
+    const quarantinedWitness = cachedContext && (
+      (cachedContext.witness && cachedContext.witness.classification === "corrupt")
+      || cachedContext.legacyEntries.length > 0
+      || cachedContext.corruptEvidence.length > 0
+    );
+    if (quarantinedWitness) {
+      cachedContext = null;
+      cachedState = null;
+    }
+    if (cachedContext && currentRevision !== null && currentRevision !== cachedRevision) {
+      cachedContext = null;
+      cachedState = null;
+    }
+    if (!cachedContext) {
+      const started = now();
+      cachedContext = loadStableContext();
+      cachedState = stateFromContext(cachedContext);
+      cachedRevision = currentRevision;
+      diagnostics.cold_load_ms = now() - started;
+    }
+  }
+
+  function read() {
+    const started = now();
+    ensureCache();
+    const result = MotaLab.cloneJsonValue(cachedState);
+    diagnostics.snapshots += 1;
+    diagnostics.snapshot_ms += now() - started;
+    return result;
+  }
 
   function write(next, context, allowInitialCorruptArchive = false) {
+    const writeStarted = now();
     if (next.corruption_required && !next.corrupt_archive && !allowInitialCorruptArchive) {
       throw new TypeError("Corrupt journal evidence must be archived before a generation is written");
     }
@@ -360,7 +426,7 @@ MotaLab.createJournal = function createJournal(storage) {
     if (!context.witness) {
       throw pauseStorage("journal-write", { reason: "unstable-import-witness" });
     }
-    const precondition = loadStableContext("journal-write-precondition");
+    const precondition = loadContextOnce();
     if (contextIdentity(precondition) !== contextIdentity(context)) {
       throw pauseStorage("journal-write-precondition", { reason: "read-write-witness-changed" });
     }
@@ -369,10 +435,14 @@ MotaLab.createJournal = function createJournal(storage) {
       : MotaLab.JOURNAL_SLOT_KEYS[0];
     const envelope = buildEnvelope(next, context.active, context.witness);
     let writeError = null;
+    // Runtime storage adapters already perform two independent canonical
+    // readbacks.  This layer then parses the target once and re-selects the
+    // complete A/B generation set below; repeating both full-slot probes here
+    // was the former hot-path multiplier.
     try { storage.set(target, MotaLab.cloneJsonValue(envelope)); }
     catch (error) { writeError = error; }
     const first = inspectKey(target);
-    const second = inspectKey(target);
+    const second = first;
     let committed = false;
     try {
       committed = first.status === "parsed" && second.status === "parsed"
@@ -388,11 +458,18 @@ MotaLab.createJournal = function createJournal(storage) {
         complete_candidate_observed: committed,
       });
     }
-    const after = loadStableContext("journal-generation-commit");
+    const after = loadContextOnce();
     if (!after.active || after.active.key !== target
       || after.active.envelope.commit_hash !== envelope.commit_hash) {
       throw pauseStorage("journal-generation-commit", { reason: "candidate-not-selected" });
     }
+    cachedContext = after;
+    cachedState = stateFromContext(after);
+    cachedRevision = storage && typeof storage.getRevision === "function"
+      ? storage.getRevision() : null;
+    diagnostics.writes.push({ generation: envelope.generation, ms: now() - writeStarted,
+      bytes: MotaLab.canonicalize(envelope).length });
+    if (diagnostics.writes.length > 32) diagnostics.writes.shift();
     return Object.freeze({
       verified: true,
       state: MotaLab.cloneJsonValue(next),
@@ -402,8 +479,9 @@ MotaLab.createJournal = function createJournal(storage) {
   }
 
   function update(mutator) {
-    const context = loadStableContext("journal-update-read");
-    const state = stateFromContext(context);
+    ensureCache();
+    const context = cachedContext;
+    const state = MotaLab.cloneJsonValue(cachedState);
     mutator(state);
     return write(state, context);
   }
@@ -417,6 +495,13 @@ MotaLab.createJournal = function createJournal(storage) {
 
   return Object.freeze({
     snapshot: read,
+    getDiagnostics() {
+      return MotaLab.cloneJsonValue(Object.assign({}, diagnostics, {
+        average_snapshot_ms: diagnostics.snapshots
+          ? diagnostics.snapshot_ms / diagnostics.snapshots : 0,
+        cached: Boolean(cachedContext), externally_invalidated: externallyInvalidated,
+      }));
+    },
     setAutopilot(enabled) { return update((state) => { state.autopilot_enabled = enabled === true; }); },
     establishSession({ session_id, mode, baseline, expected_guard = null }) {
       if (typeof session_id !== "string" || session_id.length < 1
@@ -533,6 +618,11 @@ MotaLab.createJournal = function createJournal(storage) {
     setPending(pending) {
       return update((state) => {
         state.pending_action = MotaLab.cloneJsonValue(pending);
+        if (state.pending_action.pre_observation) {
+          state.pending_action.pre_observation = MotaLab.recoveryObservationProjection(
+            state.pending_action.pre_observation,
+          );
+        }
         state.seen_action_ids[pending.action_id] = "pending";
       });
     },
@@ -554,19 +644,48 @@ MotaLab.createJournal = function createJournal(storage) {
     markCompleted(record) {
       return update((state) => {
         state.last_completed_action = MotaLab.cloneJsonValue(record);
+        delete state.last_completed_action.observation;
         state.pending_action = null;
         state.seen_action_ids[record.action_id] = "completed";
+      });
+    },
+    markCompletedAndAcknowledge(record, actionId) {
+      return update((state) => {
+        state.last_completed_action = MotaLab.cloneJsonValue(record);
+        delete state.last_completed_action.observation;
+        state.pending_action = null;
+        state.seen_action_ids[record.action_id] = "completed";
+        state.last_acknowledged_action_id = actionId;
       });
     },
     acknowledge(actionId) { return update((state) => { state.last_acknowledged_action_id = actionId; }); },
     actionState(actionId) { return read().seen_action_ids[actionId] || null; },
     setPause(pause) {
-      return update((state) => { state.last_pause = MotaLab.cloneJsonValue(pause); state.autopilot_enabled = false; });
+      return update((state) => {
+        state.last_pause = MotaLab.cloneJsonValue(pause);
+        if (state.last_pause.observation) {
+          state.last_pause.observation = MotaLab.recoveryObservationProjection(
+            state.last_pause.observation,
+          );
+        }
+        if (state.last_pause.details) {
+          state.last_pause.details = MotaLab.compactJournalDetails(state.last_pause.details);
+        }
+        state.autopilot_enabled = false;
+      });
     },
     setRegistryEntries(entries) {
+      ensureCache();
+      if (MotaLab.canonicalize(cachedState.registry_entries)
+        === MotaLab.canonicalize(entries)) return Object.freeze({ verified: true, skipped: true });
       return update((state) => { state.registry_entries = MotaLab.cloneJsonValue(entries); });
     },
     setScanState(scanState) {
+      ensureCache();
+      const next = scanState ? MotaLab.cloneJsonValue(scanState) : null;
+      if (MotaLab.canonicalize(cachedState.scan_state) === MotaLab.canonicalize(next)) {
+        return Object.freeze({ verified: true, skipped: true });
+      }
       return update((state) => { state.scan_state = scanState ? MotaLab.cloneJsonValue(scanState) : null; });
     },
   });

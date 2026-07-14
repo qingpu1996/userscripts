@@ -340,11 +340,9 @@ test("fake core → localhost service → atomic execution → settled report is
   assert.equal(fake.hero.hp, 408);
   assert.equal(fake.authority.blocks.length, 1);
 
-  const resourceAck = await controller.runSingleCycle();
-  assert.equal(resourceAck.idle, true);
-  assert.equal(journal.snapshot().last_acknowledged_action_id, resource.action_id);
   const enemy = await controller.runSingleCycle();
   assert.equal(enemy.completed, true);
+  assert.equal(journal.snapshot().last_acknowledged_action_id, resource.action_id);
   assert.equal(fake.calls.route.length, 2, "enemy is a separate next-cycle boundary");
   assert.equal(fake.hero.hp, 384);
   assert.equal(fake.hero.money, 21);

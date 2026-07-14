@@ -333,6 +333,19 @@ MotaLab.createRuntimeEnvironment = function createRuntimeEnvironment(
     return null;
   }
   const storage = {
+    subscribeChanges(callback) {
+      if (typeof scope.addEventListener !== "function") return () => {};
+      const physical = new Set(directSlotKeys);
+      const listener = (event) => {
+        if (event && physical.has(event.key)) callback({ key: event.key, remote: true });
+      };
+      scope.addEventListener("storage", listener);
+      return () => {
+        if (typeof scope.removeEventListener === "function") {
+          scope.removeEventListener("storage", listener);
+        }
+      };
+    },
     inspect(key) {
       const physicalKey = directPhysicalKey(key);
       if (physicalKey === null) return { status: "absent", key };
@@ -2369,6 +2382,76 @@ MotaLab.fingerprintRuntimeObservation = function fingerprintRuntimeObservation(o
   return `sha256:${MotaLab.sha256(MotaLab.canonicalize(projection))}`;
 };
 
+// A fast snapshot intentionally omits the cross-floor engine catalog.  Safety
+// checks performed between a complete observation and a fast snapshot must
+// therefore compare only the runtime facts represented by both shapes.  Keep
+// this projection separate from fingerprintProjection: the latter must still
+// notice catalog/model changes when both complete observations are compared.
+MotaLab.runtimeStateProjectionIgnoringPosition = function runtimeStateProjectionIgnoringPosition(
+  observation,
+) {
+  const projection = MotaLab.fingerprintProjection(observation);
+  delete projection.catalog_hash;
+  delete projection.engine_model_hash;
+  projection.hero.loc = { x: 0, y: 0, direction: null };
+  return projection;
+};
+
+MotaLab.runtimeStateChangedBeyondPosition = function runtimeStateChangedBeyondPosition(
+  before,
+  after,
+) {
+  const project = (observation) => MotaLab.canonicalize(
+    MotaLab.runtimeStateProjectionIgnoringPosition(observation),
+  );
+  return project(before) !== project(after);
+};
+
+// Durable recovery needs the current runtime facts that participate in guard
+// and delta checks, not the (potentially megabyte-sized) cross-floor engine
+// catalog.  Inventory is the only engine_model field used by delta recovery.
+MotaLab.recoveryObservationProjection = function recoveryObservationProjection(observation) {
+  if (!observation) return null;
+  const projected = {
+    protocol: observation.protocol,
+    page: observation.page,
+    session_id: observation.session_id,
+    floor_id: observation.floor_id,
+    floor_name: observation.floor_name,
+    floor_number: observation.floor_number,
+    dimensions: MotaLab.cloneJsonValue(observation.dimensions),
+    topology: MotaLab.cloneJsonValue(observation.topology),
+    topology_fingerprint: observation.topology_fingerprint,
+    map_instance_id: observation.map_instance_id,
+    hero: MotaLab.cloneJsonValue(observation.hero),
+    keys: MotaLab.cloneJsonValue(observation.keys),
+    busy: observation.busy === true,
+    blocks: MotaLab.cloneJsonValue(observation.blocks || []),
+    captured_at: observation.captured_at,
+  };
+  const inventory = observation.engine_model && observation.engine_model.inventory;
+  if (inventory) projected.recovery_inventory = MotaLab.cloneJsonValue(inventory);
+  return projected;
+};
+
+MotaLab.compactJournalDetails = function compactJournalDetails(value, depth = 0) {
+  if (depth > 8) return "[truncated]";
+  if (Array.isArray(value)) {
+    return value.slice(0, 256).map((item) => MotaLab.compactJournalDetails(item, depth + 1));
+  }
+  if (!value || typeof value !== "object") return value;
+  const result = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (["engine_model", "catalog", "floors"].includes(key)) continue;
+    if (key === "observation") {
+      result.observation = MotaLab.recoveryObservationProjection(item);
+    } else {
+      result[key] = MotaLab.compactJournalDetails(item, depth + 1);
+    }
+  }
+  return result;
+};
+
 MotaLab.compareGuard = function compareGuard(observation, guard) {
   const differences = [];
   function compare(field, expected, actual, required = true) {
@@ -2576,8 +2659,9 @@ MotaLab.compareExpectedDelta = function compareExpectedDelta(before, after, expe
   if (expected.inventory) {
     const flatten = (observation) => {
       const result = {};
-      const classes = observation.engine_model && observation.engine_model.inventory
-        && observation.engine_model.inventory.classes;
+      const inventory = observation.recovery_inventory
+        || (observation.engine_model && observation.engine_model.inventory);
+      const classes = inventory && inventory.classes;
       if (!classes || typeof classes !== "object") return result;
       for (const items of Object.values(classes)) {
         if (!items || typeof items !== "object") continue;
@@ -2972,24 +3056,68 @@ MotaLab.executeAction = async function executeAction({
   });
   let beforeStep = executionObservation;
   let beforeFingerprint = executionFingerprint;
+  const timingNow = () => (globalThis.performance && typeof globalThis.performance.now === "function"
+    ? globalThis.performance.now() : Date.now());
+  const engineTimings = [];
 
-  for (let index = 0; index < plan.length; index += 1) {
-    const step = plan[index];
-    const useDirect = step.pure && !step.boundary
-      && adapter.canMoveDirectly(step.operation.x, step.operation.y);
-    if (useDirect) adapter.moveDirectly(step.operation.x, step.operation.y);
-    else adapter.setAutomaticRoute(step.operation.x, step.operation.y);
-
+  async function moveAndSettle(method, target, final, preFingerprint) {
+    const started = timingNow();
+    adapter[method](target.x, target.y);
     const settled = await MotaLab.waitForStability(Object.assign({
       adapter,
       observe: observeFast,
-      finalizeObservation: observe,
-      preFingerprint: beforeFingerprint,
+      finalizeObservation: final ? observe : observeFast,
+      preFingerprint,
     }, stabilityOptions));
+    engineTimings.push({ method, target: MotaLab.cloneJsonValue(target),
+      final, settle_ms: timingNow() - started });
+    return settled;
+  }
+
+  for (let index = 0; index < plan.length; index += 1) {
+    const step = plan[index];
+    // A boundary remains one logical action.  We only accelerate its proven
+    // empty prefix and let the engine's normal route trigger the final cell.
+    // No intermediate full engine catalog is rebuilt.
+    if (step.boundary && step.path.length > 2) {
+      const prefixPath = step.path.slice(0, -1);
+      const approach = prefixPath[prefixPath.length - 1];
+      if (MotaLab.isPureCorridorPath(prefixPath, executionObservation, registry)
+        && adapter.canMoveDirectly(approach.x, approach.y)) {
+        const prefixSettled = await moveAndSettle(
+          "moveDirectly", approach, false, beforeFingerprint,
+        );
+        const prefixObservation = prefixSettled.observation;
+        if (prefixObservation.hero.loc.x !== approach.x
+          || prefixObservation.hero.loc.y !== approach.y
+          || MotaLab.runtimeStateChangedBeyondPosition(beforeStep, prefixObservation)) {
+          adapter.stopAutomaticRoute();
+          throw MotaLab.createPauseError(
+            "EXPECTED_DELTA_MISMATCH",
+            "FAST_PREFIX_STATE_CHANGED",
+            { operation_index: index, target: approach,
+              actual: prefixObservation.hero.loc },
+          );
+        }
+        beforeStep = prefixObservation;
+        beforeFingerprint = prefixSettled.runtime_fingerprint;
+      }
+    }
+    const useDirect = step.pure && !step.boundary
+      && adapter.canMoveDirectly(step.operation.x, step.operation.y);
+    const settled = await moveAndSettle(
+      useDirect ? "moveDirectly" : "setAutomaticRoute",
+      step.operation,
+      true,
+      beforeFingerprint,
+    );
     const afterStep = settled.observation;
     const reachedTarget = afterStep.hero.loc.x === step.operation.x
       && afterStep.hero.loc.y === step.operation.y;
-    const changedBoundary = MotaLab.stateChangedBeyondPosition(beforeStep, afterStep);
+    // beforeStep can be the fast snapshot produced by an accelerated prefix,
+    // while afterStep is the final complete observation.  Catalog presence is
+    // an observation-shape difference, not an in-game boundary transition.
+    const changedBoundary = MotaLab.runtimeStateChangedBeyondPosition(beforeStep, afterStep);
 
     if (!reachedTarget && !changedBoundary) {
       adapter.stopAutomaticRoute();
@@ -3007,6 +3135,7 @@ MotaLab.executeAction = async function executeAction({
         plan,
         completed_operations: index + 1,
         boundary_reached: true,
+        engine_timings: engineTimings,
       };
     }
     if (index < plan.length - 1) {
@@ -3020,6 +3149,7 @@ MotaLab.executeAction = async function executeAction({
       plan,
       completed_operations: index + 1,
       boundary_reached: step.boundary,
+      engine_timings: engineTimings,
     };
   }
   throw new Error("Unreachable empty execution plan");
@@ -3027,7 +3157,9 @@ MotaLab.executeAction = async function executeAction({
 
 MotaLab.createMemoryStorage = function createMemoryStorage(seed = {}) {
   const values = new Map(Object.entries(seed));
+  let revision = 0;
   return {
+    getRevision() { return revision; },
     inspect(key) {
       if (!values.has(key)) return { status: "absent", key };
       const raw = values.get(key);
@@ -3046,11 +3178,13 @@ MotaLab.createMemoryStorage = function createMemoryStorage(seed = {}) {
     set(key, value) {
       const clone = MotaLab.cloneJsonValue(value);
       values.set(key, clone);
+      revision += 1;
       return Object.freeze({ verified: true, key,
         canonical_hash: `sha256:${MotaLab.sha256(MotaLab.canonicalize(clone))}` });
     },
     delete(key) {
       values.delete(key);
+      revision += 1;
       return Object.freeze({ verified: true, key, absent: true });
     },
   };
@@ -3086,6 +3220,16 @@ MotaLab.createJournal = function createJournal(storage) {
     "commit_hash", "generation", "import_witness", "previous_commit_hash",
     "previous_generation", "state", "state_hash", "storage_protocol",
   ].sort());
+  let cachedContext = null;
+  let cachedState = null;
+  let cachedRevision = null;
+  let externallyInvalidated = false;
+  const diagnostics = { cold_load_ms: 0, snapshots: 0, snapshot_ms: 0, writes: [] };
+  const now = () => (globalThis.performance && typeof globalThis.performance.now === "function"
+    ? globalThis.performance.now() : Date.now());
+  if (storage && typeof storage.subscribeChanges === "function") {
+    storage.subscribeChanges(() => { externallyInvalidated = true; });
+  }
 
   function pauseStorage(operation, details = {}) {
     return MotaLab.createPauseError(
@@ -3374,12 +3518,64 @@ MotaLab.createJournal = function createJournal(storage) {
       result.corruption_required = true;
     }
     if (result.corruption_required) result.autopilot_enabled = false;
+    if (result.pending_action && result.pending_action.pre_observation) {
+      result.pending_action.pre_observation = MotaLab.recoveryObservationProjection(
+        result.pending_action.pre_observation,
+      );
+    }
+    if (result.last_completed_action) delete result.last_completed_action.observation;
+    if (result.last_pause) {
+      if (result.last_pause.observation) {
+        result.last_pause.observation = MotaLab.recoveryObservationProjection(
+          result.last_pause.observation,
+        );
+      }
+      if (result.last_pause.details) {
+        result.last_pause.details = MotaLab.compactJournalDetails(result.last_pause.details);
+      }
+    }
     return result;
   }
 
-  function read() { return stateFromContext(loadStableContext()); }
+  function ensureCache() {
+    if (externallyInvalidated) {
+      throw pauseStorage("journal-cache", { reason: "external-storage-change" });
+    }
+    const currentRevision = storage && typeof storage.getRevision === "function"
+      ? storage.getRevision() : null;
+    const quarantinedWitness = cachedContext && (
+      (cachedContext.witness && cachedContext.witness.classification === "corrupt")
+      || cachedContext.legacyEntries.length > 0
+      || cachedContext.corruptEvidence.length > 0
+    );
+    if (quarantinedWitness) {
+      cachedContext = null;
+      cachedState = null;
+    }
+    if (cachedContext && currentRevision !== null && currentRevision !== cachedRevision) {
+      cachedContext = null;
+      cachedState = null;
+    }
+    if (!cachedContext) {
+      const started = now();
+      cachedContext = loadStableContext();
+      cachedState = stateFromContext(cachedContext);
+      cachedRevision = currentRevision;
+      diagnostics.cold_load_ms = now() - started;
+    }
+  }
+
+  function read() {
+    const started = now();
+    ensureCache();
+    const result = MotaLab.cloneJsonValue(cachedState);
+    diagnostics.snapshots += 1;
+    diagnostics.snapshot_ms += now() - started;
+    return result;
+  }
 
   function write(next, context, allowInitialCorruptArchive = false) {
+    const writeStarted = now();
     if (next.corruption_required && !next.corrupt_archive && !allowInitialCorruptArchive) {
       throw new TypeError("Corrupt journal evidence must be archived before a generation is written");
     }
@@ -3387,7 +3583,7 @@ MotaLab.createJournal = function createJournal(storage) {
     if (!context.witness) {
       throw pauseStorage("journal-write", { reason: "unstable-import-witness" });
     }
-    const precondition = loadStableContext("journal-write-precondition");
+    const precondition = loadContextOnce();
     if (contextIdentity(precondition) !== contextIdentity(context)) {
       throw pauseStorage("journal-write-precondition", { reason: "read-write-witness-changed" });
     }
@@ -3396,10 +3592,14 @@ MotaLab.createJournal = function createJournal(storage) {
       : MotaLab.JOURNAL_SLOT_KEYS[0];
     const envelope = buildEnvelope(next, context.active, context.witness);
     let writeError = null;
+    // Runtime storage adapters already perform two independent canonical
+    // readbacks.  This layer then parses the target once and re-selects the
+    // complete A/B generation set below; repeating both full-slot probes here
+    // was the former hot-path multiplier.
     try { storage.set(target, MotaLab.cloneJsonValue(envelope)); }
     catch (error) { writeError = error; }
     const first = inspectKey(target);
-    const second = inspectKey(target);
+    const second = first;
     let committed = false;
     try {
       committed = first.status === "parsed" && second.status === "parsed"
@@ -3415,11 +3615,18 @@ MotaLab.createJournal = function createJournal(storage) {
         complete_candidate_observed: committed,
       });
     }
-    const after = loadStableContext("journal-generation-commit");
+    const after = loadContextOnce();
     if (!after.active || after.active.key !== target
       || after.active.envelope.commit_hash !== envelope.commit_hash) {
       throw pauseStorage("journal-generation-commit", { reason: "candidate-not-selected" });
     }
+    cachedContext = after;
+    cachedState = stateFromContext(after);
+    cachedRevision = storage && typeof storage.getRevision === "function"
+      ? storage.getRevision() : null;
+    diagnostics.writes.push({ generation: envelope.generation, ms: now() - writeStarted,
+      bytes: MotaLab.canonicalize(envelope).length });
+    if (diagnostics.writes.length > 32) diagnostics.writes.shift();
     return Object.freeze({
       verified: true,
       state: MotaLab.cloneJsonValue(next),
@@ -3429,8 +3636,9 @@ MotaLab.createJournal = function createJournal(storage) {
   }
 
   function update(mutator) {
-    const context = loadStableContext("journal-update-read");
-    const state = stateFromContext(context);
+    ensureCache();
+    const context = cachedContext;
+    const state = MotaLab.cloneJsonValue(cachedState);
     mutator(state);
     return write(state, context);
   }
@@ -3444,6 +3652,13 @@ MotaLab.createJournal = function createJournal(storage) {
 
   return Object.freeze({
     snapshot: read,
+    getDiagnostics() {
+      return MotaLab.cloneJsonValue(Object.assign({}, diagnostics, {
+        average_snapshot_ms: diagnostics.snapshots
+          ? diagnostics.snapshot_ms / diagnostics.snapshots : 0,
+        cached: Boolean(cachedContext), externally_invalidated: externallyInvalidated,
+      }));
+    },
     setAutopilot(enabled) { return update((state) => { state.autopilot_enabled = enabled === true; }); },
     establishSession({ session_id, mode, baseline, expected_guard = null }) {
       if (typeof session_id !== "string" || session_id.length < 1
@@ -3560,6 +3775,11 @@ MotaLab.createJournal = function createJournal(storage) {
     setPending(pending) {
       return update((state) => {
         state.pending_action = MotaLab.cloneJsonValue(pending);
+        if (state.pending_action.pre_observation) {
+          state.pending_action.pre_observation = MotaLab.recoveryObservationProjection(
+            state.pending_action.pre_observation,
+          );
+        }
         state.seen_action_ids[pending.action_id] = "pending";
       });
     },
@@ -3581,19 +3801,48 @@ MotaLab.createJournal = function createJournal(storage) {
     markCompleted(record) {
       return update((state) => {
         state.last_completed_action = MotaLab.cloneJsonValue(record);
+        delete state.last_completed_action.observation;
         state.pending_action = null;
         state.seen_action_ids[record.action_id] = "completed";
+      });
+    },
+    markCompletedAndAcknowledge(record, actionId) {
+      return update((state) => {
+        state.last_completed_action = MotaLab.cloneJsonValue(record);
+        delete state.last_completed_action.observation;
+        state.pending_action = null;
+        state.seen_action_ids[record.action_id] = "completed";
+        state.last_acknowledged_action_id = actionId;
       });
     },
     acknowledge(actionId) { return update((state) => { state.last_acknowledged_action_id = actionId; }); },
     actionState(actionId) { return read().seen_action_ids[actionId] || null; },
     setPause(pause) {
-      return update((state) => { state.last_pause = MotaLab.cloneJsonValue(pause); state.autopilot_enabled = false; });
+      return update((state) => {
+        state.last_pause = MotaLab.cloneJsonValue(pause);
+        if (state.last_pause.observation) {
+          state.last_pause.observation = MotaLab.recoveryObservationProjection(
+            state.last_pause.observation,
+          );
+        }
+        if (state.last_pause.details) {
+          state.last_pause.details = MotaLab.compactJournalDetails(state.last_pause.details);
+        }
+        state.autopilot_enabled = false;
+      });
     },
     setRegistryEntries(entries) {
+      ensureCache();
+      if (MotaLab.canonicalize(cachedState.registry_entries)
+        === MotaLab.canonicalize(entries)) return Object.freeze({ verified: true, skipped: true });
       return update((state) => { state.registry_entries = MotaLab.cloneJsonValue(entries); });
     },
     setScanState(scanState) {
+      ensureCache();
+      const next = scanState ? MotaLab.cloneJsonValue(scanState) : null;
+      if (MotaLab.canonicalize(cachedState.scan_state) === MotaLab.canonicalize(next)) {
+        return Object.freeze({ verified: true, skipped: true });
+      }
       return update((state) => { state.scan_state = scanState ? MotaLab.cloneJsonValue(scanState) : null; });
     },
   });
@@ -3969,6 +4218,10 @@ MotaLab.createController = function createController(dependencies, options = {})
   let cyclePromise = null;
   let unsafeResponseCount = 0;
   let duplicatePendingCount = 0;
+  const timingNow = () => (globalThis.performance && typeof globalThis.performance.now === "function"
+    ? globalThis.performance.now() : Date.now());
+  const timingHistory = [];
+  let activeTiming = null;
 
   function locationText(observation) {
     return observation
@@ -3994,9 +4247,11 @@ MotaLab.createController = function createController(dependencies, options = {})
   }
 
   function capture() {
+    const started = timingNow();
     try {
       currentObservation = observe();
       refreshPanel();
+      if (activeTiming) activeTiming.capture_ms += timingNow() - started;
       return currentObservation;
     } catch (error) {
       if (error && error.observation) {
@@ -4018,9 +4273,9 @@ MotaLab.createController = function createController(dependencies, options = {})
       detail_code: detailCode || null,
       action_id: currentActionId,
       captured_at: Date.now(),
-      observation: observation ? MotaLab.cloneObservationForWire(observation) : null,
+      observation: observation ? MotaLab.recoveryObservationProjection(observation) : null,
       block_evidence: evidenceBlocks,
-      details: MotaLab.cloneJsonValue(details),
+      details: MotaLab.compactJournalDetails(details),
     };
     try { journal.setPause(record); } catch (journalError) {
       record.journal_write_blocked = true;
@@ -4304,7 +4559,6 @@ MotaLab.createController = function createController(dependencies, options = {})
     const completionRecord = recovery.phase === "completed" ? {
         action_id: pending.action_id,
         fingerprint,
-        observation: MotaLab.cloneObservationForWire(currentObservation),
         completed_at: Date.now(),
         recovered: true,
       } : null;
@@ -4328,6 +4582,7 @@ MotaLab.createController = function createController(dependencies, options = {})
       : snapshot.last_completed_action
       && snapshot.last_acknowledged_action_id !== snapshot.last_completed_action.action_id
       ? snapshot.last_completed_action.action_id : null;
+    if (activeTiming) activeTiming.mode = completedActionId ? "ack_and_decide" : "decide";
     const request = MotaLab.createCycleRequest({
       observation,
       completedActionId,
@@ -4343,13 +4598,31 @@ MotaLab.createController = function createController(dependencies, options = {})
     state = "REQUESTING";
     let response;
     try {
+      const requestStarted = timingNow();
       response = await client.postCycle(request);
+      if (activeTiming) activeTiming.http_ms += timingNow() - requestStarted;
     } catch (error) {
       return pause(
         "DECISION_SERVICE_UNAVAILABLE",
         error.detail_code || "CONNECTION_FAILED",
         { message: error.message },
         observation,
+      );
+    }
+    if (completedActionId) {
+      if (response.acknowledged_action_id !== completedActionId) {
+        return pause(
+          "DECISION_SERVICE_UNAVAILABLE", "RECOVERY_ACK_MISSING",
+          { completed_action_id: completedActionId, response_status: response.status,
+            acknowledged_action_id: response.acknowledged_action_id || null }, observation,
+        );
+      }
+      if (completionRecord) journal.markCompletedAndAcknowledge(completionRecord, completedActionId);
+      else journal.acknowledge(completedActionId);
+    } else if (response.acknowledged_action_id) {
+      return pause(
+        "DECISION_SERVICE_UNAVAILABLE", "RECOVERY_ACK_IDENTITY_MISMATCH",
+        { acknowledged_action_id: response.acknowledged_action_id }, observation,
       );
     }
     if (response.status === "pause") {
@@ -4362,22 +4635,6 @@ MotaLab.createController = function createController(dependencies, options = {})
         response.error_code,
         { reason: response.reason, errors: response.errors },
         observation,
-      );
-    }
-    if (completedActionId) {
-      if (response.status !== "idle" || response.acknowledged_action_id !== completedActionId) {
-        return pause(
-          "DECISION_SERVICE_UNAVAILABLE", "RECOVERY_ACK_MISSING",
-          { completed_action_id: completedActionId, response_status: response.status,
-            acknowledged_action_id: response.acknowledged_action_id || null }, observation,
-        );
-      }
-      if (completionRecord) journal.markCompleted(completionRecord);
-      journal.acknowledge(completedActionId);
-    } else if (response.acknowledged_action_id) {
-      return pause(
-        "DECISION_SERVICE_UNAVAILABLE", "RECOVERY_ACK_IDENTITY_MISMATCH",
-        { acknowledged_action_id: response.acknowledged_action_id }, observation,
       );
     }
     if (!snapshot.service_session_confirmed) journal.markServiceSessionConfirmed();
@@ -4526,7 +4783,7 @@ MotaLab.createController = function createController(dependencies, options = {})
           journal.setPending({
             action_id: response.action_id,
             pre_fingerprint: freshFingerprint,
-            pre_observation: MotaLab.cloneObservationForWire(freshObservation),
+            pre_observation: MotaLab.recoveryObservationProjection(freshObservation),
             guard: response.guard,
             expected_delta: response.expected_delta,
             allow_unknown_floor: response.expected_delta.floor_id === null,
@@ -4553,7 +4810,7 @@ MotaLab.createController = function createController(dependencies, options = {})
     const pendingRecord = {
       action_id: response.action_id,
       pre_fingerprint: freshFingerprint,
-      pre_observation: MotaLab.cloneObservationForWire(freshObservation),
+      pre_observation: MotaLab.recoveryObservationProjection(freshObservation),
       guard: response.guard,
       expected_delta: response.expected_delta,
       requires_non_position_change: actionConstraints.requires_non_position_change,
@@ -4577,6 +4834,7 @@ MotaLab.createController = function createController(dependencies, options = {})
         observeFast,
         stabilityOptions: options.stabilityOptions || {},
       });
+      if (activeTiming) activeTiming.engine = result.engine_timings || [];
     } catch (error) {
       if (error && error.observation) currentObservation = error.observation;
       else {
@@ -4624,7 +4882,6 @@ MotaLab.createController = function createController(dependencies, options = {})
     journal.markCompleted({
       action_id: response.action_id,
       fingerprint: result.fingerprint,
-      observation: MotaLab.cloneObservationForWire(result.observation),
       completed_at: Date.now(),
       recovered: false,
     });
@@ -4637,8 +4894,19 @@ MotaLab.createController = function createController(dependencies, options = {})
 
   function runSingleCycle() {
     if (cyclePromise) return cyclePromise;
+    activeTiming = { started_at: Date.now(), started_ms: timingNow(), mode: "unknown",
+      capture_ms: 0, http_ms: 0, engine: [] };
     cyclePromise = cycleBody().catch((error) => handleError(error))
-      .finally(() => { cyclePromise = null; });
+      .finally(() => {
+        activeTiming.total_ms = timingNow() - activeTiming.started_ms;
+        delete activeTiming.started_ms;
+        activeTiming.journal = typeof journal.getDiagnostics === "function"
+          ? journal.getDiagnostics() : null;
+        timingHistory.push(activeTiming);
+        if (timingHistory.length > 32) timingHistory.shift();
+        activeTiming = null;
+        cyclePromise = null;
+      });
     return cyclePromise;
   }
 
@@ -4779,6 +5047,13 @@ MotaLab.createController = function createController(dependencies, options = {})
     getCurrentObservation,
     getLegacyArchive,
     getCorruptArchive,
+    getDiagnostics() {
+      return {
+        cycles: MotaLab.cloneJsonValue(timingHistory),
+        active: activeTiming ? MotaLab.cloneJsonValue(activeTiming) : null,
+        journal: typeof journal.getDiagnostics === "function" ? journal.getDiagnostics() : null,
+      };
+    },
     getState: () => state,
   });
 };

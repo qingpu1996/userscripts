@@ -527,6 +527,56 @@ test("相同现场的新 action_id 不受旧 completed 记录阻挡并可执行"
   assert.equal(journal.actionState("AUTO-BBBBBBBBBBBBBBBB"), "completed");
 });
 
+test("completed ACK 与下一行动在同一响应完成且只发一次 cycle 请求", async () => {
+  const before = makeObservation();
+  const after = makeObservation({ hero: { loc: { x: 9, y: 3 } } });
+  const previousId = "AUTO-AAAAAAAAAAAAAAAA";
+  const nextId = "AUTO-BBBBBBBBBBBBBBBB";
+  const current = { value: after };
+  const adapter = makeControllerAdapter(current);
+  const journal = lab.createJournal(lab.createMemoryStorage());
+  establishTestSession(journal, before);
+  journal.setAutopilot(true);
+  journal.setPending({
+    action_id: previousId,
+    pre_fingerprint: lab.fingerprintObservation(before),
+    pre_observation: lab.recoveryObservationProjection(before),
+    expected_delta: { position: { x: 9, y: 3 } },
+    allow_unknown_floor: false,
+    allow_unknown_map_instance: false,
+    requires_non_position_change: false,
+    phase: "prepared",
+  });
+  let requests = 0;
+  const controller = lab.createController({
+    adapter,
+    journal,
+    registry: lab.createBlockRegistry(),
+    client: { isConnected: () => true, async postCycle(request) {
+      requests += 1;
+      assert.equal(request.completed_action_id, previousId);
+      const response = makeExecuteResponse(after, nextId);
+      response.operations = [{ type: "grid", x: 10, y: 3 }];
+      response.expected_delta = { position: { x: 10, y: 3 } };
+      response.acknowledged_action_id = previousId;
+      return response;
+    } },
+    panel: makePanel(), observe: () => current.value, logger: { error() {} },
+  }, {
+    stabilityOptions: {
+      pollMs: 0, timeoutMs: 100, sleep: async () => {},
+      now: (() => { let tick = 0; return () => tick++; })(),
+    },
+  });
+  const result = await controller.runSingleCycle();
+  assert.equal(result.completed, true);
+  assert.equal(requests, 1);
+  assert.equal(journal.snapshot().last_acknowledged_action_id, previousId);
+  assert.equal(journal.actionState(previousId), "completed");
+  assert.equal(journal.actionState(nextId), "completed");
+  assert.equal(adapter.calls.direct, 1);
+});
+
 test("pending prestate 不变时相同 action_id 恢复执行且只调用一次 API", async () => {
   const current = { value: makeObservation() };
   const adapter = makeControllerAdapter(current);

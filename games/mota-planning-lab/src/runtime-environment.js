@@ -223,6 +223,19 @@ MotaLab.createRuntimeEnvironment = function createRuntimeEnvironment(
     return null;
   }
   const storage = {
+    subscribeChanges(callback) {
+      if (typeof scope.addEventListener !== "function") return () => {};
+      const physical = new Set(directSlotKeys);
+      const listener = (event) => {
+        if (event && physical.has(event.key)) callback({ key: event.key, remote: true });
+      };
+      scope.addEventListener("storage", listener);
+      return () => {
+        if (typeof scope.removeEventListener === "function") {
+          scope.removeEventListener("storage", listener);
+        }
+      };
+    },
     inspect(key) {
       const physicalKey = directPhysicalKey(key);
       if (physicalKey === null) return { status: "absent", key };

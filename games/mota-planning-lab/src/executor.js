@@ -185,24 +185,68 @@ MotaLab.executeAction = async function executeAction({
   });
   let beforeStep = executionObservation;
   let beforeFingerprint = executionFingerprint;
+  const timingNow = () => (globalThis.performance && typeof globalThis.performance.now === "function"
+    ? globalThis.performance.now() : Date.now());
+  const engineTimings = [];
 
-  for (let index = 0; index < plan.length; index += 1) {
-    const step = plan[index];
-    const useDirect = step.pure && !step.boundary
-      && adapter.canMoveDirectly(step.operation.x, step.operation.y);
-    if (useDirect) adapter.moveDirectly(step.operation.x, step.operation.y);
-    else adapter.setAutomaticRoute(step.operation.x, step.operation.y);
-
+  async function moveAndSettle(method, target, final, preFingerprint) {
+    const started = timingNow();
+    adapter[method](target.x, target.y);
     const settled = await MotaLab.waitForStability(Object.assign({
       adapter,
       observe: observeFast,
-      finalizeObservation: observe,
-      preFingerprint: beforeFingerprint,
+      finalizeObservation: final ? observe : observeFast,
+      preFingerprint,
     }, stabilityOptions));
+    engineTimings.push({ method, target: MotaLab.cloneJsonValue(target),
+      final, settle_ms: timingNow() - started });
+    return settled;
+  }
+
+  for (let index = 0; index < plan.length; index += 1) {
+    const step = plan[index];
+    // A boundary remains one logical action.  We only accelerate its proven
+    // empty prefix and let the engine's normal route trigger the final cell.
+    // No intermediate full engine catalog is rebuilt.
+    if (step.boundary && step.path.length > 2) {
+      const prefixPath = step.path.slice(0, -1);
+      const approach = prefixPath[prefixPath.length - 1];
+      if (MotaLab.isPureCorridorPath(prefixPath, executionObservation, registry)
+        && adapter.canMoveDirectly(approach.x, approach.y)) {
+        const prefixSettled = await moveAndSettle(
+          "moveDirectly", approach, false, beforeFingerprint,
+        );
+        const prefixObservation = prefixSettled.observation;
+        if (prefixObservation.hero.loc.x !== approach.x
+          || prefixObservation.hero.loc.y !== approach.y
+          || MotaLab.runtimeStateChangedBeyondPosition(beforeStep, prefixObservation)) {
+          adapter.stopAutomaticRoute();
+          throw MotaLab.createPauseError(
+            "EXPECTED_DELTA_MISMATCH",
+            "FAST_PREFIX_STATE_CHANGED",
+            { operation_index: index, target: approach,
+              actual: prefixObservation.hero.loc },
+          );
+        }
+        beforeStep = prefixObservation;
+        beforeFingerprint = prefixSettled.runtime_fingerprint;
+      }
+    }
+    const useDirect = step.pure && !step.boundary
+      && adapter.canMoveDirectly(step.operation.x, step.operation.y);
+    const settled = await moveAndSettle(
+      useDirect ? "moveDirectly" : "setAutomaticRoute",
+      step.operation,
+      true,
+      beforeFingerprint,
+    );
     const afterStep = settled.observation;
     const reachedTarget = afterStep.hero.loc.x === step.operation.x
       && afterStep.hero.loc.y === step.operation.y;
-    const changedBoundary = MotaLab.stateChangedBeyondPosition(beforeStep, afterStep);
+    // beforeStep can be the fast snapshot produced by an accelerated prefix,
+    // while afterStep is the final complete observation.  Catalog presence is
+    // an observation-shape difference, not an in-game boundary transition.
+    const changedBoundary = MotaLab.runtimeStateChangedBeyondPosition(beforeStep, afterStep);
 
     if (!reachedTarget && !changedBoundary) {
       adapter.stopAutomaticRoute();
@@ -220,6 +264,7 @@ MotaLab.executeAction = async function executeAction({
         plan,
         completed_operations: index + 1,
         boundary_reached: true,
+        engine_timings: engineTimings,
       };
     }
     if (index < plan.length - 1) {
@@ -233,6 +278,7 @@ MotaLab.executeAction = async function executeAction({
       plan,
       completed_operations: index + 1,
       boundary_reached: step.boundary,
+      engine_timings: engineTimings,
     };
   }
   throw new Error("Unreachable empty execution plan");

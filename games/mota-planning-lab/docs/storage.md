@@ -6,6 +6,8 @@ SQLite 是历史知识与行动审计库，不是游戏当前状态缓存。`obs
 
 SQLite ledger 之外，userscript/direct mount journal 是 at-most-once 身份链的浏览器端一半。它不再覆盖单一 active key，也没有权威 pointer。两个槽分别保存完整 envelope：`storage_protocol`、单调 `generation`、`previous_generation`、`previous_commit_hash`、完整 v2 state、`state_hash`、首次导入 witness 与 `commit_hash`。
 
+这里的 v2 state 是最小恢复证据：pending 只保存当前层运行态投影、pre fingerprint、guard、expected delta 和 action identity；completed 只保存 ID、结果 fingerprint 与时间；pause 只保留当前层投影和压缩详情。完整 `engine_model`、跨层 floor catalog 和可从现场重建的数据不会写入槽位。页面内使用已验证 generation 的内存缓存，普通 `snapshot()` 不重复读取和哈希双槽；关键 mutation 仍执行读写 witness、候选写后验证与最高 generation 复核。外部 storage 变化会使缓存失效或在下一关键写前 fail closed。
+
 读取时先验证每个 envelope 自身的前代声明：generation 1 必须是 `previous_generation=0` 且 `previous_commit_hash=null`；generation 大于 1 时必须是安全整数，并严格满足 `previous_generation=generation-1` 与合法 previous commit hash。随后独立稳定读取两槽并验证 canonical hash。两个合法槽必须是相邻 generation，且高槽的 previous generation/hash 精确指向低槽；同 generation、gap、链断、整数溢出或 unexpected higher 都 fail closed。只有一个合法高 generation 槽且其内部声明仍严格相邻时，允许忽略另一个部分/截断 candidate，从而保住上次 committed identity。写入永远选择非当前最高槽，写后双读完整 envelope，再从两槽重新选择新最高；不覆盖当前最高合法槽。
 
 单槽自证只能证明 envelope 声明的直接前代相邻，不能凭空证明更早历史没有被整体回放。没有外部高水位时，单个合法 `generation=100, previous_generation=99` 可以恢复；历史回放风险由 localhost service 的持久 ledger、session/guard/fingerprint 与行动 ack 链共同补强，不宣称浏览器单槽独立解决 rollback。

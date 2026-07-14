@@ -23,6 +23,10 @@ MotaLab.createController = function createController(dependencies, options = {})
   let cyclePromise = null;
   let unsafeResponseCount = 0;
   let duplicatePendingCount = 0;
+  const timingNow = () => (globalThis.performance && typeof globalThis.performance.now === "function"
+    ? globalThis.performance.now() : Date.now());
+  const timingHistory = [];
+  let activeTiming = null;
 
   function locationText(observation) {
     return observation
@@ -48,9 +52,11 @@ MotaLab.createController = function createController(dependencies, options = {})
   }
 
   function capture() {
+    const started = timingNow();
     try {
       currentObservation = observe();
       refreshPanel();
+      if (activeTiming) activeTiming.capture_ms += timingNow() - started;
       return currentObservation;
     } catch (error) {
       if (error && error.observation) {
@@ -72,9 +78,9 @@ MotaLab.createController = function createController(dependencies, options = {})
       detail_code: detailCode || null,
       action_id: currentActionId,
       captured_at: Date.now(),
-      observation: observation ? MotaLab.cloneObservationForWire(observation) : null,
+      observation: observation ? MotaLab.recoveryObservationProjection(observation) : null,
       block_evidence: evidenceBlocks,
-      details: MotaLab.cloneJsonValue(details),
+      details: MotaLab.compactJournalDetails(details),
     };
     try { journal.setPause(record); } catch (journalError) {
       record.journal_write_blocked = true;
@@ -358,7 +364,6 @@ MotaLab.createController = function createController(dependencies, options = {})
     const completionRecord = recovery.phase === "completed" ? {
         action_id: pending.action_id,
         fingerprint,
-        observation: MotaLab.cloneObservationForWire(currentObservation),
         completed_at: Date.now(),
         recovered: true,
       } : null;
@@ -382,6 +387,7 @@ MotaLab.createController = function createController(dependencies, options = {})
       : snapshot.last_completed_action
       && snapshot.last_acknowledged_action_id !== snapshot.last_completed_action.action_id
       ? snapshot.last_completed_action.action_id : null;
+    if (activeTiming) activeTiming.mode = completedActionId ? "ack_and_decide" : "decide";
     const request = MotaLab.createCycleRequest({
       observation,
       completedActionId,
@@ -397,13 +403,31 @@ MotaLab.createController = function createController(dependencies, options = {})
     state = "REQUESTING";
     let response;
     try {
+      const requestStarted = timingNow();
       response = await client.postCycle(request);
+      if (activeTiming) activeTiming.http_ms += timingNow() - requestStarted;
     } catch (error) {
       return pause(
         "DECISION_SERVICE_UNAVAILABLE",
         error.detail_code || "CONNECTION_FAILED",
         { message: error.message },
         observation,
+      );
+    }
+    if (completedActionId) {
+      if (response.acknowledged_action_id !== completedActionId) {
+        return pause(
+          "DECISION_SERVICE_UNAVAILABLE", "RECOVERY_ACK_MISSING",
+          { completed_action_id: completedActionId, response_status: response.status,
+            acknowledged_action_id: response.acknowledged_action_id || null }, observation,
+        );
+      }
+      if (completionRecord) journal.markCompletedAndAcknowledge(completionRecord, completedActionId);
+      else journal.acknowledge(completedActionId);
+    } else if (response.acknowledged_action_id) {
+      return pause(
+        "DECISION_SERVICE_UNAVAILABLE", "RECOVERY_ACK_IDENTITY_MISMATCH",
+        { acknowledged_action_id: response.acknowledged_action_id }, observation,
       );
     }
     if (response.status === "pause") {
@@ -416,22 +440,6 @@ MotaLab.createController = function createController(dependencies, options = {})
         response.error_code,
         { reason: response.reason, errors: response.errors },
         observation,
-      );
-    }
-    if (completedActionId) {
-      if (response.status !== "idle" || response.acknowledged_action_id !== completedActionId) {
-        return pause(
-          "DECISION_SERVICE_UNAVAILABLE", "RECOVERY_ACK_MISSING",
-          { completed_action_id: completedActionId, response_status: response.status,
-            acknowledged_action_id: response.acknowledged_action_id || null }, observation,
-        );
-      }
-      if (completionRecord) journal.markCompleted(completionRecord);
-      journal.acknowledge(completedActionId);
-    } else if (response.acknowledged_action_id) {
-      return pause(
-        "DECISION_SERVICE_UNAVAILABLE", "RECOVERY_ACK_IDENTITY_MISMATCH",
-        { acknowledged_action_id: response.acknowledged_action_id }, observation,
       );
     }
     if (!snapshot.service_session_confirmed) journal.markServiceSessionConfirmed();
@@ -580,7 +588,7 @@ MotaLab.createController = function createController(dependencies, options = {})
           journal.setPending({
             action_id: response.action_id,
             pre_fingerprint: freshFingerprint,
-            pre_observation: MotaLab.cloneObservationForWire(freshObservation),
+            pre_observation: MotaLab.recoveryObservationProjection(freshObservation),
             guard: response.guard,
             expected_delta: response.expected_delta,
             allow_unknown_floor: response.expected_delta.floor_id === null,
@@ -607,7 +615,7 @@ MotaLab.createController = function createController(dependencies, options = {})
     const pendingRecord = {
       action_id: response.action_id,
       pre_fingerprint: freshFingerprint,
-      pre_observation: MotaLab.cloneObservationForWire(freshObservation),
+      pre_observation: MotaLab.recoveryObservationProjection(freshObservation),
       guard: response.guard,
       expected_delta: response.expected_delta,
       requires_non_position_change: actionConstraints.requires_non_position_change,
@@ -631,6 +639,7 @@ MotaLab.createController = function createController(dependencies, options = {})
         observeFast,
         stabilityOptions: options.stabilityOptions || {},
       });
+      if (activeTiming) activeTiming.engine = result.engine_timings || [];
     } catch (error) {
       if (error && error.observation) currentObservation = error.observation;
       else {
@@ -678,7 +687,6 @@ MotaLab.createController = function createController(dependencies, options = {})
     journal.markCompleted({
       action_id: response.action_id,
       fingerprint: result.fingerprint,
-      observation: MotaLab.cloneObservationForWire(result.observation),
       completed_at: Date.now(),
       recovered: false,
     });
@@ -691,8 +699,19 @@ MotaLab.createController = function createController(dependencies, options = {})
 
   function runSingleCycle() {
     if (cyclePromise) return cyclePromise;
+    activeTiming = { started_at: Date.now(), started_ms: timingNow(), mode: "unknown",
+      capture_ms: 0, http_ms: 0, engine: [] };
     cyclePromise = cycleBody().catch((error) => handleError(error))
-      .finally(() => { cyclePromise = null; });
+      .finally(() => {
+        activeTiming.total_ms = timingNow() - activeTiming.started_ms;
+        delete activeTiming.started_ms;
+        activeTiming.journal = typeof journal.getDiagnostics === "function"
+          ? journal.getDiagnostics() : null;
+        timingHistory.push(activeTiming);
+        if (timingHistory.length > 32) timingHistory.shift();
+        activeTiming = null;
+        cyclePromise = null;
+      });
     return cyclePromise;
   }
 
@@ -833,6 +852,13 @@ MotaLab.createController = function createController(dependencies, options = {})
     getCurrentObservation,
     getLegacyArchive,
     getCorruptArchive,
+    getDiagnostics() {
+      return {
+        cycles: MotaLab.cloneJsonValue(timingHistory),
+        active: activeTiming ? MotaLab.cloneJsonValue(activeTiming) : null,
+        journal: typeof journal.getDiagnostics === "function" ? journal.getDiagnostics() : null,
+      };
+    },
     getState: () => state,
   });
 };
