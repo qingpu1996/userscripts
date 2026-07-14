@@ -1,5 +1,6 @@
 MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
   const scope = pageScope || (typeof unsafeWindow !== "undefined" ? unsafeWindow : globalThis);
+  const engineModelCache = { invalidated: true };
 
   function currentCore() {
     return scope && scope.core;
@@ -459,7 +460,8 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
     };
   }
 
-  function readRuntimeSnapshot() {
+  function readRuntimeSnapshot(options = {}) {
+    const includeEngineModel = options.includeEngineModel !== false;
     const attempts = [];
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       const runtime = requireRuntime();
@@ -475,17 +477,22 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
           return Object.assign(block, { damage: null, enemy: null });
         });
       const map = readMapMeta(runtime, before.current_floor_id);
-      let engineModel = null;
-      try {
-        engineModel = runtime.floors && typeof runtime.floors === "object"
-          ? MotaLab.collectEngineModel(runtime, before.hero.key_slot_ids) : null;
-      } catch (error) {
-        // Protocol v2 keeps engine_model optional for older or partial engine
-        // embeddings.  A collector-authored pause remains authoritative; a
-        // host getter that simply does not expose the model falls back to the
-        // legacy current-observation path.
-        if (error && error.pause_kind) throw error;
-        engineModel = null;
+      let engineModel;
+      if (includeEngineModel) {
+        try {
+          engineModel = runtime.floors && typeof runtime.floors === "object"
+            ? MotaLab.collectEngineModel(runtime, before.hero.key_slot_ids, {
+              cache: engineModelCache,
+              currentFloorId: before.current_floor_id,
+            }) : undefined;
+        } catch (error) {
+          // Protocol v2 keeps engine_model optional for older or partial engine
+          // embeddings.  A collector-authored pause remains authoritative; a
+          // host getter that simply does not expose the model falls back to the
+          // legacy current-observation path.
+          if (error && error.pause_kind) throw error;
+          engineModel = undefined;
+        }
       }
       const after = readRuntimeFence(runtime);
       const sameRuntime = after.runtime === runtime && currentCore() === runtime;
@@ -514,6 +521,14 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
       "RUNTIME_SNAPSHOT_UNSTABLE",
       { attempts },
     );
+  }
+
+  function readFastRuntimeSnapshot() {
+    return readRuntimeSnapshot({ includeEngineModel: false });
+  }
+
+  function invalidateEngineModelCache() {
+    engineModelCache.invalidated = true;
   }
 
   function capabilities() {
@@ -577,6 +592,8 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
 
   return Object.freeze({
     readRuntimeSnapshot,
+    readFastRuntimeSnapshot,
+    invalidateEngineModelCache,
     readBusy,
     capabilities,
     assertRequiredCapabilities,

@@ -459,6 +459,7 @@
 
   MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
     const scope = pageScope || (typeof unsafeWindow !== "undefined" ? unsafeWindow : globalThis);
+    const engineModelCache = { invalidated: true };
 
     function currentCore() {
       return scope && scope.core;
@@ -918,7 +919,8 @@
       };
     }
 
-    function readRuntimeSnapshot() {
+    function readRuntimeSnapshot(options = {}) {
+      const includeEngineModel = options.includeEngineModel !== false;
       const attempts = [];
       for (let attempt = 1; attempt <= 3; attempt += 1) {
         const runtime = requireRuntime();
@@ -934,17 +936,22 @@
             return Object.assign(block, { damage: null, enemy: null });
           });
         const map = readMapMeta(runtime, before.current_floor_id);
-        let engineModel = null;
-        try {
-          engineModel = runtime.floors && typeof runtime.floors === "object"
-            ? MotaLab.collectEngineModel(runtime, before.hero.key_slot_ids) : null;
-        } catch (error) {
-          // Protocol v2 keeps engine_model optional for older or partial engine
-          // embeddings.  A collector-authored pause remains authoritative; a
-          // host getter that simply does not expose the model falls back to the
-          // legacy current-observation path.
-          if (error && error.pause_kind) throw error;
-          engineModel = null;
+        let engineModel;
+        if (includeEngineModel) {
+          try {
+            engineModel = runtime.floors && typeof runtime.floors === "object"
+              ? MotaLab.collectEngineModel(runtime, before.hero.key_slot_ids, {
+                cache: engineModelCache,
+                currentFloorId: before.current_floor_id,
+              }) : undefined;
+          } catch (error) {
+            // Protocol v2 keeps engine_model optional for older or partial engine
+            // embeddings.  A collector-authored pause remains authoritative; a
+            // host getter that simply does not expose the model falls back to the
+            // legacy current-observation path.
+            if (error && error.pause_kind) throw error;
+            engineModel = undefined;
+          }
         }
         const after = readRuntimeFence(runtime);
         const sameRuntime = after.runtime === runtime && currentCore() === runtime;
@@ -973,6 +980,14 @@
         "RUNTIME_SNAPSHOT_UNSTABLE",
         { attempts },
       );
+    }
+
+    function readFastRuntimeSnapshot() {
+      return readRuntimeSnapshot({ includeEngineModel: false });
+    }
+
+    function invalidateEngineModelCache() {
+      engineModelCache.invalidated = true;
     }
 
     function capabilities() {
@@ -1036,6 +1051,8 @@
 
     return Object.freeze({
       readRuntimeSnapshot,
+      readFastRuntimeSnapshot,
+      invalidateEngineModelCache,
       readBusy,
       capabilities,
       assertRequiredCapabilities,
@@ -1178,23 +1195,40 @@
     return { value: Object.fromEntries(entries), complex: context.complex };
   };
 
-  MotaLab.collectEngineModel = function collectEngineModel(engine, keySlotIds = {}) {
-    const fail = (code, details = {}) => {
-      throw MotaLab.createPauseError("ENGINE_API_INCOMPATIBLE", code, details);
-    };
-    if (!engine || typeof engine !== "object" || !engine.floors
-      || typeof engine.floors !== "object" || typeof engine.getMapBlocksObj !== "function") {
-      fail("ENGINE_MODEL_SOURCE_MISSING");
+  MotaLab.collectEngineFloor = function collectEngineFloor(
+    engine, floorId, definition, dynamic, fail,
+  ) {
+    const source = Array.isArray(dynamic.map) ? dynamic.map : definition.map;
+    if (!Array.isArray(source) || source.some((row) => !Array.isArray(row))) {
+      fail("ENGINE_MODEL_MAP_MISSING", { floor_id: floorId });
     }
-    const detach = (value) => JSON.parse(JSON.stringify(MotaLab.engineJsonLiteral(value).value));
-    const floorDefinitions = detach(engine.floors);
-    const statusMaps = engine.status && engine.status.maps && typeof engine.status.maps === "object"
-      ? detach(engine.status.maps) : {};
-    const floorIds = [...new Set([...Object.keys(floorDefinitions), ...Object.keys(statusMaps)])].sort();
-    if (!floorIds.length || floorIds.length > MotaLab.MAX_ENGINE_FLOORS) {
-      fail("ENGINE_MODEL_FLOOR_LIMIT_EXCEEDED", { count: floorIds.length });
+    const inferredWidth = source.reduce((maximum, row) => Math.max(maximum, row.length), 0);
+    const width = MotaLab.isFiniteInteger(dynamic.width) ? dynamic.width
+      : MotaLab.isFiniteInteger(definition.width) ? definition.width : inferredWidth;
+    const height = MotaLab.isFiniteInteger(dynamic.height) ? dynamic.height
+      : MotaLab.isFiniteInteger(definition.height) ? definition.height : source.length;
+    if (width < 1 || height < 1 || width > MotaLab.MAX_MAP_AXIS
+      || height > MotaLab.MAX_MAP_AXIS || width * height > MotaLab.MAX_MAP_CELLS
+      || source.length > height || source.some((row) => row.length > width)) {
+      fail("ENGINE_MODEL_DIMENSIONS_EXCEEDED", { floor_id: floorId, width, height });
     }
-    const normalizeBlock = (raw) => {
+    const validCells = [];
+    const map = Array.from({ length: height }, (_, y) => Array.from({ length: width }, (_, x) => {
+      if (!source[y] || !Object.prototype.hasOwnProperty.call(source[y], x)) return null;
+      validCells.push({ x, y });
+      const value = source[y][x];
+      if (value !== null && (!MotaLab.isFiniteInteger(value) || value < 0)) {
+        fail("ENGINE_MODEL_MAP_CELL_INVALID", { floor_id: floorId, x, y });
+      }
+      return value;
+    }));
+    const rawBlocks = engine.getMapBlocksObj(floorId, true);
+    const blockValues = Array.isArray(rawBlocks) ? rawBlocks
+      : rawBlocks && typeof rawBlocks === "object" ? Object.values(rawBlocks) : [];
+    if (blockValues.length > MotaLab.MAX_BLOCKS) {
+      fail("ENGINE_MODEL_BLOCK_LIMIT_EXCEEDED", { floor_id: floorId });
+    }
+    const blocks = blockValues.map((raw) => {
       const event = raw && raw.event && typeof raw.event === "object" ? raw.event : {};
       if (!raw || raw.disable === true || event.disable === true) return null;
       const numericId = raw.numeric_id !== undefined ? raw.numeric_id
@@ -1213,77 +1247,91 @@
           : raw.noPass !== undefined ? raw.noPass : raw.no_pass),
         disabled: false,
       };
-    };
-    function collectFloor(floorId) {
-      const definition = floorDefinitions[floorId] || {};
-      const dynamic = statusMaps[floorId] || {};
-      const source = Array.isArray(dynamic.map) ? dynamic.map : definition.map;
-      if (!Array.isArray(source) || source.some((row) => !Array.isArray(row))) {
-        fail("ENGINE_MODEL_MAP_MISSING", { floor_id: floorId });
+    }).filter(Boolean).sort((left, right) => left.y - right.y || left.x - right.x);
+    const changeSource = definition.changeFloor || dynamic.changeFloor || {};
+    const change_floor = Object.entries(changeSource).map(([coordinate, rawValue]) => {
+      const match = coordinate.match(/^(\d+)\s*,\s*(\d+)$/u);
+      const body = typeof rawValue === "string" ? { floorId: rawValue } : rawValue || {};
+      const x = match ? Number(match[1]) : body.x;
+      const y = match ? Number(match[2]) : body.y;
+      if (!MotaLab.isFiniteInteger(x) || !MotaLab.isFiniteInteger(y)) {
+        fail("ENGINE_MODEL_CHANGE_FLOOR_INVALID", { floor_id: floorId, coordinate });
       }
-      const inferredWidth = source.reduce((maximum, row) => Math.max(maximum, row.length), 0);
-      const width = MotaLab.isFiniteInteger(dynamic.width) ? dynamic.width
-        : MotaLab.isFiniteInteger(definition.width) ? definition.width : inferredWidth;
-      const height = MotaLab.isFiniteInteger(dynamic.height) ? dynamic.height
-        : MotaLab.isFiniteInteger(definition.height) ? definition.height : source.length;
-      if (width < 1 || height < 1 || width > MotaLab.MAX_MAP_AXIS
-        || height > MotaLab.MAX_MAP_AXIS || width * height > MotaLab.MAX_MAP_CELLS
-        || source.length > height || source.some((row) => row.length > width)) {
-        fail("ENGINE_MODEL_DIMENSIONS_EXCEEDED", { floor_id: floorId, width, height });
-      }
-      const validCells = [];
-      const map = Array.from({ length: height }, (_, y) => Array.from({ length: width }, (_, x) => {
-        if (!source[y] || !Object.prototype.hasOwnProperty.call(source[y], x)) return null;
-        validCells.push({ x, y });
-        const value = source[y][x];
-        if (value !== null && (!MotaLab.isFiniteInteger(value) || value < 0)) {
-          fail("ENGINE_MODEL_MAP_CELL_INVALID", { floor_id: floorId, x, y });
-        }
-        return value;
-      }));
-      const rawBlocks = detach(engine.getMapBlocksObj(floorId, true));
-      const blockValues = Array.isArray(rawBlocks) ? rawBlocks
-        : rawBlocks && typeof rawBlocks === "object" ? Object.values(rawBlocks) : [];
-      if (blockValues.length > MotaLab.MAX_BLOCKS) {
-        fail("ENGINE_MODEL_BLOCK_LIMIT_EXCEEDED", { floor_id: floorId });
-      }
-      const blocks = blockValues.map(normalizeBlock).filter(Boolean)
-        .sort((left, right) => left.y - right.y || left.x - right.x);
-      const changeSource = definition.changeFloor || dynamic.changeFloor || {};
-      const change_floor = Object.entries(changeSource).map(([coordinate, rawValue]) => {
-        const match = coordinate.match(/^(\d+)\s*,\s*(\d+)$/u);
-        const body = typeof rawValue === "string" ? { floorId: rawValue } : rawValue || {};
-        const x = match ? Number(match[1]) : body.x;
-        const y = match ? Number(match[2]) : body.y;
-        if (!MotaLab.isFiniteInteger(x) || !MotaLab.isFiniteInteger(y)) {
-          fail("ENGINE_MODEL_CHANGE_FLOOR_INVALID", { floor_id: floorId, coordinate });
-        }
-        const rawLoc = body.loc;
-        const loc = Array.isArray(rawLoc) ? { x: rawLoc[0], y: rawLoc[1] }
-          : rawLoc && typeof rawLoc === "object" ? { x: rawLoc.x, y: rawLoc.y } : null;
-        const target = body.floorId !== undefined ? body.floorId : body.floor_id;
-        return {
-          x, y, floor_id: target == null ? null : String(target),
-          loc: loc && MotaLab.isFiniteInteger(loc.x) && MotaLab.isFiniteInteger(loc.y) ? loc : null,
-          direction: ["up", "down", "left", "right"].includes(body.direction) ? body.direction : null,
-          stair: typeof body.stair === "string" ? body.stair : null,
-          time: MotaLab.isFiniteInteger(body.time) && body.time >= 0 ? body.time : null,
-          ignore_change_floor: body.ignoreChangeFloor === true || body.ignore_change_floor === true,
-          opaque: target == null,
-        };
-      });
+      const rawLoc = body.loc;
+      const loc = Array.isArray(rawLoc) ? { x: rawLoc[0], y: rawLoc[1] }
+        : rawLoc && typeof rawLoc === "object" ? { x: rawLoc.x, y: rawLoc.y } : null;
+      const target = body.floorId !== undefined ? body.floorId : body.floor_id;
       return {
-        floor_id: floorId,
-        title: String(dynamic.title || dynamic.name || definition.title || definition.name || floorId),
-        width, height,
-        topology: validCells.length === width * height
-          ? { kind: "rectangle" } : { kind: "valid_cells", valid_cells: validCells },
-        map, blocks, change_floor,
-        ratio: Number.isFinite(dynamic.ratio) ? dynamic.ratio
-          : Number.isFinite(definition.ratio) ? definition.ratio : 1,
+        x, y, floor_id: target == null ? null : String(target),
+        loc: loc && MotaLab.isFiniteInteger(loc.x) && MotaLab.isFiniteInteger(loc.y) ? loc : null,
+        direction: ["up", "down", "left", "right"].includes(body.direction) ? body.direction : null,
+        stair: typeof body.stair === "string" ? body.stair : null,
+        time: MotaLab.isFiniteInteger(body.time) && body.time >= 0 ? body.time : null,
+        ignore_change_floor: body.ignoreChangeFloor === true || body.ignore_change_floor === true,
+        opaque: target == null,
       };
+    });
+    return {
+      floor_id: floorId,
+      title: String(dynamic.title || dynamic.name || definition.title || definition.name || floorId),
+      width,
+      height,
+      topology: validCells.length === width * height
+        ? { kind: "rectangle" } : { kind: "valid_cells", valid_cells: validCells },
+      map,
+      blocks,
+      change_floor,
+      ratio: Number.isFinite(dynamic.ratio) ? dynamic.ratio
+        : Number.isFinite(definition.ratio) ? definition.ratio : 1,
+    };
+  };
+
+  MotaLab.collectEngineInventory = function collectEngineInventory(engine, keySlotIds) {
+    const heroItems = MotaLab.engineJsonLiteral(
+      engine.status && engine.status.hero && engine.status.hero.items || {},
+    ).value;
+    function collectInventoryClass(pair) {
+      const [className, source] = pair;
+      return source && typeof source === "object" && !Array.isArray(source)
+        ? [[className, Object.fromEntries(Object.entries(source).filter(
+          ([, count]) => MotaLab.isFiniteInteger(count) && count >= 0,
+        ))]] : [];
     }
-    const floors = floorIds.map(collectFloor);
+    return {
+      classes: Object.fromEntries(Object.entries(heroItems).flatMap(collectInventoryClass)),
+      key_slots: Object.fromEntries(["yellow", "blue", "red"].map(
+        (color) => [color, typeof keySlotIds[color] === "string" ? keySlotIds[color] : null],
+      )),
+    };
+  };
+
+  MotaLab.collectEngineModel = function collectEngineModel(engine, keySlotIds = {}, options = {}) {
+    const fail = (code, details = {}) => {
+      throw MotaLab.createPauseError("ENGINE_API_INCOMPATIBLE", code, details);
+    };
+    if (!engine || typeof engine !== "object" || !engine.floors
+      || typeof engine.floors !== "object" || typeof engine.getMapBlocksObj !== "function") {
+      fail("ENGINE_MODEL_SOURCE_MISSING");
+    }
+    const cache = options && options.cache;
+    const currentFloorId = options && options.currentFloorId;
+    if (cache && currentFloorId != null
+      && MotaLab.engineModelCacheMatches(cache, engine)) {
+      return MotaLab.refreshEngineModel(
+        engine, keySlotIds, cache, String(currentFloorId),
+      );
+    }
+    const detach = (value) => JSON.parse(JSON.stringify(MotaLab.engineJsonLiteral(value).value));
+    const floorDefinitions = detach(engine.floors);
+    const statusMaps = engine.status && engine.status.maps && typeof engine.status.maps === "object"
+      ? detach(engine.status.maps) : {};
+    const floorIds = [...new Set([...Object.keys(floorDefinitions), ...Object.keys(statusMaps)])].sort();
+    if (!floorIds.length || floorIds.length > MotaLab.MAX_ENGINE_FLOORS) {
+      fail("ENGINE_MODEL_FLOOR_LIMIT_EXCEEDED", { count: floorIds.length });
+    }
+    const floors = floorIds.map((floorId) => MotaLab.collectEngineFloor(
+      engine, floorId, floorDefinitions[floorId] || {}, statusMaps[floorId] || {}, fail,
+    ));
 
     const blockSource = detach(engine.maps && engine.maps.blocksInfo || {});
     const blockPairs = Array.isArray(blockSource)
@@ -1350,23 +1398,7 @@
     const values = Object.fromEntries(Object.entries(detach(engine.values || {})).filter(
       ([, value]) => typeof value === "number" && Number.isFinite(value),
     ));
-    const heroItems = detach(engine.status && engine.status.hero && engine.status.hero.items || {});
-    function collectInventoryClass(pair) {
-      const [className, source] = pair;
-      return (
-      source && typeof source === "object" && !Array.isArray(source)
-        ? [[className, Object.fromEntries(Object.entries(source).filter(
-          ([, count]) => MotaLab.isFiniteInteger(count) && count >= 0,
-        ))]] : []
-      );
-    }
-    const classes = Object.fromEntries(Object.entries(heroItems).flatMap(collectInventoryClass));
-    const inventory = {
-      classes,
-      key_slots: Object.fromEntries(["yellow", "blue", "red"].map(
-        (color) => [color, typeof keySlotIds[color] === "string" ? keySlotIds[color] : null],
-      )),
-    };
+    const inventory = MotaLab.collectEngineInventory(engine, keySlotIds);
     const staticFloors = floors.map((floor) => ({
       floor_id: floor.floor_id, title: floor.title, width: floor.width, height: floor.height,
       topology: floor.topology, change_floor: floor.change_floor, ratio: floor.ratio,
@@ -1374,15 +1406,106 @@
     const catalog_hash = `sha256:${MotaLab.sha256(MotaLab.canonicalize({
       floors: staticFloors, blocks, items, enemies, values,
     }))}`;
+    const floorHashes = Object.fromEntries(floors.map((floor) => [
+      floor.floor_id,
+      `sha256:${MotaLab.sha256(MotaLab.canonicalize(floor))}`,
+    ]));
     const model = {
       protocol: 1, catalog_hash, model_hash: "", floors, blocks, items, enemies, values, inventory,
     };
     model.model_hash = `sha256:${MotaLab.sha256(MotaLab.canonicalize({
-      protocol: model.protocol, catalog_hash, floors, blocks, items, enemies, values, inventory,
+      protocol: model.protocol, catalog_hash, floor_hashes: floorHashes, inventory,
     }))}`;
     if (unescape(encodeURIComponent(JSON.stringify(model))).length > MotaLab.MAX_ENGINE_MODEL_BYTES) {
       fail("ENGINE_MODEL_SIZE_LIMIT_EXCEEDED");
     }
+    if (cache) MotaLab.storeEngineModelCache(cache, engine, model, floorHashes);
+    return model;
+  };
+
+  MotaLab.engineModelSourceEntries = function engineModelSourceEntries(source) {
+    if (!source || typeof source !== "object") return [];
+    return Object.keys(source).sort().map((key) => [key, source[key]]);
+  };
+
+  MotaLab.engineModelSources = function engineModelSources(engine) {
+    return {
+      runtime: engine,
+      floors: engine.floors,
+      status_maps: engine.status && engine.status.maps,
+      blocks: engine.maps && engine.maps.blocksInfo,
+      items: engine.material && engine.material.items,
+      enemies: engine.material && (engine.material.enemys || engine.material.enemies),
+      values: engine.values,
+    };
+  };
+
+  MotaLab.engineModelCacheMatches = function engineModelCacheMatches(cache, engine) {
+    if (!cache || cache.invalidated || !cache.model || !cache.sources) return false;
+    const sources = MotaLab.engineModelSources(engine);
+    if (Object.keys(sources).some((name) => cache.sources[name] !== sources[name])) return false;
+    const collections = {
+      floors: sources.floors,
+      status_maps: sources.status_maps,
+      blocks: sources.blocks,
+      items: sources.items,
+      enemies: sources.enemies,
+      values: sources.values,
+    };
+    return Object.entries(collections).every(([name, source]) => {
+      const before = cache.entries[name] || [];
+      const after = MotaLab.engineModelSourceEntries(source);
+      return before.length === after.length && before.every(
+        (pair, index) => pair[0] === after[index][0] && Object.is(pair[1], after[index][1]),
+      );
+    });
+  };
+
+  MotaLab.storeEngineModelCache = function storeEngineModelCache(cache, engine, model, floorHashes) {
+    const sources = MotaLab.engineModelSources(engine);
+    cache.invalidated = false;
+    cache.sources = sources;
+    cache.entries = Object.fromEntries(
+      Object.entries(sources)
+        .filter(([name]) => name !== "runtime")
+        .map(([name, source]) => [name, MotaLab.engineModelSourceEntries(source)]),
+    );
+    cache.model = model;
+    cache.floor_hashes = Object.assign({}, floorHashes);
+  };
+
+  MotaLab.refreshEngineModel = function refreshEngineModel(
+    engine, keySlotIds, cache, currentFloorId,
+  ) {
+    const fail = (code, details = {}) => {
+      throw MotaLab.createPauseError("ENGINE_API_INCOMPATIBLE", code, details);
+    };
+    const definition = engine.floors[currentFloorId] || {};
+    const dynamic = engine.status && engine.status.maps && engine.status.maps[currentFloorId] || {};
+    const previous = cache.model.floors.find((floor) => floor.floor_id === currentFloorId);
+    if (!previous) {
+      cache.invalidated = true;
+      return MotaLab.collectEngineModel(engine, keySlotIds, { cache, currentFloorId });
+    }
+    const floor = MotaLab.collectEngineFloor(
+      engine, currentFloorId, definition, dynamic, fail,
+    );
+    const inventory = MotaLab.collectEngineInventory(engine, keySlotIds);
+    const floorHashes = Object.assign({}, cache.floor_hashes, {
+      [currentFloorId]: `sha256:${MotaLab.sha256(MotaLab.canonicalize(floor))}`,
+    });
+    const floors = cache.model.floors.map((item) => (
+      item.floor_id === currentFloorId ? floor : item
+    ));
+    const model = Object.assign({}, cache.model, { floors, inventory });
+    model.model_hash = `sha256:${MotaLab.sha256(MotaLab.canonicalize({
+      protocol: model.protocol,
+      catalog_hash: model.catalog_hash,
+      floor_hashes: floorHashes,
+      inventory,
+    }))}`;
+    cache.model = model;
+    cache.floor_hashes = floorHashes;
     return model;
   };
   MotaLab.collectObservation = function collectObservation(adapter, now = Date.now) {
@@ -2268,6 +2391,13 @@
     return `sha256:${MotaLab.sha256(MotaLab.canonicalize(MotaLab.fingerprintProjection(observation)))}`;
   };
 
+  MotaLab.fingerprintRuntimeObservation = function fingerprintRuntimeObservation(observation) {
+    const projection = MotaLab.fingerprintProjection(observation);
+    delete projection.catalog_hash;
+    delete projection.engine_model_hash;
+    return `sha256:${MotaLab.sha256(MotaLab.canonicalize(projection))}`;
+  };
+
   // Source: games/mota-planning-lab/src/guard.js
 
   MotaLab.compareGuard = function compareGuard(observation, guard) {
@@ -2633,6 +2763,7 @@
   MotaLab.waitForStability = async function waitForStability({
     adapter,
     observe,
+    finalizeObservation = observe,
     preFingerprint,
     pollMs = 100,
     stablePolls = 2,
@@ -2647,12 +2778,25 @@
 
     while (now() - startedAt <= timeoutMs) {
       latestObservation = observe();
-      const fingerprint = MotaLab.fingerprintObservation(latestObservation);
+      const fingerprint = MotaLab.fingerprintRuntimeObservation(latestObservation);
       if (!latestObservation.busy && fingerprint !== preFingerprint) {
         consecutive = fingerprint === lastFingerprint ? consecutive + 1 : 1;
         lastFingerprint = fingerprint;
         if (consecutive >= stablePolls) {
-          return { observation: latestObservation, fingerprint, polls: consecutive };
+          const finalObservation = finalizeObservation === observe
+            ? latestObservation : finalizeObservation();
+          const finalRuntimeFingerprint = MotaLab.fingerprintRuntimeObservation(finalObservation);
+          if (!finalObservation.busy && finalRuntimeFingerprint === fingerprint) {
+            return {
+              observation: finalObservation,
+              fingerprint: MotaLab.fingerprintObservation(finalObservation),
+              runtime_fingerprint: finalRuntimeFingerprint,
+              polls: consecutive,
+            };
+          }
+          latestObservation = finalObservation;
+          consecutive = 0;
+          lastFingerprint = finalRuntimeFingerprint;
         }
       } else {
         consecutive = 0;
@@ -2822,6 +2966,7 @@
     registry,
     adapter,
     observe,
+    observeFast = observe,
     stabilityOptions = {},
   }) {
     // The observation used to request the decision is evidence, not a lease on
@@ -2829,7 +2974,7 @@
     // before the first engine API call and require it to be byte-equivalent under
     // the protocol fingerprint.  This closes the journal-persistence window
     // between the controller guard check and actual execution.
-    const executionObservation = observe();
+    const executionObservation = observeFast();
     const guardResult = MotaLab.compareGuard(executionObservation, action.guard);
     if (!guardResult.ok) {
       throw MotaLab.createPauseError(
@@ -2838,8 +2983,8 @@
         { differences: guardResult.differences, observation: executionObservation },
       );
     }
-    const expectedFingerprint = MotaLab.fingerprintObservation(initialObservation);
-    const executionFingerprint = MotaLab.fingerprintObservation(executionObservation);
+    const expectedFingerprint = MotaLab.fingerprintRuntimeObservation(initialObservation);
+    const executionFingerprint = MotaLab.fingerprintRuntimeObservation(executionObservation);
     if (executionFingerprint !== expectedFingerprint) {
       throw MotaLab.createPauseError(
         "GUARD_MISMATCH",
@@ -2874,7 +3019,8 @@
 
       const settled = await MotaLab.waitForStability(Object.assign({
         adapter,
-        observe,
+        observe: observeFast,
+        finalizeObservation: observe,
         preFingerprint: beforeFingerprint,
       }, stabilityOptions));
       const afterStep = settled.observation;
@@ -2902,7 +3048,7 @@
       }
       if (index < plan.length - 1) {
         beforeStep = afterStep;
-        beforeFingerprint = settled.fingerprint;
+        beforeFingerprint = settled.runtime_fingerprint;
         continue;
       }
       return {
@@ -3850,11 +3996,17 @@
   MotaLab.createController = function createController(dependencies, options = {}) {
     const { adapter, journal, registry, client, panel } = dependencies;
     const observeRaw = dependencies.observe || (() => MotaLab.collectObservation(adapter));
-    const observe = () => {
-      const observation = observeRaw();
+    const observeFastRaw = dependencies.observeFast || (dependencies.observe
+      ? observeRaw
+      : () => MotaLab.collectObservation({
+        readRuntimeSnapshot: () => adapter.readFastRuntimeSnapshot(),
+      }));
+    const attachSession = (observation) => {
       observation.session_id = journal.snapshot().session_id || "UNCONFIRMED";
       return observation;
     };
+    const observe = () => attachSession(observeRaw());
+    const observeFast = () => attachSession(observeFastRaw());
     const logger = dependencies.logger || console;
     const autoSchedule = options.autoSchedule === true;
     const cycleDelayMs = MotaLab.isFiniteInteger(options.cycleDelayMs) ? options.cycleDelayMs : 300;
@@ -4384,8 +4536,12 @@
       }
 
       state = "GUARD_CHECK";
-      const freshObservation = capture();
-      const freshFingerprint = MotaLab.fingerprintObservation(freshObservation);
+      // The decision observation is the complete runtime snapshot.  Execution
+      // performs a fresh lightweight guard read immediately before the engine
+      // API call, so rebuilding the complete cross-floor model here is both
+      // redundant and a visible main-thread stall.
+      const freshObservation = observation;
+      const freshFingerprint = fingerprint;
       const guard = MotaLab.compareGuard(freshObservation, response.guard);
       if (!guard.ok) {
         return pause(
@@ -4467,6 +4623,7 @@
           registry,
           adapter,
           observe,
+          observeFast,
           stabilityOptions: options.stabilityOptions || {},
         });
       } catch (error) {

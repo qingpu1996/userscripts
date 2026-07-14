@@ -4,11 +4,14 @@ import copy
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from mota_lab.api import create_app
-from mota_lab.engine_model import UnsupportedItemEffect, interpret_item_effect
+from mota_lab.api import CycleCoordinator, create_app
+from mota_lab.engine_model import (
+    UnsupportedItemEffect, derive_engine_authority, interpret_item_effect,
+)
 from mota_lab.models import Observation
 from mota_test_support import make_block, make_observation, make_request, make_settings
 
@@ -79,6 +82,23 @@ class ItemEffectTests(unittest.TestCase):
 
 
 class FunctionalCycleTests(unittest.TestCase):
+    def test_engine_authority_cache_reuses_model_hash_and_invalidates_on_change(self) -> None:
+        observation = Observation.model_validate(mt2_observation([]))
+        changed_payload = mt2_observation([])
+        changed_payload["engine_model"]["model_hash"] = "sha256:" + "c" * 64
+        changed = Observation.model_validate(changed_payload)
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator = CycleCoordinator(make_settings(Path(directory)))
+            with patch(
+                "mota_lab.api.derive_engine_authority", wraps=derive_engine_authority
+            ) as derive:
+                first = coordinator._derive_engine_authority(observation)
+                second = coordinator._derive_engine_authority(observation)
+                third = coordinator._derive_engine_authority(changed)
+        self.assertIs(first, second)
+        self.assertIsNot(first, third)
+        self.assertEqual(derive.call_count, 2)
+
     def test_empty_knowledge_mt2_uses_engine_model_and_returns_safe_decision(self) -> None:
         yellow_key = make_block(
             x=2, y=2, block_id="yellowKey", cls="items", trigger="getItem",

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -170,6 +171,30 @@ class CycleCoordinator:
         self.logger = DecisionLogger(settings.log_path)
         self.evidence = EvidenceWriter(settings.state_dir)
         self.planner = Planner()
+        self._engine_authority_cache: OrderedDict[tuple, Any] = OrderedDict()
+
+    def _derive_engine_authority(self, observation):
+        """Reuse pure engine-label derivation while its complete inputs match."""
+
+        model = observation.engine_model
+        if model is None:
+            return derive_engine_authority(observation)
+        hero = observation.hero
+        key = (
+            model.model_hash,
+            observation.floor_id,
+            hero.hp, hero.attack, hero.defense, hero.gold, hero.experience,
+        )
+        cached = self._engine_authority_cache.get(key)
+        if cached is not None:
+            self._engine_authority_cache.move_to_end(key)
+            return cached
+        authority = derive_engine_authority(observation)
+        self._engine_authority_cache[key] = authority
+        self._engine_authority_cache.move_to_end(key)
+        while len(self._engine_authority_cache) > 16:
+            self._engine_authority_cache.popitem(last=False)
+        return authority
 
     @staticmethod
     def _decision_key(
@@ -492,7 +517,7 @@ class CycleCoordinator:
             self._log_response(request, recovery.action.response, "unresolved_action_replayed")
             return recovery.action.response
 
-        authority = derive_engine_authority(observation)
+        authority = self._derive_engine_authority(observation)
         persisted_knowledge_fp = self.knowledge.fingerprint()
         knowledge_fp = "sha256:" + hashlib.sha256(canonical_json({
             "persisted": persisted_knowledge_fp,

@@ -61,6 +61,33 @@ test("纯空走廊经 canMoveDirectly 证明后使用 moveDirectly", async () =>
   assert.equal(result.observation.hero.loc.x, 10);
 });
 
+test("执行轮询只用 fast snapshot，稳定后只采集一次完整结果", async () => {
+  const before = makeObservation();
+  let current = before;
+  let fastReads = 0;
+  let fullReads = 0;
+  const adapter = makeAdapter((x, y) => {
+    current = makeObservation({ hero: { loc: { x, y } } });
+  });
+  const action = makeAction(before, [{ type: "grid", x: 10, y: 3 }], {
+    position: { x: 10, y: 3 },
+  });
+  const result = await lab.executeAction({
+    action,
+    initialObservation: before,
+    registry: lab.createBlockRegistry(),
+    adapter,
+    observeFast: () => { fastReads += 1; return current; },
+    observe: () => { fullReads += 1; return current; },
+    stabilityOptions: Object.assign({}, fastStability, {
+      now: (() => { let tick = 0; return () => tick++; })(),
+    }),
+  });
+  assert.equal(fastReads, 3);
+  assert.equal(fullReads, 1);
+  assert.equal(result.observation.hero.loc.x, 10);
+});
+
 test("多段纯走廊逐段稳定后执行且不逐格调用", async () => {
   const before = makeObservation();
   let current = before;

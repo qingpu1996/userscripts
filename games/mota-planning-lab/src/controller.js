@@ -1,11 +1,17 @@
 MotaLab.createController = function createController(dependencies, options = {}) {
   const { adapter, journal, registry, client, panel } = dependencies;
   const observeRaw = dependencies.observe || (() => MotaLab.collectObservation(adapter));
-  const observe = () => {
-    const observation = observeRaw();
+  const observeFastRaw = dependencies.observeFast || (dependencies.observe
+    ? observeRaw
+    : () => MotaLab.collectObservation({
+      readRuntimeSnapshot: () => adapter.readFastRuntimeSnapshot(),
+    }));
+  const attachSession = (observation) => {
     observation.session_id = journal.snapshot().session_id || "UNCONFIRMED";
     return observation;
   };
+  const observe = () => attachSession(observeRaw());
+  const observeFast = () => attachSession(observeFastRaw());
   const logger = dependencies.logger || console;
   const autoSchedule = options.autoSchedule === true;
   const cycleDelayMs = MotaLab.isFiniteInteger(options.cycleDelayMs) ? options.cycleDelayMs : 300;
@@ -535,8 +541,12 @@ MotaLab.createController = function createController(dependencies, options = {})
     }
 
     state = "GUARD_CHECK";
-    const freshObservation = capture();
-    const freshFingerprint = MotaLab.fingerprintObservation(freshObservation);
+    // The decision observation is the complete runtime snapshot.  Execution
+    // performs a fresh lightweight guard read immediately before the engine
+    // API call, so rebuilding the complete cross-floor model here is both
+    // redundant and a visible main-thread stall.
+    const freshObservation = observation;
+    const freshFingerprint = fingerprint;
     const guard = MotaLab.compareGuard(freshObservation, response.guard);
     if (!guard.ok) {
       return pause(
@@ -618,6 +628,7 @@ MotaLab.createController = function createController(dependencies, options = {})
         registry,
         adapter,
         observe,
+        observeFast,
         stabilityOptions: options.stabilityOptions || {},
       });
     } catch (error) {

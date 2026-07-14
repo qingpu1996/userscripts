@@ -131,3 +131,10 @@ MotaLab.fingerprintProjection = function fingerprintProjection(observation) {
 MotaLab.fingerprintObservation = function fingerprintObservation(observation) {
   return `sha256:${MotaLab.sha256(MotaLab.canonicalize(MotaLab.fingerprintProjection(observation)))}`;
 };
+
+MotaLab.fingerprintRuntimeObservation = function fingerprintRuntimeObservation(observation) {
+  const projection = MotaLab.fingerprintProjection(observation);
+  delete projection.catalog_hash;
+  delete projection.engine_model_hash;
+  return `sha256:${MotaLab.sha256(MotaLab.canonicalize(projection))}`;
+};

@@ -1,6 +1,7 @@
 MotaLab.waitForStability = async function waitForStability({
   adapter,
   observe,
+  finalizeObservation = observe,
   preFingerprint,
   pollMs = 100,
   stablePolls = 2,
@@ -15,12 +16,25 @@ MotaLab.waitForStability = async function waitForStability({
 
   while (now() - startedAt <= timeoutMs) {
     latestObservation = observe();
-    const fingerprint = MotaLab.fingerprintObservation(latestObservation);
+    const fingerprint = MotaLab.fingerprintRuntimeObservation(latestObservation);
     if (!latestObservation.busy && fingerprint !== preFingerprint) {
       consecutive = fingerprint === lastFingerprint ? consecutive + 1 : 1;
       lastFingerprint = fingerprint;
       if (consecutive >= stablePolls) {
-        return { observation: latestObservation, fingerprint, polls: consecutive };
+        const finalObservation = finalizeObservation === observe
+          ? latestObservation : finalizeObservation();
+        const finalRuntimeFingerprint = MotaLab.fingerprintRuntimeObservation(finalObservation);
+        if (!finalObservation.busy && finalRuntimeFingerprint === fingerprint) {
+          return {
+            observation: finalObservation,
+            fingerprint: MotaLab.fingerprintObservation(finalObservation),
+            runtime_fingerprint: finalRuntimeFingerprint,
+            polls: consecutive,
+          };
+        }
+        latestObservation = finalObservation;
+        consecutive = 0;
+        lastFingerprint = finalRuntimeFingerprint;
       }
     } else {
       consecutive = 0;

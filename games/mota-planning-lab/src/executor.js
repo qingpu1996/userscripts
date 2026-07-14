@@ -142,6 +142,7 @@ MotaLab.executeAction = async function executeAction({
   registry,
   adapter,
   observe,
+  observeFast = observe,
   stabilityOptions = {},
 }) {
   // The observation used to request the decision is evidence, not a lease on
@@ -149,7 +150,7 @@ MotaLab.executeAction = async function executeAction({
   // before the first engine API call and require it to be byte-equivalent under
   // the protocol fingerprint.  This closes the journal-persistence window
   // between the controller guard check and actual execution.
-  const executionObservation = observe();
+  const executionObservation = observeFast();
   const guardResult = MotaLab.compareGuard(executionObservation, action.guard);
   if (!guardResult.ok) {
     throw MotaLab.createPauseError(
@@ -158,8 +159,8 @@ MotaLab.executeAction = async function executeAction({
       { differences: guardResult.differences, observation: executionObservation },
     );
   }
-  const expectedFingerprint = MotaLab.fingerprintObservation(initialObservation);
-  const executionFingerprint = MotaLab.fingerprintObservation(executionObservation);
+  const expectedFingerprint = MotaLab.fingerprintRuntimeObservation(initialObservation);
+  const executionFingerprint = MotaLab.fingerprintRuntimeObservation(executionObservation);
   if (executionFingerprint !== expectedFingerprint) {
     throw MotaLab.createPauseError(
       "GUARD_MISMATCH",
@@ -194,7 +195,8 @@ MotaLab.executeAction = async function executeAction({
 
     const settled = await MotaLab.waitForStability(Object.assign({
       adapter,
-      observe,
+      observe: observeFast,
+      finalizeObservation: observe,
       preFingerprint: beforeFingerprint,
     }, stabilityOptions));
     const afterStep = settled.observation;
@@ -222,7 +224,7 @@ MotaLab.executeAction = async function executeAction({
     }
     if (index < plan.length - 1) {
       beforeStep = afterStep;
-      beforeFingerprint = settled.fingerprint;
+      beforeFingerprint = settled.runtime_fingerprint;
       continue;
     }
     return {
