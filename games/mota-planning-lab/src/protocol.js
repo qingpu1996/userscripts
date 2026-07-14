@@ -1,5 +1,5 @@
 MotaLab.cloneObservationForWire = function cloneObservationForWire(observation) {
-  return {
+  const wire = {
     protocol: observation.protocol,
     page: observation.page,
     session_id: observation.session_id,
@@ -57,6 +57,10 @@ MotaLab.cloneObservationForWire = function cloneObservationForWire(observation) 
     })),
     captured_at: observation.captured_at,
   };
+  if (observation.engine_model !== undefined) {
+    wire.engine_model = MotaLab.cloneJsonValue(observation.engine_model);
+  }
+  return wire;
 };
 
 MotaLab.createCycleRequest = function createCycleRequest({

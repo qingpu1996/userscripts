@@ -4,7 +4,7 @@
 
 ## Observation
 
-每次仅包含当前动态地图：
+每次包含当前执行现场，并可携带游戏自身完整定义的规范化 `engine_model`：
 
 ```json
 {
@@ -27,9 +27,20 @@
   "keys": {"yellow": 0, "blue": 0, "red": 0},
   "busy": false,
   "blocks": [],
+  "engine_model": {
+    "protocol": 1,
+    "catalog_hash": "sha256:...",
+    "model_hash": "sha256:...",
+    "floors": [], "blocks": [], "items": [], "enemies": [], "values": {},
+    "inventory": {"classes": {}, "key_slots": {}}
+  },
   "captured_at": 0
 }
 ```
+
+`engine_model` 可省略以兼容旧客户端，但不能显式为 null。浏览器从 `core.floors`、全部 `core.status.maps`、`getMapBlocksObj(floorId,true)`、`core.maps.blocksInfo`、`core.material` 和 `core.values` 读取后，只发送 schema 中列出的 JSON 标量，不发送函数、DOM、循环引用或原型对象。动态 floors/blocks/inventory 每轮重读；`catalog_hash` 只绑定静态目录，`model_hash` 绑定本轮完整投影。observation fingerprint 只纳入两个 hash，不把静态大对象重复并入恢复指纹。
+
+服务收到模型后立即以其覆盖同 identity 的历史人工标签，并自动承认模型中存在且尺寸匹配的 floor。`trigger=openDoor` 从 `door_info.keys` 得到成本，普通 `tools/constants` 物品按 inventory 增量处理，`cls=items` 的简单算术 `itemEffect` 由受限解释器计算面板、钥匙或 inventory 差分；解释器不执行 JS 字符串。选择、脚本事件和其他复杂效果保持 opaque。
 
 浏览器必须在一次同步采集内生成整份 observation。读取当前 map、blocks 和可见怪物前后，至少核对 floorId、hero 完整面板/位置/keys 与 moving/lock/event 围栏；前后不一致则丢弃并同步重试，持续不稳定以 `RUNTIME_SNAPSHOT_UNSTABLE` 暂停。服务不能逐字段回调页面 JS，也不能用上一轮 observation 回填本轮缺失字段。
 
@@ -67,7 +78,7 @@ guard 必须包含：`session_id`、`map_instance_id`、`dimensions`、`topology
 
 决策请求 observation、controller guard capture 与行动 API 前 capture 是三个 fresh current-runtime 检查点。pending 先持久化；真正调用引擎 API 前仍须再次读取，fingerprint 或 guard 已变化则零执行。行动后的 observation 同样来自 fresh capture，并要求相同 fingerprint 稳定两轮。
 
-operations 最多两段，末段最多一个状态变化边界。所有坐标必须位于 guard dimensions；浏览器还用当前 topology 复核。边界必须有可验证的非位置 postcondition；门、资源、怪物必须声明目标 block 移除。
+operations 最多两段，末段最多一个状态变化边界。所有坐标必须位于 guard dimensions；浏览器还用当前 topology 复核。边界必须有可验证的非位置 postcondition；门、资源、怪物必须声明目标 block 移除。非面板物品用 `expected_delta.inventory[itemId]` 声明增量，并由行动前后 `engine_model.inventory` 校验。
 
 换图以 `expected_delta.map_instance_id` 为主：省略表示不要求换图；字符串表示必须进入该精确实例；显式 `null` 表示目标尚未知但实例必须变化。旧式 `floor_id: null` 仅在已登记楼梯/传送边界中兼容，并同样要求实例变化。同一 `floor_id` 下 A→B 与不同 `floor_id` 下 A→C 走相同结算逻辑。跨实例时不比较两张无关地图的 block 差分，也禁止同时声明 `removed_blocks`/`added_blocks`。
 

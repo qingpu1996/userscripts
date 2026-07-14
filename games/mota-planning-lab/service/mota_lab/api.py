@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from .deltas import validate_expected_delta
+from .engine_model import derive_engine_authority, registry_entries as engine_registry_entries
 from .guards import compare_guard
 from .knowledge import KnowledgeError, KnowledgeRegistry
 from .logging import DecisionLogger, EvidenceWriter
@@ -38,7 +39,7 @@ from .state import canonical_json, observation_fingerprint
 from .storage import LedgerError, Store
 
 
-DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024
+DEFAULT_MAX_BODY_BYTES = 8 * 1024 * 1024
 LOGGER = logging.getLogger(__name__)
 
 
@@ -491,7 +492,12 @@ class CycleCoordinator:
             self._log_response(request, recovery.action.response, "unresolved_action_replayed")
             return recovery.action.response
 
-        knowledge_fp = self.knowledge.fingerprint()
+        authority = derive_engine_authority(observation)
+        persisted_knowledge_fp = self.knowledge.fingerprint()
+        knowledge_fp = "sha256:" + hashlib.sha256(canonical_json({
+            "persisted": persisted_knowledge_fp,
+            "engine_catalog": authority.catalog_hash,
+        }).encode("utf-8")).hexdigest()
         supersedes_action_id = None
         mode = "normal"
         decision_key = self._decision_key(
@@ -541,8 +547,9 @@ class CycleCoordinator:
                 self._log_response(request, issued.response, "decision_replayed")
                 return issued.response
 
-        entries = self.knowledge.registry_entries(observation)
         labels = self.knowledge.labels()
+        labels.update(authority.labels)
+        entries = engine_registry_entries(observation, labels)
         frontier_coordinates = {
             (block.x, block.y)
             for block in observation.blocks
@@ -550,7 +557,7 @@ class CycleCoordinator:
             or label.boundary
         }
         self.store.sync_frontiers(observation, observation_fp, frontier_coordinates)
-        if not self.knowledge.is_known_floor(observation.floor_id):
+        if not authority.floor_known and not self.knowledge.is_known_floor(observation.floor_id):
             pause = self._pause(
                 request,
                 kind=PauseKind.UNKNOWN_FLOOR,
@@ -560,7 +567,10 @@ class CycleCoordinator:
             )
             planned: DecisionResponse = pause
         else:
-            unknown = self.knowledge.unknown_blocks(observation)
+            unknown = [
+                block for block in observation.blocks
+                if (block.id, block.cls, block.trigger) not in labels
+            ]
             if unknown:
                 unknown_details = [
                     {

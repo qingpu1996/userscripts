@@ -94,7 +94,12 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
       }
       values[color] = candidates[0];
     }
-    return { path, values };
+    const slotIds = {};
+    for (const [color, names] of Object.entries(aliases)) {
+      const actual = names.find((name) => Object.prototype.hasOwnProperty.call(container, name));
+      slotIds[color] = actual || names[0];
+    }
+    return { path, values, slot_ids: slotIds };
   }
 
   function readKeys(hero) {
@@ -132,7 +137,7 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
         { layouts: candidates.map((candidate) => candidate.path) },
       );
     }
-    return selected.values;
+    return { values: selected.values, slot_ids: selected.slot_ids };
   }
 
   function readHero(runtime) {
@@ -161,10 +166,11 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
         direction: typeof loc.direction === "string" ? loc.direction : null,
       },
       keys: {
-        yellow: keys.yellow,
-        blue: keys.blue,
-        red: keys.red,
+        yellow: keys.values.yellow,
+        blue: keys.values.blue,
+        red: keys.values.red,
       },
+      key_slot_ids: keys.slot_ids,
     };
   }
 
@@ -469,6 +475,18 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
           return Object.assign(block, { damage: null, enemy: null });
         });
       const map = readMapMeta(runtime, before.current_floor_id);
+      let engineModel = null;
+      try {
+        engineModel = runtime.floors && typeof runtime.floors === "object"
+          ? MotaLab.collectEngineModel(runtime, before.hero.key_slot_ids) : null;
+      } catch (error) {
+        // Protocol v2 keeps engine_model optional for older or partial engine
+        // embeddings.  A collector-authored pause remains authoritative; a
+        // host getter that simply does not expose the model falls back to the
+        // legacy current-observation path.
+        if (error && error.pause_kind) throw error;
+        engineModel = null;
+      }
       const after = readRuntimeFence(runtime);
       const sameRuntime = after.runtime === runtime && currentCore() === runtime;
       const beforeProjection = fenceProjection(before);
@@ -481,6 +499,7 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
           hero: before.hero,
           blocks,
           busy: before.busy,
+          engine_model: engineModel,
         };
       }
       attempts.push({

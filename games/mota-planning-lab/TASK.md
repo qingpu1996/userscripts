@@ -120,6 +120,8 @@
 
 ## 当前运行态唯一权威重构
 
+- [x] **F301 完整引擎模型纵向消费**：浏览器每轮采集全部 floors/status maps、blocksInfo、items/enemies/values/inventory；服务以本轮模型临时派生 floor/block/resource 标签，空 knowledge 的新楼层和基础门/钥匙/宝石不再触发人工建模暂停。简单 `itemEffect` 使用受限算术解释器，复杂脚本保持 opaque，执行仍走 guard、原子行动与真实差分校验。
+
 - [x] **F254 live observation 一致采集**：当前 map/blocks/怪物采集前后核对 floor、完整 hero/keys 与 moving/lock/event 围栏；瞬时变化重试，持续变化 `RUNTIME_SNAPSHOT_UNSTABLE` fail closed。
 - [x] **F255 钥匙布局显式兼容**：支持 `hero.items.tools`、`hero.items.keys`、`hero.keys`；初始真实 tools fixture 为 `1/1/1`，未知容器、显式非法值、别名冲突和多布局冲突禁止默认为零；canonical tools 的零计数字段省略语义由 F268-F270 完整定义。
 - [x] **F256 三处 fresh runtime 门禁**：cycle 起点、guard/plan 前和 pending durable 后行动 API 前均重采；行动后继续要求改变且稳定两轮的完整 observation，再做 expected delta。

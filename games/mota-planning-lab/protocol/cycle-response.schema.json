@@ -130,6 +130,12 @@
             "red": {"type": "integer"}
           }
         },
+        "inventory": {
+          "type": "object",
+          "maxProperties": 4096,
+          "propertyNames": {"type": "string", "minLength": 1, "maxLength": 256},
+          "additionalProperties": {"type": "integer"}
+        },
         "position": {"$ref": "#/$defs/position"},
         "floor_id": {
           "anyOf": [

@@ -4,7 +4,7 @@ MotaLab.validateExpectedDelta = function validateExpectedDelta(expected, options
   }
   const allowed = new Set([
     "hp", "attack", "defense", "gold", "experience", "keys",
-    "position", "floor_id", "map_instance_id", "removed_blocks", "added_blocks",
+    "inventory", "position", "floor_id", "map_instance_id", "removed_blocks", "added_blocks",
   ]);
   for (const key of Object.keys(expected)) {
     if (!allowed.has(key)) throw new TypeError(`Unsupported expected_delta field: ${key}`);
@@ -22,6 +22,17 @@ MotaLab.validateExpectedDelta = function validateExpectedDelta(expected, options
     for (const color of ["yellow", "blue", "red"]) {
       if (expected.keys[color] !== undefined && !MotaLab.isFiniteInteger(expected.keys[color])) {
         throw new TypeError(`Invalid key delta: ${color}`);
+      }
+    }
+  }
+  if (expected.inventory !== undefined) {
+    if (!MotaLab.isProtocolObject(expected.inventory)
+      || Object.keys(expected.inventory).length > MotaLab.MAX_ENGINE_CATALOG_ENTRIES) {
+      throw new TypeError("Invalid inventory deltas");
+    }
+    for (const [itemId, delta] of Object.entries(expected.inventory)) {
+      if (itemId.length < 1 || itemId.length > 256 || !MotaLab.isFiniteInteger(delta)) {
+        throw new TypeError(`Invalid inventory delta: ${itemId}`);
       }
     }
   }
@@ -126,6 +137,27 @@ MotaLab.compareExpectedDelta = function compareExpectedDelta(before, after, expe
     const delta = expected.keys && expected.keys[color] !== undefined ? expected.keys[color] : 0;
     compare(`keys.${color}`, before.keys[color] + delta, after.keys[color]);
   }
+  if (expected.inventory) {
+    const flatten = (observation) => {
+      const result = {};
+      const classes = observation.engine_model && observation.engine_model.inventory
+        && observation.engine_model.inventory.classes;
+      if (!classes || typeof classes !== "object") return result;
+      for (const items of Object.values(classes)) {
+        if (!items || typeof items !== "object") continue;
+        for (const [itemId, count] of Object.entries(items)) {
+          if (MotaLab.isFiniteInteger(count)) result[itemId] = (result[itemId] || 0) + count;
+        }
+      }
+      return result;
+    };
+    const beforeInventory = flatten(before);
+    const afterInventory = flatten(after);
+    for (const [itemId, delta] of Object.entries(expected.inventory)) {
+      compare(`inventory.${itemId}`, (beforeInventory[itemId] || 0) + delta,
+        afterInventory[itemId] || 0);
+    }
+  }
 
   const mapInstanceChanged = before.map_instance_id !== after.map_instance_id;
   if (expected.map_instance_id === null && options.allowUnknownMapInstance === true) {
@@ -208,6 +240,12 @@ MotaLab.hasVerifiableNonPositionPostcondition = function hasVerifiableNonPositio
     for (const color of ["yellow", "blue", "red"]) {
       if (MotaLab.isFiniteInteger(expected.keys[color]) && expected.keys[color] !== 0) return true;
     }
+  }
+  if (expected.inventory && typeof expected.inventory === "object"
+    && !Array.isArray(expected.inventory)) {
+    if (Object.values(expected.inventory).some(
+      (value) => MotaLab.isFiniteInteger(value) && value !== 0,
+    )) return true;
   }
   if (Object.prototype.hasOwnProperty.call(expected, "floor_id")) return true;
   if (Object.prototype.hasOwnProperty.call(expected, "map_instance_id")) return true;

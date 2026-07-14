@@ -1,9 +1,4 @@
-"""Strict protocol and knowledge models.
-
-The request models deliberately enumerate every accepted observation field.  They
-must never grow a catch-all field: rejecting unexpected data is part of the
-blind-play boundary, not merely input hygiene.
-"""
+"""Strict protocol, engine-authority, and persisted knowledge models."""
 
 from __future__ import annotations
 
@@ -28,6 +23,7 @@ Coordinate = conint(strict=True, ge=0, le=255)
 NonEmptyString = constr(strict=True, min_length=1, max_length=256)
 ActionId = constr(strict=True, pattern=r"^AUTO-[A-F0-9]{16}$")
 Fingerprint = constr(strict=True, pattern=r"^sha256:[a-f0-9]{64}$")
+CatalogId = constr(strict=True, min_length=1, max_length=256)
 
 
 class StrictModel(BaseModel):
@@ -132,6 +128,139 @@ class Topology(StrictModel):
         return self
 
 
+class EngineDoorInfo(StrictModel):
+    keys: Dict[CatalogId, conint(strict=True, ge=1, le=9999)] = Field(
+        default_factory=dict, max_length=32
+    )
+
+
+class EngineBlockDefinition(StrictModel):
+    numeric_id: NonNegativeInt
+    id: CatalogId
+    cls: CatalogId
+    trigger: Optional[constr(strict=True, max_length=128)]
+    no_pass: StrictBool
+    door_info: Optional[EngineDoorInfo] = None
+
+
+class EngineItemDefinition(StrictModel):
+    id: CatalogId
+    cls: CatalogId
+    name: Optional[constr(strict=True, max_length=256)] = None
+    text: Optional[constr(strict=True, max_length=4096)] = None
+    item_effect: Optional[constr(strict=True, max_length=16384)] = None
+    item_effect_tip: Optional[constr(strict=True, max_length=4096)] = None
+    use_item_event: Optional[Union[StrictBool, StrictStr, List[Any], Dict[str, Any]]] = None
+    complex: StrictBool = False
+
+
+class EngineEnemyDefinition(StrictModel):
+    id: CatalogId
+    hp: NonNegativeInt
+    attack: Optional[NonNegativeInt]
+    defense: Optional[NonNegativeInt]
+    gold: NonNegativeInt
+    experience: NonNegativeInt
+    special: List[Union[StrictInt, StrictStr]] = Field(default_factory=list, max_length=64)
+
+
+class EngineMapBlock(StrictModel):
+    x: Coordinate
+    y: Coordinate
+    numeric_id: NonNegativeInt
+    id: CatalogId
+    cls: CatalogId
+    trigger: Optional[constr(strict=True, max_length=128)]
+    no_pass: StrictBool
+    disabled: StrictBool = False
+
+
+class EngineChangeFloor(StrictModel):
+    x: Coordinate
+    y: Coordinate
+    floor_id: Optional[CatalogId] = None
+    loc: Optional[Position] = None
+    direction: Optional[Literal["up", "down", "left", "right"]] = None
+    stair: Optional[constr(strict=True, max_length=128)] = None
+    time: Optional[NonNegativeInt] = None
+    ignore_change_floor: Optional[StrictBool] = None
+    opaque: StrictBool = False
+
+
+class EngineTopology(StrictModel):
+    kind: Literal["rectangle", "valid_cells"]
+    valid_cells: Optional[List[Position]] = Field(default=None, max_length=65536)
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> "EngineTopology":
+        if self.kind == "rectangle" and self.valid_cells is not None:
+            raise ValueError("rectangle topology must omit valid_cells")
+        if self.kind == "valid_cells" and not self.valid_cells:
+            raise ValueError("valid_cells topology requires at least one cell")
+        return self
+
+
+class EngineFloorDefinition(StrictModel):
+    floor_id: CatalogId
+    title: Optional[constr(strict=True, max_length=256)] = None
+    width: conint(strict=True, ge=1, le=256)
+    height: conint(strict=True, ge=1, le=256)
+    topology: EngineTopology
+    map: List[List[Optional[NonNegativeInt]]] = Field(max_length=256)
+    blocks: List[EngineMapBlock] = Field(default_factory=list, max_length=8192)
+    change_floor: List[EngineChangeFloor] = Field(default_factory=list, max_length=8192)
+    ratio: Union[StrictInt, float] = 1
+
+    @model_validator(mode="after")
+    def validate_floor_coordinates(self) -> "EngineFloorDefinition":
+        if self.width * self.height > 65536:
+            raise ValueError("engine floor area exceeds 65536 cells")
+        if len(self.map) > self.height or any(len(row) > self.width for row in self.map):
+            raise ValueError("engine floor map exceeds dimensions")
+        coordinates = [(item.x, item.y) for item in self.blocks]
+        coordinates += [(item.x, item.y) for item in self.change_floor]
+        if any(x >= self.width or y >= self.height for x, y in coordinates):
+            raise ValueError("engine floor coordinate is outside dimensions")
+        block_coordinates = [(item.x, item.y) for item in self.blocks if not item.disabled]
+        if len(block_coordinates) != len(set(block_coordinates)):
+            raise ValueError("engine floor blocks must have unique active coordinates")
+        return self
+
+
+class EngineInventory(StrictModel):
+    classes: Dict[CatalogId, Dict[CatalogId, NonNegativeInt]] = Field(
+        default_factory=dict, max_length=64
+    )
+    key_slots: Dict[Literal["yellow", "blue", "red"], Optional[CatalogId]] = Field(
+        default_factory=dict, max_length=3
+    )
+
+
+class EngineModel(StrictModel):
+    protocol: Literal[1]
+    catalog_hash: Fingerprint
+    model_hash: Fingerprint
+    floors: List[EngineFloorDefinition] = Field(max_length=1024)
+    blocks: List[EngineBlockDefinition] = Field(max_length=16384)
+    items: List[EngineItemDefinition] = Field(max_length=8192)
+    enemies: List[EngineEnemyDefinition] = Field(max_length=8192)
+    values: Dict[CatalogId, Union[StrictInt, float]] = Field(default_factory=dict, max_length=4096)
+    inventory: EngineInventory
+
+    @model_validator(mode="after")
+    def unique_catalog_entries(self) -> "EngineModel":
+        for name, values, key in (
+            ("floors", self.floors, lambda item: item.floor_id),
+            ("blocks", self.blocks, lambda item: (item.numeric_id, item.id)),
+            ("items", self.items, lambda item: item.id),
+            ("enemies", self.enemies, lambda item: item.id),
+        ):
+            identities = [key(item) for item in values]
+            if len(identities) != len(set(identities)):
+                raise ValueError(f"engine model {name} must be unique")
+        return self
+
+
 class Observation(StrictModel):
     protocol: Literal[2]
     page: Literal["/games/24/"]
@@ -147,7 +276,15 @@ class Observation(StrictModel):
     keys: Keys
     busy: StrictBool
     blocks: List[Block] = Field(max_length=8192)
+    engine_model: Optional[EngineModel] = None
     captured_at: NonNegativeInt
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_null_engine_model(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "engine_model" in value and value["engine_model"] is None:
+            raise ValueError("engine_model may be omitted but cannot be null")
+        return value
 
     @model_validator(mode="after")
     def unique_block_coordinates(self) -> "Observation":
@@ -278,6 +415,7 @@ class ExpectedDelta(StrictModel):
     gold: Optional[StrictInt] = None
     experience: Optional[StrictInt] = None
     keys: Optional[KeyDelta] = None
+    inventory: Optional[Dict[CatalogId, StrictInt]] = Field(default=None, max_length=4096)
     position: Optional[Position] = None
     floor_id: Optional[NonEmptyString] = None
     map_instance_id: Optional[constr(strict=True, min_length=1, max_length=256)] = None
@@ -295,6 +433,7 @@ class ExpectedDelta(StrictModel):
                 "gold",
                 "experience",
                 "keys",
+                "inventory",
                 "position",
                 "removed_blocks",
                 "added_blocks",
@@ -332,7 +471,7 @@ class BlockLabel(StrictModel):
     fast_path: StrictBool
     supported: StrictBool = True
     expected_delta: Optional[ExpectedDelta] = None
-    source: Literal["human", "bundled", "observed"] = "human"
+    source: Literal["human", "bundled", "observed", "engine"] = "human"
     version: conint(strict=True, ge=1) = 1
 
     @property
@@ -353,6 +492,8 @@ def expected_delta_has_verifiable_non_position_postcondition(
     if "floor_id" in payload:
         return True
     if "map_instance_id" in payload:
+        return True
+    if any(value != 0 for value in (payload.get("inventory") or {}).values()):
         return True
     return any(payload.get(field) for field in ("removed_blocks", "added_blocks"))
 

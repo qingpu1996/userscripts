@@ -59,7 +59,7 @@ def historical_map_fact_payload(observation: Observation, fingerprint: str) -> d
 
 def fingerprint_payload(observation: Observation) -> dict:
     payload = observation_payload(observation, include_timestamp=False)
-    return {
+    result = {
         "floor_id": payload["floor_id"],
         "session_id": payload["session_id"],
         "map_instance_id": payload["map_instance_id"],
@@ -70,6 +70,10 @@ def fingerprint_payload(observation: Observation) -> dict:
         "keys": payload["keys"],
         "blocks": payload["blocks"],
     }
+    if observation.engine_model is not None:
+        result["catalog_hash"] = observation.engine_model.catalog_hash
+        result["engine_model_hash"] = observation.engine_model.model_hash
+    return result
 
 
 def observation_fingerprint(observation: Observation) -> str:

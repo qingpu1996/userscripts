@@ -48,6 +48,7 @@
       "maxItems": 8192,
       "items": {"$ref": "#/$defs/block"}
     },
+    "engine_model": {"$ref": "#/$defs/engineModel"},
     "captured_at": {"type": "integer", "minimum": 0}
   },
   "$defs": {
@@ -154,6 +155,121 @@
             {"type": "null"}
           ]
         }
+      }
+    },
+    "engineModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "catalog_hash", "model_hash", "floors", "blocks", "items", "enemies", "values", "inventory"],
+      "properties": {
+        "protocol": {"const": 1},
+        "catalog_hash": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        "model_hash": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        "floors": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/engineFloor"}},
+        "blocks": {"type": "array", "maxItems": 16384, "items": {"$ref": "#/$defs/engineBlockDefinition"}},
+        "items": {"type": "array", "maxItems": 8192, "items": {"$ref": "#/$defs/engineItem"}},
+        "enemies": {"type": "array", "maxItems": 8192, "items": {"$ref": "#/$defs/engineEnemy"}},
+        "values": {"type": "object", "maxProperties": 4096, "additionalProperties": {"type": "number"}},
+        "inventory": {"$ref": "#/$defs/engineInventory"}
+      }
+    },
+    "engineTopology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {"enum": ["rectangle", "valid_cells"]},
+        "valid_cells": {"type": "array", "minItems": 1, "maxItems": 65536, "items": {"$ref": "#/$defs/position"}}
+      }
+    },
+    "engineMapBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "numeric_id", "id", "cls", "trigger", "no_pass", "disabled"],
+      "properties": {
+        "x": {"$ref": "#/$defs/coordinate"}, "y": {"$ref": "#/$defs/coordinate"},
+        "numeric_id": {"type": "integer", "minimum": 0},
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "cls": {"type": "string", "minLength": 1, "maxLength": 256},
+        "trigger": {"type": ["string", "null"], "maxLength": 128},
+        "no_pass": {"type": "boolean"}, "disabled": {"type": "boolean"}
+      }
+    },
+    "engineChangeFloor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y"],
+      "properties": {
+        "x": {"$ref": "#/$defs/coordinate"}, "y": {"$ref": "#/$defs/coordinate"},
+        "floor_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 256},
+        "loc": {"anyOf": [{"$ref": "#/$defs/position"}, {"type": "null"}]},
+        "direction": {"type": ["string", "null"], "enum": ["up", "down", "left", "right", null]},
+        "stair": {"type": ["string", "null"], "maxLength": 128},
+        "time": {"type": ["integer", "null"], "minimum": 0},
+        "ignore_change_floor": {"type": ["boolean", "null"]},
+        "opaque": {"type": "boolean"}
+      }
+    },
+    "engineFloor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["floor_id", "width", "height", "topology", "map", "blocks", "change_floor", "ratio"],
+      "properties": {
+        "floor_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "title": {"type": ["string", "null"], "maxLength": 256},
+        "width": {"type": "integer", "minimum": 1, "maximum": 256},
+        "height": {"type": "integer", "minimum": 1, "maximum": 256},
+        "topology": {"$ref": "#/$defs/engineTopology"},
+        "map": {"type": "array", "maxItems": 256, "items": {"type": "array", "maxItems": 256, "items": {"type": ["integer", "null"], "minimum": 0}}},
+        "blocks": {"type": "array", "maxItems": 8192, "items": {"$ref": "#/$defs/engineMapBlock"}},
+        "change_floor": {"type": "array", "maxItems": 8192, "items": {"$ref": "#/$defs/engineChangeFloor"}},
+        "ratio": {"type": "number"}
+      }
+    },
+    "engineBlockDefinition": {
+      "type": "object", "additionalProperties": false,
+      "required": ["numeric_id", "id", "cls", "trigger", "no_pass", "door_info"],
+      "properties": {
+        "numeric_id": {"type": "integer", "minimum": 0},
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "cls": {"type": "string", "minLength": 1, "maxLength": 256},
+        "trigger": {"type": ["string", "null"], "maxLength": 128},
+        "no_pass": {"type": "boolean"},
+        "door_info": {"anyOf": [{"type": "object", "additionalProperties": false, "required": ["keys"], "properties": {"keys": {"type": "object", "maxProperties": 32, "additionalProperties": {"type": "integer", "minimum": 1}}}}, {"type": "null"}]}
+      }
+    },
+    "engineItem": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "cls", "name", "text", "item_effect", "item_effect_tip", "use_item_event", "complex"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "cls": {"type": "string", "minLength": 1, "maxLength": 256},
+        "name": {"type": ["string", "null"], "maxLength": 256},
+        "text": {"type": ["string", "null"], "maxLength": 4096},
+        "item_effect": {"type": ["string", "null"], "maxLength": 16384},
+        "item_effect_tip": {"type": ["string", "null"], "maxLength": 4096},
+        "use_item_event": {"type": ["boolean", "string", "array", "object", "null"]},
+        "complex": {"type": "boolean"}
+      }
+    },
+    "engineEnemy": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "hp", "attack", "defense", "gold", "experience", "special"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "hp": {"type": "integer", "minimum": 0},
+        "attack": {"type": ["integer", "null"], "minimum": 0},
+        "defense": {"type": ["integer", "null"], "minimum": 0},
+        "gold": {"type": "integer", "minimum": 0},
+        "experience": {"type": "integer", "minimum": 0},
+        "special": {"type": "array", "maxItems": 64, "items": {"type": ["integer", "string"]}}
+      }
+    },
+    "engineInventory": {
+      "type": "object", "additionalProperties": false, "required": ["classes", "key_slots"],
+      "properties": {
+        "classes": {"type": "object", "maxProperties": 64, "additionalProperties": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}}},
+        "key_slots": {"type": "object", "additionalProperties": false, "properties": {"yellow": {"type": ["string", "null"]}, "blue": {"type": ["string", "null"]}, "red": {"type": ["string", "null"]}}}
       }
     }
   }

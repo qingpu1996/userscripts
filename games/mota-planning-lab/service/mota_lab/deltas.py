@@ -65,6 +65,29 @@ def validate_expected_delta(
             )
     actual["keys"] = actual_keys
 
+    expected_inventory = declared.get("inventory") or {}
+    if expected_inventory:
+        def inventory(model: object) -> Dict[str, int]:
+            result: Dict[str, int] = {}
+            if model is None:
+                return result
+            for items in model.inventory.classes.values():
+                for item_id, count in items.items():
+                    result[item_id] = result.get(item_id, 0) + count
+            return result
+
+        before_inventory = inventory(pre.engine_model)
+        after_inventory = inventory(post.engine_model)
+        actual_inventory: Dict[str, int] = {}
+        for item_id, expected_value in expected_inventory.items():
+            delta = after_inventory.get(item_id, 0) - before_inventory.get(item_id, 0)
+            actual_inventory[item_id] = delta
+            if delta != expected_value:
+                differences.append({
+                    "field": f"inventory.{item_id}", "expected": expected_value, "actual": delta,
+                })
+        actual["inventory"] = actual_inventory
+
     actual_position = {"x": post.hero.loc.x, "y": post.hero.loc.y}
     actual["position"] = actual_position
     if "position" in declared and declared["position"] is not None:

@@ -75,7 +75,7 @@ MotaLab.sha256 = function sha256(input) {
 };
 
 MotaLab.fingerprintProjection = function fingerprintProjection(observation) {
-  return {
+  const projection = {
     floor_id: observation.floor_id,
     session_id: observation.session_id,
     dimensions: {
@@ -121,6 +121,11 @@ MotaLab.fingerprintProjection = function fingerprintProjection(observation) {
     })).sort((a, b) => a.y - b.y || a.x - b.x
       || a.numeric_id - b.numeric_id || a.id.localeCompare(b.id)),
   };
+  if (observation.engine_model && typeof observation.engine_model.catalog_hash === "string") {
+    projection.catalog_hash = observation.engine_model.catalog_hash;
+    projection.engine_model_hash = observation.engine_model.model_hash;
+  }
+  return projection;
 };
 
 MotaLab.fingerprintObservation = function fingerprintObservation(observation) {

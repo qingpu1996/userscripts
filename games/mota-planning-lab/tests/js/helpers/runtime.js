@@ -216,6 +216,7 @@ function makePoisonCore(options = {}) {
   const authority = Object.freeze({ hero, blocks, currentMap });
   const allowed = {
     status,
+    floors: null,
     getMapBlocksObj(floorId, includeDisabled) {
       if (String(floorId) !== String(currentFloorId) || includeDisabled !== true) {
         throw new Error("wrong current block request");
