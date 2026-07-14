@@ -53,6 +53,8 @@ response schema
 
 `reconnectOnly` 走同一分类并携带 phase/action ID/pre/current fingerprint，同时明确发送 `intent=reconnect_only`。服务在该 intent 下禁止进入 planner、decision cache 或 action issuance；无 unresolved 返回 idle，有 unresolved 返回同 identity 暂停。浏览器若收到违反门禁的 execute，持久保存 action ID/guard/response hash 并进入 `RECONNECT_UNEXPECTED_EXECUTE`，绝不执行。completed 分类在发送前只形成 recovery report，不清 pending；服务成功结算后必须用独立 idle + 同 ID `acknowledged_action_id` 明确确认。
 
+fresh observation 在恢复分类前先按运行态数据模型归一钥匙：canonical `hero.items.tools` 中被引擎省略的零计数字段变成 `0`。因此门动作后的 `1 -> 字段删除` 可被 expected delta 判为 `1 -> 0`；若目标 block 也按声明消失，则 pending 进入 completed。这个过程只解释已发生的正常引擎动作，刷新、`reconnect_only` 和再次 reload 都不会重放行动 API。显式非法值或布局冲突在恢复分类前即 fail closed。
+
 SQLite 状态机是 `IMPORT_WITNESS -> CONSISTENT_PRIVATE_SNAPSHOT -> CANDIDATE_SCHEMA_AND_BEHAVIOR_PROBE -> IDENTITY_RECHECK -> ATOMIC_GENERATION_MANIFEST -> GENERATION_CONNECT_RECHECK -> WAL`。调用方 pathname 只作导入 witness；分类后不再重开它。WAL/SHM 必须成对且 framing/size 合法，私有 probe 前后复核 source；发布和实际 connect 前后的 replace/swap 只能触发拒绝，不能让替换 inode 接受 DDL/WAL。manifest 指向 state dir 内权威 generation，重启从该 generation 恢复；candidate 崩溃残留在成功启动后清理。
 
 fingerprint 包含 session、map instance、dimensions、topology、英雄面板、keys 和当前 blocks；忽略时间和 busy。

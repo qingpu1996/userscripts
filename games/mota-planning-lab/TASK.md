@@ -101,7 +101,7 @@
 ## 当前运行态唯一权威重构
 
 - [x] **F254 live observation 一致采集**：当前 map/blocks/怪物采集前后核对 floor、完整 hero/keys 与 moving/lock/event 围栏；瞬时变化重试，持续变化 `RUNTIME_SNAPSHOT_UNSTABLE` fail closed。
-- [x] **F255 钥匙布局显式兼容**：支持 `hero.items.tools`、`hero.items.keys`、`hero.keys`；真实 tools fixture 为 `1/1/1`，缺失、残缺、别名冲突和多布局冲突均禁止默认为零。
+- [x] **F255 钥匙布局显式兼容**：支持 `hero.items.tools`、`hero.items.keys`、`hero.keys`；初始真实 tools fixture 为 `1/1/1`，未知容器、显式非法值、别名冲突和多布局冲突禁止默认为零；canonical tools 的零计数字段省略语义由 F268-F270 完整定义。
 - [x] **F256 三处 fresh runtime 门禁**：cycle 起点、guard/plan 前和 pending durable 后行动 API 前均重采；行动后继续要求改变且稳定两轮的完整 observation，再做 expected delta。
 - [x] **F257 历史地图事实投影**：SQLite 完整 observation 只保留作恢复/审计；planner 只接收 revisioned `HistoricalMapFact`，其中无 hero、keys、busy，跨图模拟的资源向量只来自本轮 live observation。
 - [x] **F258 实时原子重规划**：每次仍只签一个状态边界，空走廊不跨边界；可达性、路线、估值和世界搜索队列每轮重算，未增加 current-state mirror 或持久派生 route cache。
@@ -117,6 +117,14 @@
 - [x] **F265 硬门禁与原子性回归**：unknown block、unknown damage、incomplete label 仍优先 fail closed；operations 不触碰 unsupported，每次仍只有一个末端状态变化边界。
 - [x] **F266 完整离线 QA 与证据**：`104 JS + 97 Python + 1 integration = 202/202`；双 dist hash、静态盲玩、协议/schema、compile/syntax、docs/JSON、diff 与隔离 prospective index 全绿，证据位于 `qa/runs/2026-07-14-optional-unsupported-frontier/`。
 - [ ] **F267 全新只读验收**：由主会话在本修复 Agent 结束后新建未参与修复的只读验收 Agent；本 Agent 不自验替代。
+
+## Canonical tools 零钥匙省略与 pending 恢复
+
+- [x] **F268 零值数据模型**：canonical `hero.items.tools` 容器存在即声明三色布局；被引擎删除的零计数字段归一为 `0`，空容器表示三色全零。
+- [x] **F269 严格布局门禁**：显式值必须是有限非负整数；非普通 tools 容器、同色长短别名冲突、多布局冲突与完全缺少可识别容器继续 fail closed，既有 `items.keys`/`hero.keys` 完整性不放宽。
+- [x] **F270 已执行动作恢复**：黄门消失、位置改变、`yellowKey` 从 `1` 删除的 fresh observation 归一为 `yellow=0`，`keys.yellow=-1 + removed_blocks` 可补记 completed/ack；reconnect/reload 不重放引擎 API。
+- [x] **F271 完整离线 QA 与证据**：定向红灯、完整 JS/Python/integration、协议/schema、compile/syntax、双 dist 确定性、Acorn 静态盲玩、docs/JSON、diff 与隔离 prospective index 全绿；证据位于 `qa/runs/2026-07-14-zero-key-omission-recovery/`。
+- [ ] **F272 全新只读验收**：由主会话在本修复 Agent 结束后新建未参与修复的只读验收 Agent；本 Agent 不自验替代。
 
 ## v0.1 历史原型记录（不适用于 v2 运行逻辑）
 

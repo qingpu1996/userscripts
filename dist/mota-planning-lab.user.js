@@ -481,8 +481,18 @@
       return value;
     }
 
-    function readKeyLayout(container, path) {
-      if (!container || typeof container !== "object") return null;
+    function readKeyLayout(container, path, options = {}) {
+      if (!container || typeof container !== "object" || Array.isArray(container)
+        || Object.prototype.toString.call(container) !== "[object Object]") {
+        if (options.declared === true) {
+          throw MotaLab.createPauseError(
+            "ENGINE_API_INCOMPATIBLE",
+            "INVALID_KEY_LAYOUT",
+            { layout: path, value_type: container === null ? "null" : typeof container },
+          );
+        }
+        return null;
+      }
       const aliases = {
         yellow: ["yellowKey", "yellow"],
         blue: ["blueKey", "blue"],
@@ -491,20 +501,43 @@
       const present = Object.values(aliases).some((names) => (
         names.some((name) => Object.prototype.hasOwnProperty.call(container, name))
       ));
-      if (!present) return null;
+      if (!present && options.omittedZero !== true) {
+        if (options.declared === true) {
+          throw MotaLab.createPauseError(
+            "ENGINE_API_INCOMPATIBLE",
+            "INCOMPLETE_KEY_LAYOUT",
+            { layout: path, missing_color: "yellow" },
+          );
+        }
+        return null;
+      }
       const values = {};
       for (const [color, names] of Object.entries(aliases)) {
         const available = names.filter((name) => (
           Object.prototype.hasOwnProperty.call(container, name)
         ));
         if (available.length === 0) {
+          if (options.omittedZero === true) {
+            values[color] = 0;
+            continue;
+          }
           throw MotaLab.createPauseError(
             "ENGINE_API_INCOMPATIBLE",
             "INCOMPLETE_KEY_LAYOUT",
             { layout: path, missing_color: color },
           );
         }
-        const candidates = available.map((name) => readNumber(container[name], `${path}.${name}`));
+        const candidates = available.map((name) => {
+          const value = readNumber(container[name], `${path}.${name}`);
+          if (value < 0) {
+            throw MotaLab.createPauseError(
+              "ENGINE_API_INCOMPATIBLE",
+              "INVALID_RUNTIME_FIELD",
+              { field: `${path}.${name}`, valueType: typeof container[name] },
+            );
+          }
+          return value;
+        });
         if (candidates.some((value) => value !== candidates[0])) {
           throw MotaLab.createPauseError(
             "ENGINE_API_INCOMPATIBLE",
@@ -519,10 +552,18 @@
 
     function readKeys(hero) {
       const items = hero.items && typeof hero.items === "object" ? hero.items : null;
+      const hasCanonicalTools = Boolean(items
+        && Object.prototype.hasOwnProperty.call(items, "tools"));
+      const hasItemsKeys = Boolean(items
+        && Object.prototype.hasOwnProperty.call(items, "keys"));
+      const hasHeroKeys = Object.prototype.hasOwnProperty.call(hero, "keys");
       const candidates = [
-        readKeyLayout(items && items.tools, "hero.items.tools"),
-        readKeyLayout(items && items.keys, "hero.items.keys"),
-        readKeyLayout(hero.keys, "hero.keys"),
+        hasCanonicalTools ? readKeyLayout(items.tools, "hero.items.tools", {
+          declared: true,
+          omittedZero: true,
+        }) : null,
+        hasItemsKeys ? readKeyLayout(items.keys, "hero.items.keys", { declared: true }) : null,
+        hasHeroKeys ? readKeyLayout(hero.keys, "hero.keys", { declared: true }) : null,
       ].filter(Boolean);
       if (candidates.length === 0) {
         throw MotaLab.createPauseError(

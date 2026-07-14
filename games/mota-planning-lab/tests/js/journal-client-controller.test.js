@@ -1019,3 +1019,104 @@ test("reconnectOnly 对 pause/error/malformed/network 全部保留 completed rec
   assert.equal(calls, 2);
   assert.equal(adapter.calls.direct + adapter.calls.route, 0);
 });
+
+test("黄钥匙归零字段被 canonical tools 省略后，刷新重连只补记 completed/ack 且不重放", async () => {
+  const door = {
+    x: 6, y: 8, id: 21,
+    event: { id: "yellowDoor", cls: "terrains", trigger: "openDoor", noPass: true },
+  };
+  const beforeRuntime = makePoisonCore({
+    floorId: "MT0",
+    currentMap: { title: "0F", width: 11, height: 11 },
+    blocks: [door],
+    hero: {
+      hp: 1000, atk: 10, def: 10, money: 0, exp: 0,
+      loc: { x: 6, y: 10, direction: "up" },
+      items: { tools: { yellowKey: 1, blueKey: 1, redKey: 1 } },
+    },
+  });
+  const afterRuntime = makePoisonCore({
+    floorId: "MT0",
+    currentMap: { title: "0F", width: 11, height: 11 },
+    blocks: [],
+    hero: {
+      hp: 1000, atk: 10, def: 10, money: 0, exp: 0,
+      loc: { x: 6, y: 9, direction: "up" },
+      items: { tools: { blueKey: 1, redKey: 1 } },
+    },
+  });
+  const beforeAdapter = lab.createEngineAdapter(beforeRuntime.scope);
+  const afterAdapter = lab.createEngineAdapter(afterRuntime.scope);
+  const before = lab.collectObservation(beforeAdapter, () => 1);
+  before.session_id = "SESSION-SYNTHETIC-0001";
+  const actionId = "AUTO-0000000000000001";
+  const storage = lab.createMemoryStorage();
+  const setup = lab.createJournal(storage);
+  establishTestSession(setup, before);
+  setup.setPending({
+    action_id: actionId,
+    pre_fingerprint: lab.fingerprintObservation(before),
+    pre_observation: before,
+    expected_delta: {
+      keys: { yellow: -1 },
+      removed_blocks: [{ x: 6, y: 8, id: "yellowDoor" }],
+    },
+    allow_unknown_floor: false,
+    allow_unknown_map_instance: false,
+    requires_non_position_change: true,
+    operations: [{ type: "grid", x: 6, y: 9 }, { type: "grid", x: 6, y: 8 }],
+    phase: "prepared",
+  });
+
+  const requests = [];
+  const restarted = lab.createController({
+    adapter: afterAdapter,
+    journal: lab.createJournal(storage),
+    registry: lab.createBlockRegistry(),
+    client: { isConnected: () => true, async postCycle(request) {
+      requests.push(request);
+      return {
+        status: "idle", reason: "recovery accepted",
+        acknowledged_action_id: actionId, registry_entries: [],
+      };
+    } },
+    panel: makePanel(),
+    observe: () => lab.collectObservation(afterAdapter, () => 2),
+    logger: { error() {} },
+  });
+  const recovered = await restarted.reconnectOnly();
+  assert.equal(recovered.connected, true);
+  assert.equal(recovered.executed, false);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].completed_action_id, actionId);
+  assert.equal(requests[0].recovery.phase, "completed");
+  assert.deepEqual(JSON.parse(JSON.stringify(requests[0].observation.keys)), {
+    yellow: 0, blue: 1, red: 1,
+  });
+  const recoveredJournal = lab.createJournal(storage).snapshot();
+  assert.equal(recoveredJournal.pending_action, null);
+  assert.equal(recoveredJournal.last_completed_action.action_id, actionId);
+  assert.equal(recoveredJournal.last_completed_action.recovered, true);
+  assert.equal(recoveredJournal.last_acknowledged_action_id, actionId);
+  assert.equal(afterRuntime.calls.direct.length + afterRuntime.calls.route.length, 0);
+
+  const reloadedRequests = [];
+  const reloaded = lab.createController({
+    adapter: afterAdapter,
+    journal: lab.createJournal(storage),
+    registry: lab.createBlockRegistry(),
+    client: { isConnected: () => true, async postCycle(request) {
+      reloadedRequests.push(request);
+      return { status: "idle", reason: "already acknowledged", registry_entries: [] };
+    } },
+    panel: makePanel(),
+    observe: () => lab.collectObservation(afterAdapter, () => 3),
+    logger: { error() {} },
+  });
+  const repeated = await reloaded.reconnectOnly();
+  assert.equal(repeated.connected, true);
+  assert.equal(repeated.executed, false);
+  assert.equal(reloadedRequests[0].completed_action_id, null);
+  assert.equal(reloadedRequests[0].recovery.phase, "none");
+  assert.equal(afterRuntime.calls.direct.length + afterRuntime.calls.route.length, 0);
+});

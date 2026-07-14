@@ -22,4 +22,6 @@
 
 当前运行态唯一权威重构证据：[`runs/2026-07-14-live-runtime-authority/`](runs/2026-07-14-live-runtime-authority/)。覆盖真实 tools key shape、key layout fail-closed、同步采集围栏、行动 API 前 fresh guard、历史 map fact 去 hero/resources、重访 revision、单边界重规划与 `196/196` 完整离线 QA。
 
+canonical tools 零钥匙省略恢复证据：[`runs/2026-07-14-zero-key-omission-recovery/`](runs/2026-07-14-zero-key-omission-recovery/)。覆盖零字段/空 tools 归一、显式非法值与布局冲突 fail closed、黄门后 `yellowKey` 删除的 expected-delta completed/ack，以及 reconnect/reload 零重放；完整离线 QA 为 `203/203`。
+
 本轮明确 `not-run`：真实游戏页面、真实存档、真实移动/换图、内置浏览器注入和外网。离线 fake core 结果不得冒充现场验证。

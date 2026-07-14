@@ -52,6 +52,11 @@ assert.deepEqual(liveTools.hero.items.tools, {
   yellowKey: 1, blueKey: 1, redKey: 1,
 });
 assert.deepEqual(liveTools.expected_keys, { yellow: 1, blue: 1, red: 1 });
+const zeroOmission = heroShapes.cases.find(
+  (entry) => entry.name === "h5mota-24-canonical-tools-zero-omission",
+);
+assert.deepEqual(zeroOmission.hero.items.tools, { blueKey: 1, redKey: 1 });
+assert.deepEqual(zeroOmission.expected_keys, { yellow: 0, blue: 1, red: 1 });
 
 for (const schemaName of [
   "observation.schema.json",

@@ -33,7 +33,7 @@
 
 浏览器必须在一次同步采集内生成整份 observation。读取当前 map、blocks 和可见怪物前后，至少核对 floorId、hero 完整面板/位置/keys 与 moving/lock/event 围栏；前后不一致则丢弃并同步重试，持续不稳定以 `RUNTIME_SNAPSHOT_UNSTABLE` 暂停。服务不能逐字段回调页面 JS，也不能用上一轮 observation 回填本轮缺失字段。
 
-三色钥匙不允许缺失后默认为零。适配器支持 `hero.items.tools`、`hero.items.keys` 和 `hero.keys` 三种显式布局；每个候选必须完整，多个候选同时存在时数值必须一致，否则以 `ENGINE_API_INCOMPATIBLE` 暂停。
+三色钥匙必须来自可识别容器。canonical `hero.items.tools` 容器存在时，引擎可通过删除归零的 `yellowKey/blueKey/redKey` 字段表达零计数，因此省略色归一为 `0`，空容器归一为三色全零；`hero.items.keys` 和 `hero.keys` 候选仍必须完整。显式值必须是有限、非负整数；同色长短别名或多个候选布局归一后不一致、canonical 容器结构非法、完全缺少可识别容器时，均以 `ENGINE_API_INCOMPATIBLE` 暂停。
 
 `rectangle` 必须省略 `valid_cells`；`valid_cells` 必须非空、唯一并位于 dimensions 内。英雄、block、operation、guard 坐标均需同时位于 dimensions 和有效格。浏览器最多发送 8192 个 block；轴上限 256。
 

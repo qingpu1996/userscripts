@@ -64,11 +64,11 @@
 
 当前适配器只接受显式登记的三色钥匙容器：
 
-1. `hero.items.tools.yellowKey/blueKey/redKey`；
+1. canonical `hero.items.tools`：容器自身存在即声明三色钥匙布局；`yellowKey/blueKey/redKey` 或对应短别名存在时读取显式值，归零后被引擎删除的字段按 `0` 归一；
 2. `hero.items.keys.yellowKey/blueKey/redKey`（兼容既有引擎形状，也接受同容器的 `yellow/blue/red` 别名）；
 3. `hero.keys.yellowKey/blueKey/redKey`（同样接受短别名）。
 
-至少一个完整布局必须存在。布局残缺、字段不是整数、同一容器的别名冲突，或多个布局数值冲突时都暂停 `ENGINE_API_INCOMPATIBLE`。缺失绝不默认为零；多个布局同时存在且完全一致时才允许继续。
+至少一个可识别布局必须存在。只有 canonical `hero.items.tools` 具有“容器存在 + 零计数字段可省略”的语义，空 `tools` 因而表示三色钥匙均为零；这不是对任意缺失数据的兜底。`hero.items.keys` 与 `hero.keys` 仍必须给出完整三色布局。任何显式字段都必须是有限、非负整数；同一容器长短别名冲突、多个布局归一后冲突、声明为非普通对象的 `tools`，以及完全没有可识别钥匙容器时，都暂停 `ENGINE_API_INCOMPATIBLE`。
 
 ## 原子重规划
 
@@ -77,3 +77,5 @@
 已登记但尚未支持的边界也属于不可跨越集合。实时重规划可以跳过一个可绕开的 optional unsupported frontier，选择另一个独立可达且当前资源可承担的 supported 边界；不能把 unsupported 当作可通行地形，也不能在没有其他合法进展时返回 idle 或尝试穿越。
 
 刷新时不能简单丢弃 pre observation：如果当前 fingerprint 等于 pre，证明尚未执行并重发同一 action ID；如果真实现场满足 expected post，补记 completed；否则暂停为恢复歧义。该审计链与“游戏现场是当前权威”并不冲突——账本只解释动作历史，永远不能把旧面板写回或覆盖现场。
+
+钥匙字段归零省略同样先在 fresh observation 中归一，再进入 fingerprint、guard 和 expected-delta。比如门动作前 `yellow=1`，动作后 canonical `tools` 删除 `yellowKey` 且目标门 block 消失，会得到真实 `yellow=0`，从而以 `keys.yellow=-1` 和 `removed_blocks` 证明 pending 已执行；刷新或 `reconnect_only` 只补记 completed/ack，不会再次调用移动 API。
