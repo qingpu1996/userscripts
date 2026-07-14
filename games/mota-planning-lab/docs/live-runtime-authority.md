@@ -60,6 +60,8 @@
 
 可达性、路径、候选排序、资源估值和世界搜索队列都由“当前 observation + 历史地图事实 + transitions + 标签”实时重算。它们不是权威数据，不跨 cycle 作为当前状态复用。`decisions` 表只承担同一 observation/knowledge 身份下的幂等响应与行动签名审计；现场 fingerprint 或知识版本变化后会重新规划。
 
+怪物可战斗性也属于本轮派生结果，不是知识库。浏览器对当前可见怪物逐坐标读取 `getEnemyInfo/getDamage`，只在 observation 内保存这次审计事实；本地不保存怪物属性表，也不拿历史 stats 覆盖下一轮。world search 只允许未模拟任何变化的本轮 live root 使用 enemy 字段，并把直接可达战斗作为终端候选；同图拾取、开门、战斗后以及 A→B→A 返回后的节点都只能把怪物当阻挡，等待真实执行和 fresh observation。`exp/experience` 等字段别名只做严格标准化；own property 显式非法不能当成字段缺席。damage 原始值严格为 null/`???` 且当前攻击无法穿透当前防御时，规划器才把该格视为本轮不可战斗阻挡；英雄加攻后必须用新的接口结果重新判定。`undefined` 等非协议返回值在采集侧保留 raw type 后立即暂停，绝不转成可发送的 null。
+
 ## 钥匙布局兼容与失败策略
 
 当前适配器只接受显式登记的三色钥匙容器：

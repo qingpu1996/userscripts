@@ -99,7 +99,10 @@ class Block(StrictModel):
     cls: NonEmptyString
     trigger: Optional[constr(strict=True, max_length=128)]
     no_pass: StrictBool
-    damage: Union[StrictInt, Literal["???"], None] = None
+    # Explicit null is valid, but omission is not: JSON.stringify(undefined)
+    # drops the property, and defaulting an omitted value to null would turn a
+    # runtime API failure into an apparently known engine sentinel.
+    damage: Union[NonNegativeInt, Literal["???"], None]
     enemy: Optional[Enemy] = None
 
 

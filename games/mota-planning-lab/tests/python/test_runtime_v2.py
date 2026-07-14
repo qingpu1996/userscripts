@@ -36,6 +36,7 @@ from mota_lab.storage import (
 from mota_test_support import (
     label_block,
     make_block,
+    make_enemy_block,
     make_observation,
     make_request,
     make_settings,
@@ -779,6 +780,83 @@ class SessionWorldAndCorsTests(unittest.TestCase):
             finally:
                 coordinator.store.close()
 
+    def test_change_map_completion_ack_precedes_live_unfightable_enemy_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = make_settings(Path(directory), rate_limit_per_second=0)
+            stair = make_block(x=1, y=0, block_id="upFloor", cls="terrains", trigger="changeFloor")
+            mark_floor(settings, floor_id="MT0")
+            label_block(settings, stair, category="stair")
+            coordinator = CycleCoordinator(settings)
+            try:
+                pre = make_observation(
+                    floor_id="MT0", floor_number=0, map_instance_id="MT0-map",
+                    width=2, height=1, x=0, y=0, blocks=[stair], session_id="live-enemy-session",
+                    attack=10, hp=1000, yellow=0, blue=1, red=1,
+                )
+                issued = coordinator.cycle(CycleRequest.model_validate(make_request(pre)))
+                self.assertEqual(issued["status"], "execute")
+                self.assertEqual(issued["action_kind"], "SCAN_OPAQUE_EXIT")
+
+                unfightable = make_enemy_block(
+                    x=0, y=0, damage=None, block_id="blackSlime",
+                )
+                unfightable["enemy"].update({
+                    "hp": 200, "attack": 35, "defense": 10,
+                    "gold": 5, "experience": 5, "special": [],
+                })
+                post = make_observation(
+                    floor_id="MT1", floor_number=1, map_instance_id="MT1-map",
+                    width=2, height=1, x=1, y=0, blocks=[unfightable],
+                    session_id="live-enemy-session", captured_at=1234567891,
+                    attack=10, hp=1000, yellow=0, blue=1, red=1,
+                )
+                post_fp = observation_fingerprint(Observation.model_validate(post))
+                completed = make_request(
+                    post,
+                    completed_action_id=issued["action_id"],
+                    recovery={
+                        "phase": "completed",
+                        "pending_action_id": issued["action_id"],
+                        "pre_fingerprint": observation_fingerprint(Observation.model_validate(pre)),
+                        "current_fingerprint": post_fp,
+                        "detail_code": None,
+                    },
+                )
+                acknowledged = coordinator.cycle(CycleRequest.model_validate(completed))
+                self.assertEqual(acknowledged["status"], "idle")
+                self.assertEqual(acknowledged["acknowledged_action_id"], issued["action_id"])
+                self.assertEqual(coordinator.store.get_action(issued["action_id"]).status, "completed")
+                events = [
+                    json.loads(line)["event"]
+                    for line in settings.log_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                self.assertLess(
+                    max(index for index, event in enumerate(events) if event == "action_completed"),
+                    max(index for index, event in enumerate(events)
+                        if event == "completed_action_acknowledged"),
+                )
+                self.assertEqual(
+                    coordinator.cycle(CycleRequest.model_validate(completed)), acknowledged,
+                )
+            finally:
+                coordinator.store.close()
+
+            restarted = CycleCoordinator(settings)
+            try:
+                repeated = restarted.cycle(CycleRequest.model_validate(completed))
+                self.assertEqual(repeated["status"], "idle")
+                self.assertEqual(repeated["acknowledged_action_id"], issued["action_id"])
+                self.assertEqual(
+                    restarted.store._connection.execute(
+                        "SELECT COUNT(*) FROM actions",
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(restarted.store.unresolved_action_count("live-enemy-session"), 0)
+            finally:
+                restarted.store.close()
+
     def test_frontier_scan_and_boundary_removal_recompute(self) -> None:
         boundary = make_block(x=1, y=0, block_id="door")
         label = BlockLabel(
@@ -1017,6 +1095,219 @@ class SessionWorldAndCorsTests(unittest.TestCase):
         )
         self.assertIsNotNone(unlocked)
         self.assertGreaterEqual(unlocked.path_length, 3)
+
+    def test_known_unfightable_enemy_is_never_crossed_by_scan_or_world_search(self) -> None:
+        exit_stair = make_block(
+            x=1, y=0, block_id="upFloor", cls="terrains", trigger="changeFloor"
+        )
+        enemy = make_enemy_block(x=1, y=0, damage=5, block_id="blockedEnemy")
+        enemy["enemy"]["defense"] = 10
+        remote_resource = make_block(x=2, y=0, block_id="behindEnemy")
+        current = Observation.model_validate(make_observation(
+            width=2, height=1, blocks=[exit_stair], map_instance_id="A", floor_id="A",
+            attack=10,
+        ))
+        remote = Observation.model_validate(make_observation(
+            width=3, height=1, blocks=[enemy, remote_resource],
+            map_instance_id="B", floor_id="B", attack=10,
+        ))
+        stair_label = BlockLabel(
+            id=exit_stair["id"], cls=exit_stair["cls"], trigger=exit_stair["trigger"],
+            category="stair", passable=False, boundary=True, fast_path=False,
+        )
+        enemy_label = BlockLabel(
+            id=enemy["id"], cls=enemy["cls"], trigger=enemy["trigger"],
+            category="enemy", passable=False, boundary=True, fast_path=False,
+        )
+        resource_label = BlockLabel(
+            id=remote_resource["id"], cls=remote_resource["cls"],
+            trigger=remote_resource["trigger"], category="resource",
+            passable=False, boundary=True, fast_path=False,
+            expected_delta={"attack": 10},
+        )
+        labels = {
+            stair_label.identity: stair_label,
+            enemy_label.identity: enemy_label,
+            resource_label.identity: resource_label,
+        }
+        planner = Planner(planning_budget=32)
+        result, exhausted = planner._world_search(
+            current,
+            labels,
+            {
+                "map_facts": [map_fact(current), map_fact(remote)],
+                "transitions": [{
+                    "from_map_instance_id": "A", "to_map_instance_id": "B",
+                    "from_x": 1, "from_y": 0, "to_x": 0, "to_y": 0,
+                }],
+            },
+        )
+        self.assertFalse(exhausted)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.first.boundary.block.id, "upFloor")
+        self.assertEqual(result.path_length, 1)
+
+        blocked_stair = make_block(
+            x=2, y=0, block_id="upFloor", cls="terrains", trigger="changeFloor"
+        )
+        scan_enemy = make_enemy_block(x=1, y=0, damage=None, block_id="blockedEnemy")
+        scan_enemy["enemy"]["defense"] = 10
+        scan_observation = Observation.model_validate(make_observation(
+            width=3, height=1, blocks=[scan_enemy, blocked_stair],
+            map_instance_id="B", floor_id="B", attack=10,
+        ))
+        scan_response = planner.plan(
+            scan_observation,
+            labels,
+            action_id_factory=lambda: "AUTO-0000000000000001",
+            registry_entries=[],
+            world_context={"map_facts": [map_fact(scan_observation)], "transitions": [], "frontiers": []},
+            scan_state={
+                "phase": "discover",
+                "anchor_map_instance_id": "B",
+                "current_map_instance_id": "B",
+                "scanned_map_instance_ids": ["B"],
+                "pending_exits": [],
+                "traversed_transitions": [],
+                "reason": "synthetic scan",
+            },
+        )
+        self.assertEqual(scan_response.status, "idle")
+        self.assertNotIn("action_id", scan_response.model_dump(mode="json", exclude_unset=True))
+
+    def test_world_search_never_reuses_live_enemy_fact_after_same_map_resource(self) -> None:
+        gem = make_block(x=1, y=0, block_id="redGem")
+        enemy = make_enemy_block(x=2, y=0, damage=0, block_id="staleEnemy")
+        enemy["enemy"].update({"defense": 10, "gold": 20_000, "experience": 0})
+        observation = Observation.model_validate(make_observation(
+            width=3, height=1, x=0, y=0, attack=10,
+            map_instance_id="A", floor_id="A", blocks=[gem, enemy],
+        ))
+        gem_label = BlockLabel(
+            id=gem["id"], cls=gem["cls"], trigger=gem["trigger"],
+            category="resource", passable=False, boundary=True, fast_path=False,
+            expected_delta={"attack": 10},
+        )
+        enemy_label = BlockLabel(
+            id=enemy["id"], cls=enemy["cls"], trigger=enemy["trigger"],
+            category="enemy", passable=False, boundary=True, fast_path=False,
+        )
+
+        result, exhausted = Planner(planning_budget=32)._world_search(
+            observation,
+            {gem_label.identity: gem_label, enemy_label.identity: enemy_label},
+            {"map_facts": [map_fact(observation)], "transitions": []},
+        )
+
+        self.assertFalse(exhausted)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.first.boundary.block.id, "redGem")
+        self.assertEqual(result.path_length, 1)
+        self.assertEqual(result.score, 309.5)
+
+    def test_world_search_never_reuses_live_enemy_fact_after_non_attack_resource(self) -> None:
+        potion = make_block(x=1, y=0, block_id="redPotion")
+        enemy = make_enemy_block(x=2, y=0, damage=0, block_id="staleEnemy")
+        enemy["enemy"].update({"defense": 1, "gold": 20_000, "experience": 0})
+        observation = Observation.model_validate(make_observation(
+            width=3, height=1, x=0, y=0, attack=10,
+            map_instance_id="A", floor_id="A", blocks=[potion, enemy],
+        ))
+        potion_label = BlockLabel(
+            id=potion["id"], cls=potion["cls"], trigger=potion["trigger"],
+            category="resource", passable=False, boundary=True, fast_path=False,
+            expected_delta={"hp": 200},
+        )
+        enemy_label = BlockLabel(
+            id=enemy["id"], cls=enemy["cls"], trigger=enemy["trigger"],
+            category="enemy", passable=False, boundary=True, fast_path=False,
+        )
+
+        result, _ = Planner(planning_budget=32)._world_search(
+            observation,
+            {potion_label.identity: potion_label, enemy_label.identity: enemy_label},
+            {"map_facts": [map_fact(observation)], "transitions": []},
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.first.boundary.block.id, "redPotion")
+        self.assertEqual(result.path_length, 1)
+        self.assertEqual(result.score, 209.5)
+
+    def test_world_search_never_reuses_live_enemy_fact_after_return_to_same_map(self) -> None:
+        portal_a = make_block(
+            x=1, y=0, block_id="portalA", cls="terrains", trigger="changeFloor"
+        )
+        enemy = make_enemy_block(x=3, y=0, damage=0, block_id="staleEnemy")
+        enemy["enemy"].update({"defense": 1, "gold": 20_000, "experience": 0})
+        portal_b = make_block(
+            x=1, y=0, block_id="portalB", cls="terrains", trigger="changeFloor"
+        )
+        current = Observation.model_validate(make_observation(
+            width=4, height=1, x=0, y=0, map_instance_id="A", floor_id="A",
+            blocks=[portal_a, enemy],
+        ))
+        remote = Observation.model_validate(make_observation(
+            width=2, height=1, x=0, y=0, map_instance_id="B", floor_id="B",
+            blocks=[portal_b],
+        ))
+        labels = {}
+        for portal in (portal_a, portal_b):
+            label = BlockLabel(
+                id=portal["id"], cls=portal["cls"], trigger=portal["trigger"],
+                category="stair", passable=False, boundary=True, fast_path=False,
+            )
+            labels[label.identity] = label
+        enemy_label = BlockLabel(
+            id=enemy["id"], cls=enemy["cls"], trigger=enemy["trigger"],
+            category="enemy", passable=False, boundary=True, fast_path=False,
+        )
+        labels[enemy_label.identity] = enemy_label
+
+        result, exhausted = Planner(planning_budget=32)._world_search(
+            current,
+            labels,
+            {
+                "map_facts": [map_fact(current), map_fact(remote)],
+                "transitions": [
+                    {
+                        "from_map_instance_id": "A", "to_map_instance_id": "B",
+                        "from_x": 1, "from_y": 0, "to_x": 0, "to_y": 0,
+                    },
+                    {
+                        "from_map_instance_id": "B", "to_map_instance_id": "A",
+                        "from_x": 1, "from_y": 0, "to_x": 2, "to_y": 0,
+                    },
+                ],
+            },
+        )
+
+        self.assertFalse(exhausted)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.first.boundary.block.id, "portalA")
+        self.assertLess(result.score, 1000.0)
+
+    def test_world_search_live_root_enemy_is_a_terminal_atomic_candidate(self) -> None:
+        enemy = make_enemy_block(x=1, y=0, damage=10, block_id="liveEnemy")
+        enemy["enemy"].update({"defense": 1, "gold": 5, "experience": 4})
+        observation = Observation.model_validate(make_observation(
+            width=2, height=1, x=0, y=0, map_instance_id="A", floor_id="A",
+            blocks=[enemy],
+        ))
+        label = BlockLabel(
+            id=enemy["id"], cls=enemy["cls"], trigger=enemy["trigger"],
+            category="enemy", passable=False, boundary=True, fast_path=False,
+        )
+
+        result, exhausted = Planner(planning_budget=32)._world_search(
+            observation, {label.identity: label},
+            {"map_facts": [map_fact(observation)], "transitions": []},
+        )
+
+        self.assertFalse(exhausted)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.first.boundary.block.id, "liveEnemy")
+        self.assertEqual(result.path_length, 1)
 
     def test_unknown_exit_is_opaque_and_never_scores_resource_behind_it(self) -> None:
         stair = make_block(x=1, y=0, block_id="upFloor", cls="terrains", trigger="changeFloor")

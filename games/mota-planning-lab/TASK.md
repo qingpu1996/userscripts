@@ -1,6 +1,6 @@
 # 魔塔规划实验室运行态代理：实施规划
 
-> v2 状态（2026-07-14）：`196/196` 当前运行态权威重构后的真实序章测试发现，可绕开的已登记 unsupported NPC 会被错误当作全局否决。本轮把 unsupported 收紧为不可穿越 frontier：存在其他合法 supported 进展时跳过，只有没有合法进展时才确定性暂停；unknown/damage/incomplete 等硬门禁保持 fail closed。完成后仍须由主会话派发全新只读验收。下方 v0.1 章节仅作历史原型记录。
+> v2 状态（2026-07-14）：真实 MT1 现场证明 H5 引擎会用 `getDamage=null` 表示英雄当前无法穿透怪物防御，而不是怪物模型缺失。本轮取消本地怪物模型假设：每轮以当前坐标的 `getEnemyInfo/getDamage` 和当前 hero.attack 为权威，严格归一字段别名，把可解释的不可战斗怪物作为阻挡 frontier；真正无法解释的伤害仍 fail closed。完成后仍须由主会话派发全新只读验收。下方 v0.1 章节仅作历史原型记录。
 
 ## Protocol v2 重构任务
 
@@ -125,6 +125,33 @@
 - [x] **F270 已执行动作恢复**：黄门消失、位置改变、`yellowKey` 从 `1` 删除的 fresh observation 归一为 `yellow=0`，`keys.yellow=-1 + removed_blocks` 可补记 completed/ack；reconnect/reload 不重放引擎 API。
 - [x] **F271 完整离线 QA 与证据**：定向红灯、完整 JS/Python/integration、协议/schema、compile/syntax、双 dist 确定性、Acorn 静态盲玩、docs/JSON、diff 与隔离 prospective index 全绿；证据位于 `qa/runs/2026-07-14-zero-key-omission-recovery/`。
 - [ ] **F272 全新只读验收**：由主会话在本修复 Agent 结束后新建未参与修复的只读验收 Agent；本 Agent 不自验替代。
+
+## 当前怪物实时语义与换层恢复
+
+- [x] **F273 红灯复现**：真实 `exp` 字段被旧 adapter 丢失、可解释的 null/`???` 被 observation 全局拒绝、MT0→MT1 completed observation 无法形成的 synthetic 测试在实现前失败并保留证据。
+- [x] **F274 字段严格归一**：当前坐标 `getEnemyInfo` 支持 `atk/attack`、`def/defense`、`money/gold`、`exp/experience`；同字段双别名同值通过，冲突或显式非法值 fail closed；`special:0` 归一为空数组。显式 own-property 非法值与缺席的严格区分由 F282 补强。
+- [x] **F275 实时不可战斗语义**：仅当当前 `hero.attack <= enemy.defense` 时，null/`???` 解释为本轮 `known_unfightable`；它仍是不可穿越边界，不进入战斗候选，但不会否决独立资源、门、楼梯或可战怪。下一轮重新读取，不保存旧结论；历史 map fact 的 enemy stats 只作审计。仅按“非当前 map”排除 future combat 的不足由 F281 补强。
+- [x] **F276 真未知伤害证据**：当前攻击已能穿透、defense 缺失、别名冲突、非法属性或其他无法解释情形继续 `UNKNOWN_DAMAGE / DAMAGE_UNEXPLAINED`，证据含坐标、identity、raw damage、当前怪物字段和 hero attack。
+- [x] **F277 换层 pending/ack**：进入含可解释不可战斗怪物的新 map 后，合法 observation 先结算旧楼梯 action，决策日志按 `action_completed → completed_action_acknowledged` 排序；刷新、重连和服务重启不重放、不签第二个 action。
+- [x] **F278 完整离线 QA 与证据**：`108 JS + 103 Python + 1 integration = 212/212`；协议/schema、compile/syntax、双 dist 确定性、Acorn 静态盲玩、docs/JSON、diff 与隔离 prospective index 全绿，证据位于 `qa/runs/2026-07-14-live-enemy-semantics/`。
+- [x] **F279 首轮全新只读验收（未放行）**：验收发现 world search 在同图资源后及 A→B→A 后仍消费旧战损，以及显式 alias `undefined` 被当作缺席；结论不可以交付，进入下列整改。
+
+## 怪物事实 root-live-only 验收整改
+
+- [x] **F280 验收反例红灯**：`redGem → enemy`、非攻击资源 → enemy、A→B→A 另一入口 → enemy 与 `atk/def/exp/money:undefined` 在修复前稳定失败并保留输出。
+- [x] **F281 root-live-only terminal**：只有 untouched live root 可使用本轮 enemy facts；直接可达可战怪是一个终端原子候选，任何资源、门、楼梯、战斗、地图切换或返回后的节点都不得模拟旧战损或收益。
+- [x] **F282 alias 存在性门禁**：optional alias 只有全部 own property 缺席才归一 null；显式 `undefined/null/NaN/Infinity`、字符串、非整数和负数均 `ENGINE_API_INCOMPATIBLE / INVALID_RUNTIME_FIELD`，双别名同值/冲突语义保持。
+- [x] **F283 恢复与盲玩回归**：known_unfightable、真正未知 damage、takeover scan、MT0→MT1 completed/ack、浏览器和服务重启零重放、单边界与静态盲玩门禁继续通过。
+- [x] **F284 完整离线 QA 与证据**：`108 JS + 107 Python + 1 integration = 216/216`；协议/schema、compile/syntax、双 dist 确定性、Acorn 静态盲玩、docs/JSON、diff 与隔离 prospective index 全绿，证据位于 `qa/runs/2026-07-14-live-enemy-root-only-followup/`。
+- [ ] **F285 整改后全新只读验收**：由主会话新建未参与本轮修复的只读验收 Agent；本 Agent 不自验替代。
+
+## getDamage undefined fail-closed 验收整改
+
+- [x] **F286 第二轮验收反例红灯**：`getDamage()` 返回 `undefined` 且 `hero.attack <= enemy.defense` 时，旧逻辑把它归一为 null 并误判 known-unfightable；定向测试在修复前稳定失败。
+- [x] **F287 damage 严格值域门禁**：只有有限非负整数、严格 null 和字符串 `???` 属于可解释输入；其中仅严格 null/`???` 可在实时攻防不穿透时成为 known-unfightable。`undefined`、NaN、Infinity、负数、非整数、其他字符串、对象和布尔值均在浏览器采集边界 `UNKNOWN_DAMAGE / DAMAGE_UNEXPLAINED` 暂停。
+- [x] **F288 原始证据与 wire 边界**：非法 damage 的暂停证据保留坐标、identity、`raw_damage` 类型、hero attack、enemy defense 和当前怪物字段；controller 在采集失败后零 localhost 请求、零行动，服务不会接收被静默转成 null 的 undefined。
+- [x] **F289 完整离线 QA 与证据**：`111 JS + 108 Python + 1 integration = 220/220`；协议/schema、compile/syntax、双 dist 确定性、Acorn 静态盲玩、docs/JSON、diff 与隔离 prospective index 全绿，证据位于 `qa/runs/2026-07-14-damage-undefined-fail-closed/`。
+- [ ] **F290 整改后全新只读验收**：由主会话新建未参与本轮修复的只读验收 Agent；本 Agent 不自验替代。
 
 ## v0.1 历史原型记录（不适用于 v2 运行逻辑）
 

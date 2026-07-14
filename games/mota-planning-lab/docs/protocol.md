@@ -39,6 +39,10 @@
 
 当前动态 map 同时提供 `dimensions` 与 `grid` 时，两者必须联合校验：完整无洞且每行等长才可确认为 `rectangle`；空行、缺尾行、短行或稀疏洞必须降为从实际 grid 单元推导的 `valid_cells`；grid 越界或显式 valid cells 与 grid 冲突则拒绝观察。不能因声明了 dimensions 就把 ragged grid 补成矩形。
 
+怪物字段只来自本轮当前层当前坐标的 `getEnemyInfo/getDamage`。adapter 严格归一 `atk/attack`、`def/defense`、`money/gold`、`exp/experience`：同一语义的双别名同值可接受，冲突 fail closed；attack/defense 双别名都完全缺席时协议允许归一为 null，gold/experience 缺席仍不合法。任一别名作为 own property 显式存在但值为 `undefined/null/NaN/Infinity`、字符串、非整数或负数时，立即暂停 `ENGINE_API_INCOMPATIBLE / INVALID_RUNTIME_FIELD`，不能借 optional null 规则吞掉；`special:0` 表示无特殊并归一为 `[]`。协议不增加持久 `fightable` 字段：服务由本轮 `hero.attack + enemy.defense + damage` 推导。有限非负整数 damage 是本轮引擎战损真值；只有原始返回值严格等于 `null` 或字符串 `"???"`，且 `hero.attack <= enemy.defense`，才是可解释的当前不可战斗边界。`undefined`、NaN、Infinity、负数、非整数、其他字符串、对象和布尔值一律在浏览器采集边界暂停 `UNKNOWN_DAMAGE / DAMAGE_UNEXPLAINED`，保留安全标量化 raw evidence，且不得进入 localhost wire；不能先归一为 null 再套用不可战斗解释。
+
+enemy combat fact 的有效域比 map fact 更窄：仅本轮原始 live root 可使用，且只能产生一个终端原子候选。任何已模拟边界都会使旧 enemy stats/damage 失效；同一 map id 上的资源后继和跨图返回都不能重新消费，必须等待新的 observation。历史 enemy 字段仍可留作审计，但不进入 future-state 数值模拟。
+
 `source=engine_current_map/confidence=confirmed` 表示当前 map 明确声明；`runtime_observed/inferred` 表示只从当前动态 grid 形状推导。无法可靠解释时暂停，不猜测未到达区域。
 
 ## Map identity
@@ -70,6 +74,8 @@ operations 最多两段，末段最多一个状态变化边界。所有坐标必
 execute、pause、idle 可携带 `scan_state`：phase、anchor/current map instance、已扫描实例、pending/traversed/frontier 数量与原因。字段可省略但不能为 null，浏览器 parser、Schema 和 Pydantic 共同严格校验。
 
 服务成功结算请求中的 `completed_action_id` 时，不在同一响应签发下一行动，而返回独立 `idle`，并携带完全相同的 `acknowledged_action_id`。该字段可省略但不能为 null；浏览器只有在 status/identity 都匹配时才清除 pending 并记录 ack。
+
+新 map observation 中存在可解释的当前不可战斗怪物不影响这条顺序：浏览器仍先发送旧 action 的 `completed_action_id`，服务事务性校验 change-map delta 并记录 `action_completed`，随后返回 ack；只有下一 cycle 才根据新现场重新规划。刷新或重连不会因为怪物 damage 为 null 而重放楼梯 action。
 
 ## Transition 与恢复
 

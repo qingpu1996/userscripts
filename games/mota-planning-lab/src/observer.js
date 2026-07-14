@@ -56,7 +56,7 @@ MotaLab.runtimeScalarEvidence = function runtimeScalarEvidence(value) {
 
 MotaLab.normalizeObservedDamage = function normalizeObservedDamage(value) {
   if (value === "???") return value;
-  return MotaLab.isFiniteInteger(value) ? value : null;
+  return MotaLab.isFiniteInteger(value) && value >= 0 ? value : null;
 };
 
 MotaLab.enemyEvidence = function enemyEvidence(enemy) {
@@ -208,13 +208,6 @@ MotaLab.collectObservation = function collectObservation(adapter, now = Date.now
     const normalizedDamage = isEnemy ? MotaLab.normalizeObservedDamage(raw.damage) : null;
     let normalizedEnemy = null;
     let issue = null;
-    if (isEnemy && (!MotaLab.isFiniteInteger(raw.damage) || raw.damage < 0)) {
-      issue = {
-        pause_kind: "UNKNOWN_DAMAGE",
-        detail_code: raw.damage === null || raw.damage === undefined || raw.damage === "???"
-          ? "DAMAGE_NULL" : "DAMAGE_UNEXPLAINED",
-      };
-    }
     if (isEnemy) {
       try {
         normalizedEnemy = MotaLab.normalizeEnemy(raw.enemy, raw);
@@ -225,6 +218,35 @@ MotaLab.collectObservation = function collectObservation(adapter, now = Date.now
           detail_code: error.detail_code,
           field: error.details && error.details.field,
         };
+      }
+      if (raw.enemy_issue) {
+        issue = {
+          pause_kind: "UNKNOWN_DAMAGE",
+          detail_code: "DAMAGE_UNEXPLAINED",
+          field: raw.enemy_issue.field || null,
+          runtime_issue: raw.enemy_issue,
+        };
+      }
+      if (!MotaLab.isFiniteInteger(raw.damage) || raw.damage < 0) {
+        // Only the engine's two documented unknown-damage sentinels may be
+        // explained by an impenetrable defense.  In particular, JavaScript
+        // undefined means the runtime API did not produce a protocol value;
+        // treating it as null would silently turn an API failure into a safe
+        // planning fact.
+        const engineReportedUnknown = raw.damage === null || raw.damage === "???";
+        const knownUnfightable = engineReportedUnknown
+          && normalizedEnemy !== null
+          && MotaLab.isFiniteInteger(normalizedEnemy.defense)
+          && hero.attack <= normalizedEnemy.defense
+          && !raw.enemy_issue;
+        if (!knownUnfightable) {
+          issue = issue || {
+            pause_kind: "UNKNOWN_DAMAGE",
+            detail_code: "DAMAGE_UNEXPLAINED",
+            hero_attack: hero.attack,
+            enemy_defense: normalizedEnemy === null ? null : normalizedEnemy.defense,
+          };
+        }
       }
     }
     const normalizedBlock = {
@@ -243,6 +265,12 @@ MotaLab.collectObservation = function collectObservation(adapter, now = Date.now
       collectionIssues.push(Object.assign(issue, {
         block: MotaLab.blockEvidence(raw, normalizedDamage),
         raw_enemy: MotaLab.enemyEvidence(raw.enemy),
+        raw_enemy_aliases: raw.enemy_raw_evidence || null,
+        runtime_issue: issue.runtime_issue || null,
+        hero_attack: issue.hero_attack === undefined ? hero.attack : issue.hero_attack,
+        enemy_defense: issue.enemy_defense === undefined
+          ? normalizedEnemy === null ? null : normalizedEnemy.defense
+          : issue.enemy_defense,
         normalized: {
           damage: normalizedBlock.damage,
           enemy: normalizedBlock.enemy,
@@ -306,6 +334,8 @@ MotaLab.collectObservation = function collectObservation(adapter, now = Date.now
       {
         block: primary.block,
         field: primary.field || null,
+        hero_attack: primary.hero_attack,
+        enemy_defense: primary.enemy_defense,
         collection_issues: collectionIssues,
       },
     );

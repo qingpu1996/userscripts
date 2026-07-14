@@ -773,19 +773,93 @@
       }
       const info = runtime.getEnemyInfo(block.id, null, block.x, block.y, floorId);
       const damage = runtime.getDamage(block.id, block.x, block.y, floorId);
-      const special = info && Array.isArray(info.special)
-        ? info.special.filter((value) => ["string", "number"].includes(typeof value))
-        : [];
+      if (!info || typeof info !== "object" || Array.isArray(info)) {
+        return { damage, enemy: null, enemy_issue: null, enemy_raw_evidence: null };
+      }
+
+      const scalarEvidence = (value) => {
+        if (value === null || typeof value === "boolean") return value;
+        if (typeof value === "string") return value.slice(0, 256);
+        if (typeof value === "number") {
+          return Number.isFinite(value) ? value : { type: "number", value: String(value) };
+        }
+        if (value === undefined) return { type: "undefined", value: null };
+        return { type: typeof value, value: Object.prototype.toString.call(value).slice(0, 128) };
+      };
+      let enemyIssue = null;
+      function readAliases(names, field) {
+        const present = names.filter((name) => Object.prototype.hasOwnProperty.call(info, name));
+        if (present.length === 0) return null;
+        const invalid = present.find((name) => (
+          !MotaLab.isFiniteInteger(info[name]) || info[name] < 0
+        ));
+        if (invalid !== undefined) {
+          throw MotaLab.createPauseError(
+            "ENGINE_API_INCOMPATIBLE",
+            "INVALID_RUNTIME_FIELD",
+            {
+              field,
+              alias: invalid,
+              valueType: typeof info[invalid],
+              value: scalarEvidence(info[invalid]),
+            },
+          );
+        }
+        const first = info[present[0]];
+        if (present.some((name) => !Object.is(info[name], first))) {
+          enemyIssue = enemyIssue || {
+            field,
+            reason: "CONFLICTING_RUNTIME_ALIASES",
+            aliases: Object.fromEntries(present.map((name) => [name, scalarEvidence(info[name])])),
+          };
+          return null;
+        }
+        return first;
+      }
+      function readSpecial() {
+        if (!Object.prototype.hasOwnProperty.call(info, "special")
+          || info.special === null || info.special === 0) return [];
+        const values = Array.isArray(info.special) ? info.special : [info.special];
+        if (values.length > 64 || values.some((value) => (
+          typeof value !== "string" && !MotaLab.isFiniteInteger(value)
+        ))) {
+          enemyIssue = enemyIssue || {
+            field: "enemy.special",
+            reason: "INVALID_RUNTIME_FIELD",
+            value: scalarEvidence(info.special),
+          };
+          return [];
+        }
+        return values.slice();
+      }
+      const attack = readAliases(["atk", "attack"], "enemy.attack");
+      const defense = readAliases(["def", "defense"], "enemy.defense");
+      const gold = readAliases(["money", "gold"], "enemy.gold");
+      const experience = readAliases(["exp", "experience"], "enemy.experience");
+      const special = readSpecial();
       return {
         damage,
-        enemy: info && typeof info === "object" ? {
+        enemy: {
           hp: info.hp === undefined ? null : info.hp,
-          attack: info.atk !== undefined ? info.atk : info.attack === undefined ? null : info.attack,
-          defense: info.def !== undefined ? info.def : info.defense === undefined ? null : info.defense,
-          gold: info.money !== undefined ? info.money : info.gold === undefined ? null : info.gold,
-          experience: info.experience === undefined ? null : info.experience,
+          attack,
+          defense,
+          gold,
+          experience,
           special,
-        } : null,
+        },
+        enemy_issue: enemyIssue,
+        enemy_raw_evidence: {
+          hp: scalarEvidence(info.hp),
+          atk: scalarEvidence(info.atk),
+          attack: scalarEvidence(info.attack),
+          def: scalarEvidence(info.def),
+          defense: scalarEvidence(info.defense),
+          money: scalarEvidence(info.money),
+          gold: scalarEvidence(info.gold),
+          exp: scalarEvidence(info.exp),
+          experience: scalarEvidence(info.experience),
+          special: scalarEvidence(info.special),
+        },
       };
     }
 
@@ -1008,7 +1082,7 @@
 
   MotaLab.normalizeObservedDamage = function normalizeObservedDamage(value) {
     if (value === "???") return value;
-    return MotaLab.isFiniteInteger(value) ? value : null;
+    return MotaLab.isFiniteInteger(value) && value >= 0 ? value : null;
   };
 
   MotaLab.enemyEvidence = function enemyEvidence(enemy) {
@@ -1160,13 +1234,6 @@
       const normalizedDamage = isEnemy ? MotaLab.normalizeObservedDamage(raw.damage) : null;
       let normalizedEnemy = null;
       let issue = null;
-      if (isEnemy && (!MotaLab.isFiniteInteger(raw.damage) || raw.damage < 0)) {
-        issue = {
-          pause_kind: "UNKNOWN_DAMAGE",
-          detail_code: raw.damage === null || raw.damage === undefined || raw.damage === "???"
-            ? "DAMAGE_NULL" : "DAMAGE_UNEXPLAINED",
-        };
-      }
       if (isEnemy) {
         try {
           normalizedEnemy = MotaLab.normalizeEnemy(raw.enemy, raw);
@@ -1177,6 +1244,35 @@
             detail_code: error.detail_code,
             field: error.details && error.details.field,
           };
+        }
+        if (raw.enemy_issue) {
+          issue = {
+            pause_kind: "UNKNOWN_DAMAGE",
+            detail_code: "DAMAGE_UNEXPLAINED",
+            field: raw.enemy_issue.field || null,
+            runtime_issue: raw.enemy_issue,
+          };
+        }
+        if (!MotaLab.isFiniteInteger(raw.damage) || raw.damage < 0) {
+          // Only the engine's two documented unknown-damage sentinels may be
+          // explained by an impenetrable defense.  In particular, JavaScript
+          // undefined means the runtime API did not produce a protocol value;
+          // treating it as null would silently turn an API failure into a safe
+          // planning fact.
+          const engineReportedUnknown = raw.damage === null || raw.damage === "???";
+          const knownUnfightable = engineReportedUnknown
+            && normalizedEnemy !== null
+            && MotaLab.isFiniteInteger(normalizedEnemy.defense)
+            && hero.attack <= normalizedEnemy.defense
+            && !raw.enemy_issue;
+          if (!knownUnfightable) {
+            issue = issue || {
+              pause_kind: "UNKNOWN_DAMAGE",
+              detail_code: "DAMAGE_UNEXPLAINED",
+              hero_attack: hero.attack,
+              enemy_defense: normalizedEnemy === null ? null : normalizedEnemy.defense,
+            };
+          }
         }
       }
       const normalizedBlock = {
@@ -1195,6 +1291,12 @@
         collectionIssues.push(Object.assign(issue, {
           block: MotaLab.blockEvidence(raw, normalizedDamage),
           raw_enemy: MotaLab.enemyEvidence(raw.enemy),
+          raw_enemy_aliases: raw.enemy_raw_evidence || null,
+          runtime_issue: issue.runtime_issue || null,
+          hero_attack: issue.hero_attack === undefined ? hero.attack : issue.hero_attack,
+          enemy_defense: issue.enemy_defense === undefined
+            ? normalizedEnemy === null ? null : normalizedEnemy.defense
+            : issue.enemy_defense,
           normalized: {
             damage: normalizedBlock.damage,
             enemy: normalizedBlock.enemy,
@@ -1258,6 +1360,8 @@
         {
           block: primary.block,
           field: primary.field || null,
+          hero_attack: primary.hero_attack,
+          enemy_defense: primary.enemy_defense,
           collection_issues: collectionIssues,
         },
       );

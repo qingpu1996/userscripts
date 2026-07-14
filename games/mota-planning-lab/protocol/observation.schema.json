@@ -143,7 +143,7 @@
         "no_pass": {"type": "boolean"},
         "damage": {
           "anyOf": [
-            {"type": "integer"},
+            {"type": "integer", "minimum": 0},
             {"const": "???"},
             {"type": "null"}
           ]

@@ -1120,3 +1120,108 @@ test("黄钥匙归零字段被 canonical tools 省略后，刷新重连只补记
   assert.equal(reloadedRequests[0].recovery.phase, "none");
   assert.equal(afterRuntime.calls.direct.length + afterRuntime.calls.route.length, 0);
 });
+
+test("换层后出现实时可解释的不可战斗怪物仍先完成 pending/ack 且重连零重放", async () => {
+  const stair = {
+    x: 1, y: 0, id: 88,
+    event: { id: "upFloor", cls: "terrains", trigger: "changeFloor", noPass: true },
+  };
+  const enemy = {
+    x: 0, y: 0, id: 201,
+    event: { id: "blackSlime", cls: "enemy48", trigger: "battle", noPass: true },
+  };
+  const beforeRuntime = makePoisonCore({
+    floorId: "MT0",
+    currentMap: { title: "0F", width: 2, height: 1 },
+    blocks: [stair],
+    hero: {
+      hp: 1000, atk: 10, def: 10, money: 0, exp: 0,
+      loc: { x: 0, y: 0, direction: "right" },
+      items: { tools: { blueKey: 1, redKey: 1 } },
+    },
+  });
+  const afterRuntime = makePoisonCore({
+    floorId: "MT1",
+    currentMap: { title: "1F", width: 2, height: 1 },
+    blocks: [enemy],
+    damage: { blackSlime: null },
+    enemyInfo: {
+      blackSlime: { hp: 200, atk: 35, def: 10, money: 5, exp: 5, special: 0 },
+    },
+    hero: {
+      hp: 1000, atk: 10, def: 10, money: 0, exp: 0,
+      loc: { x: 1, y: 0, direction: "up" },
+      items: { tools: { blueKey: 1, redKey: 1 } },
+    },
+  });
+  const beforeAdapter = lab.createEngineAdapter(beforeRuntime.scope);
+  const afterAdapter = lab.createEngineAdapter(afterRuntime.scope);
+  const before = lab.collectObservation(beforeAdapter, () => 1);
+  before.session_id = "SESSION-SYNTHETIC-0001";
+  const actionId = "AUTO-0000000000000002";
+  const storage = lab.createMemoryStorage();
+  const setup = lab.createJournal(storage);
+  establishTestSession(setup, before);
+  setup.setPending({
+    action_id: actionId,
+    pre_fingerprint: lab.fingerprintObservation(before),
+    pre_observation: before,
+    expected_delta: { map_instance_id: null },
+    allow_unknown_floor: true,
+    allow_unknown_map_instance: true,
+    requires_non_position_change: true,
+    operations: [{ type: "grid", x: 1, y: 0 }],
+    phase: "prepared",
+  });
+
+  const requests = [];
+  const restarted = lab.createController({
+    adapter: afterAdapter,
+    journal: lab.createJournal(storage),
+    registry: lab.createBlockRegistry(),
+    client: { isConnected: () => true, async postCycle(request) {
+      requests.push(request);
+      return {
+        status: "idle", reason: "change-map recovery accepted",
+        acknowledged_action_id: actionId, registry_entries: [],
+      };
+    } },
+    panel: makePanel(),
+    observe: () => lab.collectObservation(afterAdapter, () => 2),
+    logger: { error() {} },
+  });
+  const recovered = await restarted.reconnectOnly();
+  assert.equal(recovered.connected, true);
+  assert.equal(recovered.executed, false);
+  assert.equal(requests[0].completed_action_id, actionId);
+  assert.equal(requests[0].recovery.phase, "completed");
+  assert.equal(requests[0].observation.floor_id, "MT1");
+  assert.equal(requests[0].observation.blocks[0].damage, null);
+  assert.equal(requests[0].observation.blocks[0].enemy.defense, 10);
+  assert.equal(requests[0].observation.blocks[0].enemy.experience, 5);
+  assert.equal(afterRuntime.calls.direct.length + afterRuntime.calls.route.length, 0);
+
+  const durable = lab.createJournal(storage).snapshot();
+  assert.equal(durable.pending_action, null);
+  assert.equal(durable.last_completed_action.action_id, actionId);
+  assert.equal(durable.last_acknowledged_action_id, actionId);
+
+  const reloadedRequests = [];
+  const reloaded = lab.createController({
+    adapter: afterAdapter,
+    journal: lab.createJournal(storage),
+    registry: lab.createBlockRegistry(),
+    client: { isConnected: () => true, async postCycle(request) {
+      reloadedRequests.push(request);
+      return { status: "idle", reason: "already acknowledged", registry_entries: [] };
+    } },
+    panel: makePanel(),
+    observe: () => lab.collectObservation(afterAdapter, () => 3),
+    logger: { error() {} },
+  });
+  const repeated = await reloaded.reconnectOnly();
+  assert.equal(repeated.executed, false);
+  assert.equal(reloadedRequests[0].completed_action_id, null);
+  assert.equal(reloadedRequests[0].recovery.phase, "none");
+  assert.equal(afterRuntime.calls.direct.length + afterRuntime.calls.route.length, 0);
+});

@@ -74,3 +74,7 @@ completed action 的 pre/post map instance 不同才建立 transition，同 floo
 暂停会停止自动路线、关闭 autopilot、保存完整当前 observation 和结构化 evidence。未知对象、伤害、交互、guard、差分、API、session 和规划预算都 fail closed。只有用户明确启动或重连才能离开暂停态。
 
 普通规划中的已登记 unsupported boundary 先作为不可穿越 frontier 留在图中。存在其他独立可达、标签完整且资源可承担的 supported 候选时不会进入 `PAUSED`；没有合法 supported 进展而仍有可达 unsupported 时，才进入 `UNSUPPORTED_INTERACTION / UNSUPPORTED_REGISTERED_INTERACTION`。这不改变 unknown block、unknown damage、incomplete label、busy、guard、recovery 或 delta 的优先 fail-closed 行为。
+
+当前怪物 damage 原始值严格为 null/`???` 时先用同一 observation 的 `hero.attack` 与该坐标 `enemy.defense` 分类。若攻击不能穿透，它只是本轮 `known_unfightable` 阻挡：不进入 `PAUSED`、不穿越、不签战斗 action；没有其他进展时返回明确 idle。hero 攻击变化后的下一轮必须重新读取 `getEnemyInfo/getDamage` 并重新分类，不沿用 journal、SQLite snapshot 或旧派生结果。攻击已能穿透、defense 缺失/非法或字段冲突等无法解释情况进入 `UNKNOWN_DAMAGE / DAMAGE_UNEXPLAINED`；`undefined` 和其他非协议 damage 不参与攻防解释，采集侧直接 fail closed。
+
+world-search 状态机把 live root 与所有 simulated node 明确分开。只有 `depth=0 + 无 first action + live map/position/resources + removed 为空` 的 root 能读取本轮战斗事实；enemy 候选写入排名后立刻终止该分支。任何非 root 节点（包括同图拾取后和 A→B→A 返回）都不能模拟 enemy outcome，必须先进入 `EXECUTING -> SETTLING -> REPORTING`，再由下一轮 `OBSERVING` 取得新战损。

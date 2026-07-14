@@ -4,6 +4,8 @@
 
 浏览器唯一运行态入口是 `src/engine-adapter.js`。每轮先读取当前 floorId，之后只读取 hero 白名单、`status.maps[currentFloorId]`、`getMapBlocksObj(currentFloorId,true)` 和当前可见怪物坐标的 enemy info/damage。dimensions 与 valid cells 只从这一个当前动态 map 获得。
 
+怪物属性不建立本地数据库。`atk/attack`、`def/defense`、`money/gold`、`exp/experience` 只在本次同步采集内严格归一；own property 显式非法不能伪装成缺席，别名冲突、非法值和无法解释的 damage 均 fail closed。只有 `getDamage()` 原始返回严格 null/`???` 且可由当前 hero 攻击不穿透当前 enemy 防御解释时，才仅形成不可穿越边界；`undefined` 等非协议值保留 raw evidence 后在采集边界暂停，不发送给服务，不触发攻略查询、历史 stats 回填或人工“模型补全”。历史 observation 中为审计保留的 enemy 字段不参与任何 simulated node 的战斗数值；只有 untouched live root 的直接战斗可作为终端候选，同图状态变化或 A→B→A 后也必须等 fresh observation。
+
 同一次采集在读取 map/blocks/怪物前后核对当前 floor、hero/keys/位置和最小 busy 围栏；不一致则整份丢弃，不会混合两个时刻。钥匙必须来自已登记布局：canonical `hero.items.tools` 容器存在时，只有被引擎省略的零计数字段按 `0` 归一；其他容器残缺、显式非法值、别名冲突或多布局冲突不会用零兜底。
 
 禁止读取 floor catalogue、非 current map、完整 maps、全量素材、工程地图源码、存档原文、攻略或路线资料。出口后的布局保持 opaque，只有英雄正常转移进入后才采集。

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from collections import deque
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
-from .combat import UnknownDamage, combat_outcome
+from .combat import UnknownDamage, combat_availability, combat_outcome
 from .guards import guard_from_observation
 from .models import (
     BlockLabel,
@@ -651,7 +651,10 @@ class Planner:
         Each simulated boundary is consumed before reachability is rebuilt.  A
         cross-map step is possible only through a transition that was recorded
         from a real completed action.  The returned action is still only the
-        first atomic boundary of the best audited path.
+        first atomic boundary of the best audited path.  Enemy facts are the
+        exception: they may be consumed only from the untouched live root and
+        are terminal, because any simulated state change invalidates the live
+        combat panel even when the search later returns to the same map id.
         """
         facts = self._world_facts(observation, world_context)
         transitions: Dict[Tuple[str, int, int], List[Mapping[str, Any]]] = {}
@@ -689,13 +692,26 @@ class Planner:
             fact = facts.get(map_id)
             if fact is None:
                 continue
-            simulated = self._state_observation(
+            live_root = (
+                depth == 0
+                and first is None
+                and map_id == observation.map_instance_id
+                and position == initial_position
+                and resources == initial_resources
+                and not removed
+            )
+            simulated = observation if live_root else self._state_observation(
                 fact, observation, resources, position, removed
             )
             graph = CurrentFloorGraph(simulated, labels)
             for boundary in graph.reachable_boundaries():
                 label = boundary.label
                 if not label.supported or block_label_execution_error(label) is not None:
+                    continue
+                if label.category == "enemy" and not live_root:
+                    # Historical combat facts are audit-only.  This also
+                    # rejects same-map resource/door changes and A->B->A
+                    # returns: map identity alone never restores freshness.
                     continue
                 try:
                     expected = self._expected_for(boundary)
@@ -724,6 +740,11 @@ class Planner:
                 path_length = depth + 1
                 if best is None or (next_score, -path_length) > (best.score, -best.path_length):
                     best = WorldSearchResult(first_candidate, next_score, explored, path_length)
+
+                if label.category == "enemy":
+                    # A live combat boundary is one atomic terminal candidate.
+                    # Its outcome cannot authorize any simulated successor.
+                    continue
 
                 transition_rows = transitions.get(
                     (map_id, boundary.block.x, boundary.block.y), []
@@ -772,14 +793,17 @@ class Planner:
                 registry_entries,
             )
 
-        # Unknown/invalid damage anywhere on the currently visible floor must
-        # stop before route ranking, even when another candidate looks cheaper.
+        # Only genuinely unexplained damage is a floor-wide hard gate.  An
+        # engine null/??? explained by the fresh live attack being unable to
+        # penetrate this coordinate's fresh defense is an ordinary blocked
+        # frontier and must not veto independent progress.
+        known_unfightable_coordinates = set()
         for block in observation.blocks:
             label = labels[(block.id, block.cls, block.trigger)]
             if label.category != "enemy":
                 continue
             try:
-                combat_outcome(block)
+                availability = combat_availability(block, observation.hero.attack)
             except UnknownDamage as exc:
                 return self._pause(
                     PauseKind.UNKNOWN_DAMAGE,
@@ -794,8 +818,12 @@ class Planner:
                         "trigger": block.trigger,
                         "numeric_id": block.numeric_id,
                         "damage": block.damage,
+                        "enemy": None if block.enemy is None else block.enemy.model_dump(mode="json"),
+                        "hero_attack": observation.hero.attack,
                     },
                 )
+            if availability == "known_unfightable":
+                known_unfightable_coordinates.add((block.x, block.y))
 
         if scan_state is not None and scan_state.get("phase") != "complete":
             return self._plan_scan(
@@ -814,6 +842,11 @@ class Planner:
         planned: List[PlannedBoundary] = []
         for boundary in boundaries:
             label = boundary.label
+            if (
+                label.category == "enemy"
+                and (boundary.block.x, boundary.block.y) in known_unfightable_coordinates
+            ):
+                continue
             if not label.supported:
                 # An unsupported boundary is an impassable unresolved frontier,
                 # not a global veto.  CurrentFloorGraph already excludes it
@@ -868,6 +901,12 @@ class Planner:
         if not planned:
             if unsupported:
                 return self._pause_for_unsupported(unsupported, registry_entries)
+            if known_unfightable_coordinates:
+                return IdleResponse(
+                    status="idle",
+                    reason="当前可达 frontier 仅包含按实时攻防确认的当前不可战斗怪物；保持现场不行动。",
+                    registry_entries=registry_entries,
+                )
             return IdleResponse(
                 status="idle",
                 reason="当前已观察层没有可达的已知状态变化边界。",

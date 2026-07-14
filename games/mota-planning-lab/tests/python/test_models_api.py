@@ -112,6 +112,24 @@ class ProtocolModelTests(unittest.TestCase):
         self.assertEqual(parsed.hero.hp, 208)
         self.assertIsNone(parsed.blocks[0].enemy.attack)
 
+    def test_damage_is_required_and_rejects_non_protocol_wire_values(self) -> None:
+        explicit_null = make_block(x=1, y=0, damage=None)
+        self.assertIsNone(
+            Observation.model_validate(
+                make_observation(blocks=[explicit_null])
+            ).blocks[0].damage
+        )
+
+        omitted = make_block(x=1, y=0, damage=None)
+        del omitted["damage"]
+        with self.assertRaises(ValidationError):
+            Observation.model_validate(make_observation(blocks=[omitted]))
+
+        for invalid in (-1, 1.5, float("nan"), float("inf"), "50", True, {}, []):
+            block = make_block(x=1, y=0, damage=invalid)
+            with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
+                Observation.model_validate(make_observation(blocks=[block]))
+
     def test_field_aware_serializer_audits_all_required_nullable_request_fields(self) -> None:
         triggerless = make_block(
             x=1,

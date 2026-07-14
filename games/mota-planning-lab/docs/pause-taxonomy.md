@@ -8,7 +8,7 @@
 | pause_kind | 使用条件 | 典型 detail_code |
 | --- | --- | --- |
 | `NEW_OBJECT_OR_MECHANISM` | 新 block identity、trigger、NPC/机关，或边界标签缺少可验证 postcondition | `UNKNOWN_BLOCK`、`UNKNOWN_TRIGGER`、`UNKNOWN_NPC`、`UNKNOWN_MECHANISM`、`INCOMPLETE_LABEL` |
-| `UNKNOWN_DAMAGE` | 当前可见怪物 damage 为 null、`???`、非有限、负数或无法解释 | `DAMAGE_NULL`、`DAMAGE_UNEXPLAINED` |
+| `UNKNOWN_DAMAGE` | 当前可见怪物 damage 不是有限非负整数、严格 null 或 `???`，或 null/`???` 无法由本轮实时 hero attack 与当前坐标 enemy defense 解释 | `DAMAGE_UNEXPLAINED` |
 | `UNKNOWN_FLOOR` | 当前 floorId 尚无合法模型 | `FLOOR_MODEL_MISSING` |
 | `EXPECTED_DELTA_MISMATCH` | 实际资源/block/floor 差分不符，或恢复/ledger identity 无法安全解释 | `RESOURCE_DELTA_MISMATCH`、`RECOVERY_STATE_AMBIGUOUS`、`RECOVERY_JOURNAL_LEDGER_MISMATCH`、`RECONNECT_UNRESOLVED_ACTION` |
 | `GUARD_MISMATCH` | 行动前现场与 guard 不同；首次现场与用户基线不同 | `PRE_ACTION_GUARD_MISMATCH`、`INITIAL_BASELINE_MISMATCH` |
@@ -29,6 +29,8 @@
 - 已知楼层之间的返回路径。
 
 “当前没有正收益行动”可以返回 `idle`，但不能伪装成新 pause_kind。
+
+`hero.attack <= enemy.defense` 时引擎原始返回值严格为 null/`???` 才是已解释的“当前不可战斗”，不属于暂停：该 enemy 格仍阻挡全部路线与扫描，跳过战斗候选；若没有其他合法进展，返回明确 no-progress idle。攻击已能穿透或 defense 缺失时进入 `UNKNOWN_DAMAGE / DAMAGE_UNEXPLAINED`。`undefined` 不是 null：它与 NaN、Infinity、负数、非整数、其他字符串、对象和布尔值都进入同一 fail-closed 暂停，并在 `raw_damage` 保留原始类型；属性别名 own property 显式非法进入 `ENGINE_API_INCOMPATIBLE / INVALID_RUNTIME_FIELD`，别名冲突继续 fail closed。
 
 ## 统一暂停步骤
 

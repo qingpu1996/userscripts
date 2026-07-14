@@ -225,6 +225,294 @@ test("毒值运行时只读取当前层白名单并序列化 11x11 观察", () =
   assert.deepEqual(fake.calls.forbidden, []);
 });
 
+test("当前怪物字段别名严格归一且 exp 是实时经验字段", () => {
+  const block = {
+    x: 1, y: 0, id: 2,
+    event: { id: "greenSlime", cls: "enemy48", trigger: "battle", noPass: true },
+  };
+  const hero = {
+    hp: 1000, atk: 10, def: 10, money: 0, exp: 0,
+    loc: { x: 0, y: 0, direction: "right" },
+    items: { tools: { yellowKey: 0, blueKey: 1, redKey: 1 } },
+  };
+  const current = makePoisonCore({
+    hero,
+    blocks: [block],
+    damage: { greenSlime: 50 },
+    enemyInfo: {
+      greenSlime: { hp: 50, atk: 20, def: 1, money: 1, exp: 1, special: 0 },
+    },
+  });
+  const observed = lab.collectObservation(lab.createEngineAdapter(current.scope));
+  assert.deepEqual(JSON.parse(JSON.stringify(observed.blocks[0].enemy)), {
+    hp: 50, attack: 20, defense: 1, gold: 1, experience: 1, special: [],
+  });
+
+  const sameAliases = makePoisonCore({
+    hero,
+    blocks: [block],
+    damage: { greenSlime: 50 },
+    enemyInfo: {
+      greenSlime: {
+        hp: 50, atk: 20, attack: 20, def: 1, defense: 1,
+        money: 1, gold: 1, exp: 1, experience: 1, special: [0, "audit"],
+      },
+    },
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      lab.collectObservation(lab.createEngineAdapter(sameAliases.scope)).blocks[0].enemy.special,
+    )),
+    [0, "audit"],
+  );
+
+  for (const [field, info] of [
+    ["enemy.attack", { hp: 50, atk: 20, attack: 21, def: 1, money: 1, exp: 1 }],
+    ["enemy.defense", { hp: 50, atk: 20, def: 1, defense: 2, money: 1, exp: 1 }],
+    ["enemy.gold", { hp: 50, atk: 20, def: 1, money: 1, gold: 2, exp: 1 }],
+    ["enemy.experience", { hp: 50, atk: 20, def: 1, money: 1, exp: 1, experience: 2 }],
+  ]) {
+    const conflicting = makePoisonCore({
+      hero, blocks: [block], damage: { greenSlime: 50 }, enemyInfo: { greenSlime: info },
+    });
+    assert.throws(
+      () => lab.collectObservation(lab.createEngineAdapter(conflicting.scope)),
+      (error) => error.pause_kind === "UNKNOWN_DAMAGE"
+        && error.detail_code === "DAMAGE_UNEXPLAINED"
+        && error.details.collection_issues[0].field === field,
+      field,
+    );
+  }
+
+  const invalidExp = makePoisonCore({
+    hero,
+    blocks: [block],
+    damage: { greenSlime: 50 },
+    enemyInfo: {
+      greenSlime: { hp: 50, atk: 20, def: 1, money: 1, exp: "1", special: 0 },
+    },
+  });
+  assert.throws(
+    () => lab.collectObservation(lab.createEngineAdapter(invalidExp.scope)),
+    (error) => error.pause_kind === "ENGINE_API_INCOMPATIBLE"
+      && error.detail_code === "INVALID_RUNTIME_FIELD"
+      && error.details.field === "enemy.experience",
+  );
+
+  for (const alias of ["atk", "def", "exp", "money"]) {
+    const explicitUndefined = {
+      hp: 50, atk: 20, def: 1, money: 1, exp: 1, special: 0,
+    };
+    explicitUndefined[alias] = undefined;
+    const invalid = makePoisonCore({
+      hero, blocks: [block], damage: { greenSlime: 50 },
+      enemyInfo: { greenSlime: explicitUndefined },
+    });
+    assert.throws(
+      () => lab.collectObservation(lab.createEngineAdapter(invalid.scope)),
+      (error) => error.pause_kind === "ENGINE_API_INCOMPATIBLE"
+        && error.detail_code === "INVALID_RUNTIME_FIELD"
+        && error.details.field === ({
+          atk: "enemy.attack", def: "enemy.defense",
+          exp: "enemy.experience", money: "enemy.gold",
+        })[alias],
+      `explicit own ${alias}:undefined must fail as an invalid runtime field`,
+    );
+  }
+
+  const aliasFields = {
+    atk: "enemy.attack", def: "enemy.defense",
+    exp: "enemy.experience", money: "enemy.gold",
+  };
+  for (const [alias, field] of Object.entries(aliasFields)) {
+    for (const value of [null, Number.NaN, Number.POSITIVE_INFINITY, "1", 1.5, -1]) {
+      const invalidInfo = {
+        hp: 50, atk: 20, def: 1, money: 1, exp: 1, special: 0,
+      };
+      invalidInfo[alias] = value;
+      const invalid = makePoisonCore({
+        hero, blocks: [block], damage: { greenSlime: 50 },
+        enemyInfo: { greenSlime: invalidInfo },
+      });
+      assert.throws(
+        () => lab.collectObservation(lab.createEngineAdapter(invalid.scope)),
+        (error) => error.pause_kind === "ENGINE_API_INCOMPATIBLE"
+          && error.detail_code === "INVALID_RUNTIME_FIELD"
+          && error.details.field === field,
+        `explicit invalid ${alias}:${String(value)} must fail closed`,
+      );
+    }
+  }
+
+  const missingOptionalAliases = makePoisonCore({
+    hero, blocks: [block], damage: { greenSlime: 50 },
+    enemyInfo: {
+      greenSlime: { hp: 50, money: 1, exp: 1, special: 0 },
+    },
+  });
+  const missingOptionalEnemy = lab.collectObservation(
+    lab.createEngineAdapter(missingOptionalAliases.scope),
+  ).blocks[0].enemy;
+  assert.equal(missingOptionalEnemy.attack, null);
+  assert.equal(missingOptionalEnemy.defense, null);
+
+  for (const requiredAlias of ["money", "exp"]) {
+    const missingRequiredInfo = {
+      hp: 50, atk: 20, def: 1, money: 1, exp: 1, special: 0,
+    };
+    delete missingRequiredInfo[requiredAlias];
+    const missingRequired = makePoisonCore({
+      hero, blocks: [block], damage: { greenSlime: 50 },
+      enemyInfo: { greenSlime: missingRequiredInfo },
+    });
+    assert.throws(
+      () => lab.collectObservation(lab.createEngineAdapter(missingRequired.scope)),
+      (error) => error.pause_kind === "UNKNOWN_DAMAGE"
+        && error.detail_code === "DAMAGE_UNEXPLAINED",
+      `missing required ${requiredAlias} must fail closed`,
+    );
+  }
+});
+
+test("实时攻防可解释的 null 或问号战损是可序列化的当前不可战斗边界", () => {
+  for (const damage of [null, "???"]) {
+    const fake = makePoisonCore({
+      hero: {
+        hp: 1000, atk: 10, def: 10, money: 0, exp: 0,
+        loc: { x: 0, y: 0, direction: "right" },
+        items: { tools: {} },
+      },
+      blocks: [{
+        x: 1, y: 0, id: 2,
+        event: { id: "blackSlime", cls: "enemy48", trigger: "battle", noPass: true },
+      }],
+      damage: { blackSlime: damage },
+      enemyInfo: {
+        blackSlime: { hp: 200, atk: 35, def: 10, money: 5, exp: 5, special: 0 },
+      },
+    });
+    const observation = lab.collectObservation(lab.createEngineAdapter(fake.scope));
+    assert.equal(observation.blocks[0].damage, damage);
+    assert.equal(observation.blocks[0].enemy.defense, 10);
+    assert.equal(observation.blocks[0].enemy.experience, 5);
+    assert.doesNotThrow(() => JSON.stringify(lab.cloneObservationForWire(observation)));
+  }
+});
+
+test("undefined 战损无论攻防关系都 fail closed 并保留原始证据", () => {
+  for (const heroAttack of [10, 11]) {
+    const fake = makePoisonCore({
+      hero: {
+        hp: 1000, atk: heroAttack, def: 10, money: 0, exp: 0,
+        loc: { x: 0, y: 0, direction: "right" },
+        items: { tools: {} },
+      },
+      blocks: [{
+        x: 1, y: 0, id: 2,
+        event: { id: "blackSlime", cls: "enemy48", trigger: "battle", noPass: true },
+      }],
+      damage: { blackSlime: undefined },
+      enemyInfo: {
+        blackSlime: { hp: 200, atk: 35, def: 10, money: 5, exp: 5, special: 0 },
+      },
+    });
+    assert.throws(
+      () => lab.collectObservation(lab.createEngineAdapter(fake.scope)),
+      (error) => {
+        assert.equal(error.pause_kind, "UNKNOWN_DAMAGE");
+        assert.equal(error.detail_code, "DAMAGE_UNEXPLAINED");
+        const evidence = error.details.collection_issues[0];
+        assert.deepEqual(
+          JSON.parse(JSON.stringify(evidence.block.raw_damage)),
+          { type: "undefined", value: null },
+        );
+        assert.equal(evidence.block.x, 1);
+        assert.equal(evidence.block.y, 0);
+        assert.equal(evidence.block.id, "blackSlime");
+        assert.equal(evidence.block.cls, "enemy48");
+        assert.equal(evidence.block.trigger, "battle");
+        assert.equal(evidence.hero_attack, heroAttack);
+        assert.equal(evidence.enemy_defense, 10);
+        return true;
+      },
+    );
+  }
+});
+
+test("undefined 战损在浏览器采集边界暂停且绝不进入 localhost wire", async () => {
+  const fake = makePoisonCore({
+    hero: {
+      hp: 1000, atk: 10, def: 10, money: 0, exp: 0,
+      loc: { x: 0, y: 0, direction: "right" },
+      items: { tools: {} },
+    },
+    blocks: [{
+      x: 1, y: 0, id: 2,
+      event: { id: "blackSlime", cls: "enemy48", trigger: "battle", noPass: true },
+    }],
+    damage: { blackSlime: undefined },
+    enemyInfo: {
+      blackSlime: { hp: 200, atk: 35, def: 10, money: 5, exp: 5, special: 0 },
+    },
+  });
+  const journal = lab.createJournal(lab.createMemoryStorage());
+  let postCalls = 0;
+  const controller = lab.createController({
+    adapter: lab.createEngineAdapter(fake.scope),
+    journal,
+    registry: lab.createBlockRegistry(),
+    client: {
+      isConnected: () => true,
+      postCycle: async () => { postCalls += 1; return { status: "idle", reason: "unexpected" }; },
+    },
+    panel: { update() {} },
+    logger: { error() {} },
+  });
+
+  const result = await controller.initialize();
+  const pause = journal.snapshot().last_pause;
+  assert.equal(result.pause_kind, "UNKNOWN_DAMAGE");
+  assert.equal(result.detail_code, "DAMAGE_UNEXPLAINED");
+  assert.equal(postCalls, 0);
+  assert.equal(pause.details.hero_attack, 10);
+  assert.equal(pause.details.enemy_defense, 10);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(pause.block_evidence[0].raw_damage)),
+    { type: "undefined", value: null },
+  );
+  assert.equal(fake.calls.direct.length + fake.calls.route.length, 0);
+});
+
+test("damage 严格值域拒绝非协议值", () => {
+  const invalidDamage = [
+    Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY,
+    -1, 1.5, "50", {}, true, false,
+  ];
+  for (const damage of invalidDamage) {
+    const fake = makePoisonCore({
+      hero: {
+        hp: 1000, atk: 10, def: 10, money: 0, exp: 0,
+        loc: { x: 0, y: 0, direction: "right" },
+        items: { tools: {} },
+      },
+      blocks: [{
+        x: 1, y: 0, id: 2,
+        event: { id: "monster", cls: "enemy48", trigger: "battle", noPass: true },
+      }],
+      damage: { monster: damage },
+      enemyInfo: {
+        monster: { hp: 200, atk: 35, def: 10, money: 5, exp: 5, special: 0 },
+      },
+    });
+    assert.throws(
+      () => lab.collectObservation(lab.createEngineAdapter(fake.scope)),
+      (error) => error.pause_kind === "UNKNOWN_DAMAGE"
+        && error.detail_code === "DAMAGE_UNEXPLAINED",
+      `invalid damage ${String(damage)} must fail closed`,
+    );
+  }
+});
+
 test("怪物未知、问号、负数和非有限战损均暂停", () => {
   for (const value of [null, "???", -1, Number.NaN]) {
     const fake = makePoisonCore({
@@ -245,8 +533,14 @@ test("怪物未知、问号、负数和非有限战损均暂停", () => {
 
 test("采集期未知战损暂停保留本轮完整 observation 且零决策、零行动", async () => {
   const cases = [
-    { damage: null, normalized: null, raw: null, code: "DAMAGE_NULL" },
-    { damage: "???", normalized: "???", raw: "???", code: "DAMAGE_NULL" },
+    { damage: null, normalized: null, raw: null, code: "DAMAGE_UNEXPLAINED" },
+    { damage: "???", normalized: "???", raw: "???", code: "DAMAGE_UNEXPLAINED" },
+    {
+      damage: undefined,
+      normalized: null,
+      raw: { type: "undefined", value: null },
+      code: "DAMAGE_UNEXPLAINED",
+    },
     {
       damage: Number.NaN,
       normalized: null,
@@ -382,7 +676,7 @@ test("block 必填身份缺失时暂停并保留坐标证据", () => {
   }
 });
 
-test("怪物 hp/gold/experience 必须是合法整数，攻防可为 null", () => {
+test("怪物 hp/gold/experience 必须是合法整数，攻防仅在字段缺席时可为 null", () => {
   const block = {
     x: 0, y: 0, id: 2,
     event: { id: "syntheticEnemy", cls: "enemy48", trigger: "battle" },
@@ -390,23 +684,24 @@ test("怪物 hp/gold/experience 必须是合法整数，攻防可为 null", () =
   const nullable = makePoisonCore({
     blocks: [block],
     enemyInfo: {
-      syntheticEnemy: { hp: 10, atk: null, def: null, money: 0, experience: 0, special: [] },
+      syntheticEnemy: { hp: 10, money: 0, experience: 0, special: [] },
     },
   });
   const observation = lab.collectObservation(lab.createEngineAdapter(nullable.scope));
   assert.equal(observation.blocks[0].enemy.attack, null);
   assert.equal(observation.blocks[0].enemy.defense, null);
 
-  for (const info of [
-    { hp: null, atk: 1, def: 1, money: 0, experience: 0 },
-    { hp: 10, atk: 1, def: 1, money: -1, experience: 0 },
-    { hp: 10, atk: 1, def: 1, money: 0, experience: null },
+  for (const [info, pauseKind] of [
+    [{ hp: null, atk: 1, def: 1, money: 0, experience: 0 }, "UNKNOWN_DAMAGE"],
+    [{ hp: 10, atk: 1, def: 1, money: -1, experience: 0 }, "ENGINE_API_INCOMPATIBLE"],
+    [{ hp: 10, atk: 1, def: 1, money: 0, experience: null }, "ENGINE_API_INCOMPATIBLE"],
   ]) {
     const fake = makePoisonCore({ blocks: [block], enemyInfo: { syntheticEnemy: info } });
     assert.throws(
       () => lab.collectObservation(lab.createEngineAdapter(fake.scope)),
-      (error) => error.pause_kind === "UNKNOWN_DAMAGE"
-        && error.detail_code === "DAMAGE_UNEXPLAINED",
+      (error) => error.pause_kind === pauseKind
+        && error.detail_code === (pauseKind === "UNKNOWN_DAMAGE"
+          ? "DAMAGE_UNEXPLAINED" : "INVALID_RUNTIME_FIELD"),
     );
   }
 });

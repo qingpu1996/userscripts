@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from mota_lab.api import CycleCoordinator
 from mota_lab.combat import UnknownDamage, combat_outcome
 from mota_lab.deltas import validate_expected_delta
@@ -96,12 +98,16 @@ class GraphAndModelTests(unittest.TestCase):
         self.assertEqual((outcome.hp_delta, outcome.gold_delta, outcome.experience_delta), (-24, 5, 4))
 
     def test_unknown_and_negative_damage_rejected(self) -> None:
-        for damage in (None, "???", -1):
+        for damage in (None, "???"):
             block = Observation.model_validate(
                 make_observation(blocks=[make_enemy_block(x=1, y=0, damage=damage)])
             ).blocks[0]
             with self.subTest(damage=damage), self.assertRaises(UnknownDamage):
                 combat_outcome(block)
+        with self.assertRaises(ValidationError):
+            Observation.model_validate(
+                make_observation(blocks=[make_enemy_block(x=1, y=0, damage=-1)])
+            )
 
     def test_resource_transition_and_valuation(self) -> None:
         state = ResourceState(100, 10, 10, 0, 0, 1, 0, 0)
@@ -224,6 +230,77 @@ class PlannerCycleTests(unittest.TestCase):
         label_block(self.settings, unknown, category="enemy")
         paused = self.cycle(make_observation(blocks=[unknown]))
         self.assertEqual(paused["pause_kind"], "UNKNOWN_DAMAGE")
+
+    def test_known_unfightable_enemy_does_not_block_independent_supported_progress(self) -> None:
+        enemy = make_enemy_block(x=1, y=0, damage=None, block_id="blackSlime")
+        enemy["enemy"]["defense"] = 10
+        resource = make_block(x=0, y=1, block_id="yellowKey")
+        mark_floor(self.settings)
+        label_block(self.settings, enemy, category="enemy")
+        label_block(self.settings, resource, category="resource", expected_delta={"keys": {"yellow": 1}})
+
+        response = self.cycle(make_observation(
+            attack=10, x=0, y=0, blocks=[enemy, resource]
+        ))
+
+        self.assertEqual(response["status"], "execute")
+        self.assertEqual(response["operations"][-1], {"type": "grid", "x": 0, "y": 1})
+        self.assertNotIn(
+            (1, 0),
+            {(operation["x"], operation["y"]) for operation in response["operations"]},
+        )
+
+    def test_known_unfightable_enemy_is_blocked_and_idle_when_it_is_the_only_frontier(self) -> None:
+        enemy = make_enemy_block(x=1, y=0, damage="???", block_id="skeleton")
+        enemy["enemy"]["defense"] = 20
+        resource = make_block(x=2, y=0, block_id="remotePotion")
+        mark_floor(self.settings)
+        label_block(self.settings, enemy, category="enemy")
+        label_block(self.settings, resource, category="resource", expected_delta={"hp": 10})
+
+        response = self.cycle(make_observation(
+            attack=10,
+            width=3,
+            height=1,
+            valid_cells=[{"x": x, "y": 0} for x in range(3)],
+            blocks=[enemy, resource],
+        ))
+
+        self.assertEqual(response["status"], "idle")
+        self.assertIn("当前不可战斗", response["reason"])
+        self.assertNotIn("action_id", response)
+
+    def test_damage_null_is_unexplained_once_live_attack_can_penetrate(self) -> None:
+        enemy = make_enemy_block(x=1, y=0, damage=None, block_id="blackSlime")
+        enemy["enemy"]["defense"] = 10
+        mark_floor(self.settings)
+        label_block(self.settings, enemy, category="enemy")
+
+        response = self.cycle(make_observation(attack=11, blocks=[enemy]))
+
+        self.assertEqual(response["status"], "pause")
+        self.assertEqual(response["pause_kind"], "UNKNOWN_DAMAGE")
+        self.assertEqual(response["detail_code"], "DAMAGE_UNEXPLAINED")
+        self.assertEqual(response["details"]["block"]["damage"], None)
+        self.assertEqual(response["details"]["block"]["enemy"]["defense"], 10)
+
+    def test_enemy_fightability_is_recomputed_from_each_live_observation(self) -> None:
+        enemy = make_enemy_block(x=1, y=0, damage=None, block_id="liveEnemy")
+        enemy["enemy"]["defense"] = 10
+        mark_floor(self.settings)
+        label_block(self.settings, enemy, category="enemy")
+
+        blocked = self.cycle(make_observation(attack=10, blocks=[enemy]))
+        self.assertEqual(blocked["status"], "idle")
+
+        updated = make_enemy_block(x=1, y=0, damage=20, block_id="liveEnemy")
+        updated["enemy"]["defense"] = 10
+        available = self.cycle(make_observation(
+            attack=11, blocks=[updated], captured_at=1234567891
+        ))
+        self.assertEqual(available["status"], "execute")
+        self.assertEqual(available["action_kind"], "MOVE_TO_ENEMY")
+        self.assertEqual(available["expected_delta"]["hp"], -20)
 
     def test_unsupported_registered_interaction_pauses(self) -> None:
         npc = make_block(x=1, y=0, block_id="npcA", cls="npcs", trigger="action")

@@ -1,0 +1,43 @@
+{
+  "protocol": 1,
+  "run": "2026-07-14-live-enemy-root-only-followup",
+  "result": "pass",
+  "tests": {
+    "javascript": {"passed": 108, "failed": 0},
+    "python": {"passed": 107, "failed": 0},
+    "integration": {"passed": 1, "failed": 0},
+    "total": {"passed": 216, "failed": 0}
+  },
+  "checks": {
+    "targeted_red_before_fix": "pass",
+    "same_map_attack_resource_does_not_reuse_enemy": "pass",
+    "same_map_non_attack_resource_does_not_reuse_enemy": "pass",
+    "cross_map_return_does_not_reuse_enemy": "pass",
+    "live_root_enemy_terminal_candidate": "pass",
+    "known_unfightable_live_reclassification": "pass",
+    "enemy_alias_own_undefined_fail_closed": "pass",
+    "enemy_alias_invalid_matrix_fail_closed": "pass",
+    "optional_alias_absence_only": "pass",
+    "required_alias_absence_fail_closed": "pass",
+    "change_map_pending_completed_ack": "pass",
+    "browser_and_service_restart_zero_replay": "pass",
+    "fixture_and_schema_provenance": "pass",
+    "protocol_wire": "pass",
+    "python_compile": "pass",
+    "javascript_syntax": "pass",
+    "userscript_build": "pass",
+    "direct_mount_build": "pass",
+    "deterministic_rebuild": "pass",
+    "static_blind_play": "pass",
+    "docs_and_json": "pass",
+    "git_diff_check": "pass",
+    "isolated_prospective_staged_check": "pass"
+  },
+  "artifacts": {
+    "dist/mota-planning-lab.user.js": "sha256:d00d9608a0aef2ef738c01b7eda2a023099b8d433cd5a8d71bbb309bb8bd77ab",
+    "dist/mota-planning-lab.direct-mount.js": "sha256:6cae2ffc12f93c4f21b5ec3e48d2271b224659cbebe8b2655d78a6d213ef27e5"
+  },
+  "real_browser": "not-run-by-fix-agent",
+  "live_state_directories": "not-read-or-written",
+  "stage_commit_push_pr_rebase_squash_merge": "not-run"
+}

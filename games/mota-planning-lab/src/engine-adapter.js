@@ -320,19 +320,93 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
     }
     const info = runtime.getEnemyInfo(block.id, null, block.x, block.y, floorId);
     const damage = runtime.getDamage(block.id, block.x, block.y, floorId);
-    const special = info && Array.isArray(info.special)
-      ? info.special.filter((value) => ["string", "number"].includes(typeof value))
-      : [];
+    if (!info || typeof info !== "object" || Array.isArray(info)) {
+      return { damage, enemy: null, enemy_issue: null, enemy_raw_evidence: null };
+    }
+
+    const scalarEvidence = (value) => {
+      if (value === null || typeof value === "boolean") return value;
+      if (typeof value === "string") return value.slice(0, 256);
+      if (typeof value === "number") {
+        return Number.isFinite(value) ? value : { type: "number", value: String(value) };
+      }
+      if (value === undefined) return { type: "undefined", value: null };
+      return { type: typeof value, value: Object.prototype.toString.call(value).slice(0, 128) };
+    };
+    let enemyIssue = null;
+    function readAliases(names, field) {
+      const present = names.filter((name) => Object.prototype.hasOwnProperty.call(info, name));
+      if (present.length === 0) return null;
+      const invalid = present.find((name) => (
+        !MotaLab.isFiniteInteger(info[name]) || info[name] < 0
+      ));
+      if (invalid !== undefined) {
+        throw MotaLab.createPauseError(
+          "ENGINE_API_INCOMPATIBLE",
+          "INVALID_RUNTIME_FIELD",
+          {
+            field,
+            alias: invalid,
+            valueType: typeof info[invalid],
+            value: scalarEvidence(info[invalid]),
+          },
+        );
+      }
+      const first = info[present[0]];
+      if (present.some((name) => !Object.is(info[name], first))) {
+        enemyIssue = enemyIssue || {
+          field,
+          reason: "CONFLICTING_RUNTIME_ALIASES",
+          aliases: Object.fromEntries(present.map((name) => [name, scalarEvidence(info[name])])),
+        };
+        return null;
+      }
+      return first;
+    }
+    function readSpecial() {
+      if (!Object.prototype.hasOwnProperty.call(info, "special")
+        || info.special === null || info.special === 0) return [];
+      const values = Array.isArray(info.special) ? info.special : [info.special];
+      if (values.length > 64 || values.some((value) => (
+        typeof value !== "string" && !MotaLab.isFiniteInteger(value)
+      ))) {
+        enemyIssue = enemyIssue || {
+          field: "enemy.special",
+          reason: "INVALID_RUNTIME_FIELD",
+          value: scalarEvidence(info.special),
+        };
+        return [];
+      }
+      return values.slice();
+    }
+    const attack = readAliases(["atk", "attack"], "enemy.attack");
+    const defense = readAliases(["def", "defense"], "enemy.defense");
+    const gold = readAliases(["money", "gold"], "enemy.gold");
+    const experience = readAliases(["exp", "experience"], "enemy.experience");
+    const special = readSpecial();
     return {
       damage,
-      enemy: info && typeof info === "object" ? {
+      enemy: {
         hp: info.hp === undefined ? null : info.hp,
-        attack: info.atk !== undefined ? info.atk : info.attack === undefined ? null : info.attack,
-        defense: info.def !== undefined ? info.def : info.defense === undefined ? null : info.defense,
-        gold: info.money !== undefined ? info.money : info.gold === undefined ? null : info.gold,
-        experience: info.experience === undefined ? null : info.experience,
+        attack,
+        defense,
+        gold,
+        experience,
         special,
-      } : null,
+      },
+      enemy_issue: enemyIssue,
+      enemy_raw_evidence: {
+        hp: scalarEvidence(info.hp),
+        atk: scalarEvidence(info.atk),
+        attack: scalarEvidence(info.attack),
+        def: scalarEvidence(info.def),
+        defense: scalarEvidence(info.defense),
+        money: scalarEvidence(info.money),
+        gold: scalarEvidence(info.gold),
+        exp: scalarEvidence(info.exp),
+        experience: scalarEvidence(info.experience),
+        special: scalarEvidence(info.special),
+      },
     };
   }
 
