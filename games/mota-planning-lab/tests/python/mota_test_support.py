@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -142,11 +143,21 @@ def make_settings(
     max_body_bytes: int = 256 * 1024,
     rate_limit_per_second: int = 50,
 ) -> Settings:
-    return Settings.for_directory(
+    settings = Settings.for_directory(
         directory,
         max_body_bytes=max_body_bytes,
         rate_limit_per_second=rate_limit_per_second,
     )
+    # Tests explicitly use an isolated mutable fixture directory as the
+    # coordinator's bundled-data source. Production never does this.
+    fixture_settings = replace(settings, bundled_data_dir=settings.knowledge_dir)
+    KnowledgeRegistry(
+        fixture_settings.labels_path,
+        fixture_settings.floors_path,
+        bundled_labels_path=settings.bundled_data_dir / "block-labels.json",
+        bundled_floors_path=settings.bundled_data_dir / "floor-models.json",
+    )
+    return fixture_settings
 
 
 def registry(settings: Settings) -> KnowledgeRegistry:

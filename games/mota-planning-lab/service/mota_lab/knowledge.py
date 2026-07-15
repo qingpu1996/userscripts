@@ -64,7 +64,39 @@ class KnowledgeRegistry:
         self._lock = RLock()
         self._bootstrap()
 
+    @classmethod
+    def from_bundled_read_only(
+        cls,
+        labels_path: Path,
+        floors_path: Path,
+    ) -> "KnowledgeRegistry":
+        """Load packaged rules once without creating or mutating any path.
+
+        Production uses this constructor.  The regular constructor remains for
+        explicit offline label-authoring commands and tests only.
+        """
+        instance = cls.__new__(cls)
+        instance.labels_path = Path(labels_path)
+        instance.floors_path = Path(floors_path)
+        instance.bundled_labels_path = None
+        instance.bundled_floors_path = None
+        instance._lock = RLock()
+        try:
+            instance._memory_labels = BlockLabelsFile.model_validate(
+                _read_json(instance.labels_path)
+            )
+            instance._memory_floors = FloorModelsFile.model_validate(
+                _read_json(instance.floors_path)
+            )
+        except ValidationError as exc:
+            raise KnowledgeError(f"invalid bundled knowledge: {exc}") from exc
+        instance._read_only = True
+        return instance
+
     def _bootstrap(self) -> None:
+        self._read_only = False
+        self._memory_labels = None
+        self._memory_floors = None
         self.labels_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.labels_path.exists():
             payload = (
@@ -85,12 +117,16 @@ class KnowledgeRegistry:
         self._load_floors()
 
     def _load_labels(self) -> BlockLabelsFile:
+        if self._read_only:
+            return self._memory_labels
         try:
             return BlockLabelsFile.model_validate(_read_json(self.labels_path))
         except ValidationError as exc:
             raise KnowledgeError(f"invalid block labels: {exc}") from exc
 
     def _load_floors(self) -> FloorModelsFile:
+        if self._read_only:
+            return self._memory_floors
         try:
             return FloorModelsFile.model_validate(_read_json(self.floors_path))
         except ValidationError as exc:
@@ -147,6 +183,8 @@ class KnowledgeRegistry:
         return "sha256:" + hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
     def apply_block_label(self, label: BlockLabel) -> BlockLabel:
+        if self._read_only:
+            raise KnowledgeError("bundled knowledge is read-only")
         safety_error = block_label_execution_error(label)
         if safety_error is not None:
             raise KnowledgeError(safety_error)
@@ -171,6 +209,8 @@ class KnowledgeRegistry:
             return label
 
     def apply_floor_model(self, floor: FloorModel) -> FloorModel:
+        if self._read_only:
+            raise KnowledgeError("bundled knowledge is read-only")
         with self._lock:
             floors_file = self._load_floors()
             floors = {existing.floor_id: existing for existing in floors_file.floors}

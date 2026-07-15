@@ -127,21 +127,110 @@ MotaLab.engineJsonLiteral = function engineJsonLiteral(value, state = null, dept
   return { value: Object.fromEntries(entries), complex: context.complex };
 };
 
+MotaLab.detachEngineData = function detachEngineData(value) {
+  return JSON.parse(JSON.stringify(MotaLab.engineJsonLiteral(value).value));
+};
+
+MotaLab.decodeDetachedDynamicMap = function decodeDetachedDynamicMap(
+  floorId, dynamicMap, definitionMap, width, height, fail,
+) {
+  if (!Array.isArray(dynamicMap)) {
+    return Array.isArray(definitionMap)
+      ? definitionMap.map((row) => Array.isArray(row) ? row.slice() : row)
+      : definitionMap;
+  }
+  const compressed = dynamicMap.some((row) => !Array.isArray(row))
+    || dynamicMap.some((row) => row.some((cell) => cell < 0));
+  if (!compressed) return dynamicMap.map((row) => Array.isArray(row) ? row.slice() : row);
+
+  const reject = (reason, details = {}) => fail("ENGINE_MODEL_MAP_COMPRESSION_INVALID", {
+    floor_id: floorId, reason, ...details,
+  });
+  if (dynamicMap.length !== height) {
+    reject("dynamic_height_mismatch", { expected: height, actual: dynamicMap.length });
+  }
+  let needsDefinition = false;
+  for (let y = 0; y < height; y += 1) {
+    const row = dynamicMap[y];
+    if (row === 0) {
+      needsDefinition = true;
+      continue;
+    }
+    if (!Array.isArray(row)) {
+      reject("dynamic_row_token_invalid", {
+        y, token: MotaLab.runtimeScalarEvidence(row),
+      });
+    }
+    if (row.length !== width) {
+      reject("dynamic_width_mismatch", { y, expected: width, actual: row.length });
+    }
+    for (let x = 0; x < width; x += 1) {
+      const cell = row[x];
+      if (cell === -1) needsDefinition = true;
+      else if (!MotaLab.isFiniteInteger(cell) || cell < 0) {
+        reject("dynamic_cell_token_invalid", {
+          x, y, token: MotaLab.runtimeScalarEvidence(cell),
+        });
+      }
+    }
+  }
+  if (needsDefinition) {
+    if (!Array.isArray(definitionMap) || definitionMap.length !== height) {
+      reject("definition_height_mismatch", {
+        expected: height, actual: Array.isArray(definitionMap) ? definitionMap.length : null,
+      });
+    }
+    for (let y = 0; y < height; y += 1) {
+      const definitionRow = definitionMap[y];
+      if (!Array.isArray(definitionRow) || definitionRow.length !== width) {
+        reject("definition_width_mismatch", {
+          y, expected: width, actual: Array.isArray(definitionRow) ? definitionRow.length : null,
+        });
+      }
+      for (let x = 0; x < width; x += 1) {
+        const inherited = dynamicMap[y] === 0 || dynamicMap[y][x] === -1;
+        const value = definitionRow[x];
+        if (inherited && (!MotaLab.isFiniteInteger(value) || value < 0)) {
+          reject("definition_cell_invalid", {
+            x, y, token: MotaLab.runtimeScalarEvidence(value),
+          });
+        }
+      }
+    }
+  }
+  const decoded = Array.from({ length: height }, () => Array(width));
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      decoded[y][x] = dynamicMap[y] === 0 || dynamicMap[y][x] === -1
+        ? definitionMap[y][x] : dynamicMap[y][x];
+    }
+  }
+  return decoded;
+};
+
 MotaLab.collectEngineFloor = function collectEngineFloor(
   engine, floorId, definition, dynamic, fail,
 ) {
-  const source = Array.isArray(dynamic.map) ? dynamic.map : definition.map;
-  if (!Array.isArray(source) || source.some((row) => !Array.isArray(row))) {
-    fail("ENGINE_MODEL_MAP_MISSING", { floor_id: floorId });
-  }
-  const inferredWidth = source.reduce((maximum, row) => Math.max(maximum, row.length), 0);
+  const selected = Array.isArray(dynamic.map) ? dynamic.map : definition.map;
+  if (!Array.isArray(selected)) fail("ENGINE_MODEL_MAP_MISSING", { floor_id: floorId });
+  const inferredWidth = selected.reduce(
+    (maximum, row) => Math.max(maximum, Array.isArray(row) ? row.length : 0), 0,
+  );
   const width = MotaLab.isFiniteInteger(dynamic.width) ? dynamic.width
     : MotaLab.isFiniteInteger(definition.width) ? definition.width : inferredWidth;
   const height = MotaLab.isFiniteInteger(dynamic.height) ? dynamic.height
-    : MotaLab.isFiniteInteger(definition.height) ? definition.height : source.length;
+    : MotaLab.isFiniteInteger(definition.height) ? definition.height : selected.length;
   if (width < 1 || height < 1 || width > MotaLab.MAX_MAP_AXIS
-    || height > MotaLab.MAX_MAP_AXIS || width * height > MotaLab.MAX_MAP_CELLS
-    || source.length > height || source.some((row) => row.length > width)) {
+    || height > MotaLab.MAX_MAP_AXIS || width * height > MotaLab.MAX_MAP_CELLS) {
+    fail("ENGINE_MODEL_DIMENSIONS_EXCEEDED", { floor_id: floorId, width, height });
+  }
+  const source = MotaLab.decodeDetachedDynamicMap(
+    floorId, dynamic.map, definition.map, width, height, fail,
+  );
+  if (!Array.isArray(source) || source.some((row) => !Array.isArray(row))) {
+    fail("ENGINE_MODEL_MAP_MISSING", { floor_id: floorId });
+  }
+  if (source.length > height || source.some((row) => row.length > width)) {
     fail("ENGINE_MODEL_DIMENSIONS_EXCEEDED", { floor_id: floorId, width, height });
   }
   const validCells = [];
@@ -253,7 +342,7 @@ MotaLab.collectEngineModel = function collectEngineModel(engine, keySlotIds = {}
       engine, keySlotIds, cache, String(currentFloorId),
     );
   }
-  const detach = (value) => JSON.parse(JSON.stringify(MotaLab.engineJsonLiteral(value).value));
+  const detach = MotaLab.detachEngineData;
   const floorDefinitions = detach(engine.floors);
   const statusMaps = engine.status && engine.status.maps && typeof engine.status.maps === "object"
     ? detach(engine.status.maps) : {};
@@ -412,8 +501,10 @@ MotaLab.refreshEngineModel = function refreshEngineModel(
   const fail = (code, details = {}) => {
     throw MotaLab.createPauseError("ENGINE_API_INCOMPATIBLE", code, details);
   };
-  const definition = engine.floors[currentFloorId] || {};
-  const dynamic = engine.status && engine.status.maps && engine.status.maps[currentFloorId] || {};
+  const definition = MotaLab.detachEngineData(engine.floors[currentFloorId] || {});
+  const dynamic = MotaLab.detachEngineData(
+    engine.status && engine.status.maps && engine.status.maps[currentFloorId] || {},
+  );
   const previous = cache.model.floors.find((floor) => floor.floor_id === currentFloorId);
   if (!previous) {
     cache.invalidated = true;
@@ -610,6 +701,7 @@ MotaLab.collectObservation = function collectObservation(adapter, now = Date.now
       damage: normalizedDamage,
       enemy: isEnemy ? normalizedEnemy : null,
     };
+    if (typeof raw.shop_id === "string") normalizedBlock.shop_id = raw.shop_id;
     blocks.push(normalizedBlock);
     if (issue) {
       collectionIssues.push(Object.assign(issue, {
@@ -677,6 +769,8 @@ MotaLab.collectObservation = function collectObservation(adapter, now = Date.now
     captured_at: now(),
   };
   if (snapshot.engine_model) observation.engine_model = snapshot.engine_model;
+  if (Array.isArray(snapshot.shops)) observation.shops = snapshot.shops;
+  if (snapshot.active_menu) observation.active_menu = snapshot.active_menu;
   if (collectionIssues.length) {
     const primary = collectionIssues[0];
     const error = MotaLab.createPauseError(

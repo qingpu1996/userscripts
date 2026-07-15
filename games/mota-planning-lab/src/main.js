@@ -29,7 +29,7 @@ MotaLab.main = async function main() {
     return;
   }
   const adapter = MotaLab.createEngineAdapter();
-  const journal = MotaLab.createJournal(environment.storage);
+  const journal = MotaLab.createJournal();
   const registry = MotaLab.createBlockRegistry();
   const client = MotaLab.createLocalhostClient(environment.request);
   const controller = MotaLab.createController(

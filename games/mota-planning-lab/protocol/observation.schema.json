@@ -48,6 +48,8 @@
       "maxItems": 8192,
       "items": {"$ref": "#/$defs/block"}
     },
+    "shops": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/shop"}},
+    "active_menu": {"$ref": "#/$defs/activeMenu"},
     "engine_model": {"$ref": "#/$defs/engineModel"},
     "captured_at": {"type": "integer", "minimum": 0}
   },
@@ -154,9 +156,14 @@
             {"$ref": "#/$defs/enemy"},
             {"type": "null"}
           ]
-        }
+        },
+        "shop_id": {"type": "string", "minLength": 1, "maxLength": 256}
       }
     },
+    "shopEffect": {"type": "object", "additionalProperties": false, "required": ["field", "amount"], "properties": {"field": {"enum": ["hp", "attack", "defense"]}, "amount": {"type": "integer", "minimum": 1}}},
+    "shopChoice": {"type": "object", "additionalProperties": false, "required": ["choice_id", "index", "text", "cost", "effect", "counter_flag", "purchase_count"], "properties": {"choice_id": {"type": "string", "minLength": 1, "maxLength": 256}, "index": {"type": "integer", "minimum": 0, "maximum": 31}, "text": {"type": "string", "minLength": 1, "maxLength": 256}, "cost": {"type": "integer", "minimum": 1}, "effect": {"$ref": "#/$defs/shopEffect"}, "counter_flag": {"type": "string", "minLength": 1, "maxLength": 256}, "purchase_count": {"type": "integer", "minimum": 0}}},
+    "shop": {"type": "object", "additionalProperties": false, "required": ["supported", "shop_id", "repeatable", "choices"], "properties": {"supported": {"const": true}, "shop_id": {"type": "string", "minLength": 1, "maxLength": 256}, "repeatable": {"const": true}, "choices": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/shopChoice"}}}},
+    "activeMenu": {"type": "object", "additionalProperties": false, "required": ["shop_id", "menu_id", "ready", "selection", "choices"], "properties": {"shop_id": {"type": "string", "minLength": 1, "maxLength": 256}, "menu_id": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}, "ready": {"const": true}, "selection": {"type": ["integer", "null"], "minimum": 0, "maximum": 31}, "choices": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string", "minLength": 1, "maxLength": 256}}}},
     "engineModel": {
       "type": "object",
       "additionalProperties": false,

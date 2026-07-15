@@ -76,14 +76,13 @@
       }
     },
     "operation": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["type", "x", "y"],
-      "properties": {
-        "type": {"const": "grid"},
-        "x": {"type": "integer", "minimum": 0, "maximum": 255},
-        "y": {"type": "integer", "minimum": 0, "maximum": 255}
-      }
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["type", "x", "y"],
+          "properties": {"type": {"const": "grid"}, "x": {"type": "integer", "minimum": 0, "maximum": 255}, "y": {"type": "integer", "minimum": 0, "maximum": 255}}},
+        {"type": "object", "additionalProperties": false,
+          "required": ["type", "shop_id", "menu_id", "choice_id", "choice_index", "expected_cost", "expected_effect", "expected_purchase_count"],
+          "properties": {"type": {"const": "menu_choice"}, "shop_id": {"type": "string", "minLength": 1, "maxLength": 256}, "menu_id": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}, "choice_id": {"type": "string", "minLength": 1, "maxLength": 256}, "choice_index": {"type": "integer", "minimum": 0, "maximum": 8}, "expected_cost": {"type": "integer", "minimum": 1}, "expected_effect": {"type": "object", "additionalProperties": false, "required": ["field", "amount"], "properties": {"field": {"enum": ["hp", "attack", "defense"]}, "amount": {"type": "integer", "minimum": 1}}}, "expected_purchase_count": {"type": "integer", "minimum": 0}}}
+      ]
     },
     "blockRef": {
       "type": "object",
@@ -204,7 +203,7 @@
         "action_id": {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"},
         "action_kind": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,63}$"},
         "reason": {"type": "string", "minLength": 1, "maxLength": 512},
-        "operations": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"$ref": "#/$defs/operation"}},
+        "operations": {"type": "array", "minItems": 1, "maxItems": 3, "items": {"$ref": "#/$defs/operation"}},
         "guard": {"$ref": "#/$defs/guard"},
         "expected_delta": {"$ref": "#/$defs/expectedDelta"},
         "supersedes_action_id": {

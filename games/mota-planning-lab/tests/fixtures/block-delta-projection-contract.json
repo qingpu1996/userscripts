@@ -1,0 +1,16 @@
+{
+  "cases": [
+    {"name":"battle numeric damage","before":{"x":1,"y":2,"numeric_id":201,"id":"skeleton","cls":"enemys","trigger":"battle","no_pass":true,"damage":24,"enemy":{"hp":110}},"after":{"x":1,"y":2,"numeric_id":201,"id":"skeleton","cls":"enemys","trigger":"battle","no_pass":true,"damage":20,"enemy":{"hp":110}},"equal":true},
+    {"name":"enemy cls null to numeric","before":{"x":2,"y":2,"numeric_id":202,"id":"priest","cls":"enemy48","trigger":null,"no_pass":true,"damage":null,"enemy":{"hp":100}},"after":{"x":2,"y":2,"numeric_id":202,"id":"priest","cls":"enemy48","trigger":null,"no_pass":true,"damage":3596,"enemy":{"hp":100}},"equal":true},
+    {"name":"unknown sentinel to numeric","before":{"x":3,"y":2,"numeric_id":203,"id":"mage","cls":"enemys","trigger":"battle","no_pass":true,"damage":"???","enemy":{"hp":100}},"after":{"x":3,"y":2,"numeric_id":203,"id":"mage","cls":"enemys","trigger":"battle","no_pass":true,"damage":10,"enemy":{"hp":100}},"equal":true},
+    {"name":"enemy stable unknown field changes","before":{"x":4,"y":2,"numeric_id":204,"id":"mage","cls":"enemys","trigger":"battle","no_pass":true,"damage":10,"enemy":{"hp":100},"future_semantic":"a"},"after":{"x":4,"y":2,"numeric_id":204,"id":"mage","cls":"enemys","trigger":"battle","no_pass":true,"damage":9,"enemy":{"hp":100},"future_semantic":"b"},"equal":false},
+    {"name":"nested enemy changes","before":{"x":5,"y":2,"numeric_id":205,"id":"mage","cls":"enemys","trigger":"battle","no_pass":true,"damage":10,"enemy":{"hp":100}},"after":{"x":5,"y":2,"numeric_id":205,"id":"mage","cls":"enemys","trigger":"battle","no_pass":true,"damage":9,"enemy":{"hp":101}},"equal":false},
+    {"name":"identity changes","before":{"x":6,"y":2,"numeric_id":206,"id":"mage","cls":"enemys","trigger":"battle","no_pass":true,"damage":10,"enemy":{"hp":100}},"after":{"x":6,"y":2,"numeric_id":206,"id":"mage2","cls":"enemys","trigger":"battle","no_pass":true,"damage":9,"enemy":{"hp":100}},"equal":false},
+    {"name":"non enemy damage remains stable semantics","before":{"x":7,"y":2,"numeric_id":27,"id":"redGem","cls":"items","trigger":"getItem","no_pass":false,"damage":null,"enemy":null},"after":{"x":7,"y":2,"numeric_id":27,"id":"redGem","cls":"items","trigger":"getItem","no_pass":false,"damage":0,"enemy":null},"equal":false},
+    {"name":"negative enemy damage rejected","before":{"x":8,"y":2,"numeric_id":208,"id":"bad","cls":"enemys","trigger":"battle","no_pass":true,"damage":-1,"enemy":{"hp":100}},"error":true},
+    {"name":"fraction enemy damage rejected","before":{"x":9,"y":2,"numeric_id":209,"id":"bad","cls":"enemys","trigger":"battle","no_pass":true,"damage":1.5,"enemy":{"hp":100}},"error":true},
+    {"name":"boolean enemy damage rejected","before":{"x":10,"y":2,"numeric_id":210,"id":"bad","cls":"enemys","trigger":"battle","no_pass":true,"damage":true,"enemy":{"hp":100}},"error":true},
+    {"name":"object enemy damage rejected","before":{"x":11,"y":2,"numeric_id":211,"id":"bad","cls":"enemys","trigger":"battle","no_pass":true,"damage":{"unknown":true},"enemy":{"hp":100}},"error":true},
+    {"name":"other string enemy damage rejected","before":{"x":12,"y":2,"numeric_id":212,"id":"bad","cls":"enemys","trigger":"battle","no_pass":true,"damage":"unknown","enemy":{"hp":100}},"error":true}
+  ]
+}

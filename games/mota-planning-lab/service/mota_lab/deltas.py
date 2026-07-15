@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, List, Mapping
 
 from .models import ExpectedDelta, Observation
@@ -21,6 +22,47 @@ def _block_identity(block: object) -> tuple:
         getattr(block, "cls"),
         getattr(block, "trigger"),
     )
+
+
+def block_delta_projection(block: object) -> Dict[str, Any]:
+    """Return the stable block semantics used by post-action validation.
+
+    Enemy damage is derived from the current hero and therefore is not map
+    identity.  Everything else, including fields unknown to this service, is
+    deliberately retained so new engine semantics continue to fail closed.
+    """
+    if isinstance(block, Mapping):
+        payload = dict(block)
+    else:
+        model_dump = getattr(block, "model_dump", None)
+        if not callable(model_dump):
+            raise TypeError("invalid observed block")
+        payload = model_dump(mode="json")
+
+    trigger = payload.get("trigger")
+    cls = payload.get("cls")
+    is_enemy = trigger == "battle" or (
+        isinstance(cls, str) and cls.lower().startswith("enemy")
+    )
+    if is_enemy:
+        damage = payload.get("damage")
+        valid_damage = (
+            damage is None
+            or damage == "???"
+            or (
+                isinstance(damage, int)
+                and not isinstance(damage, bool)
+                and damage >= 0
+            )
+        )
+        # Be explicit for mappings used by contract tests; Python floats can
+        # otherwise hide NaN/Inf behind surprising equality behaviour.
+        if isinstance(damage, float) and not math.isfinite(damage):
+            valid_damage = False
+        if not valid_damage:
+            raise TypeError("invalid observed enemy damage")
+        payload.pop("damage", None)
+    return payload
 
 
 def _matches_block_ref(block: object, reference: Mapping[str, Any]) -> bool:
@@ -143,12 +185,21 @@ def validate_expected_delta(
         )
 
     if not map_changed:
+        # Validate the complete sets before finding changes.  A malformed
+        # damage value must not escape validation merely because its block is
+        # removed, added, or outside the expected-delta coordinates.
+        pre_projections = {
+            (block.x, block.y): block_delta_projection(block) for block in pre.blocks
+        }
+        post_projections = {
+            (block.x, block.y): block_delta_projection(block) for block in post.blocks
+        }
         pre_blocks = {(block.x, block.y): block for block in pre.blocks}
         post_blocks = {(block.x, block.y): block for block in post.blocks}
         changed_coordinates = {
             coordinate
             for coordinate in set(pre_blocks) | set(post_blocks)
-            if pre_blocks.get(coordinate) != post_blocks.get(coordinate)
+            if pre_projections.get(coordinate) != post_projections.get(coordinate)
         }
         expected_removed = declared.get("removed_blocks") or []
         expected_added = declared.get("added_blocks") or []

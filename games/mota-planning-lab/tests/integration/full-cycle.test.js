@@ -144,6 +144,7 @@ test("fake core → localhost service → atomic execution → settled report is
   const stateDir = path.join(temporaryRoot, "state");
   const knowledgeDir = path.join(temporaryRoot, "knowledge");
   fs.mkdirSync(knowledgeDir, { recursive: true });
+  writeKnowledge(knowledgeDir);
 
   const python = process.env.MOTA_LAB_PYTHON || "python3";
   const serviceDir = path.join(projectDir, "service");
@@ -153,12 +154,21 @@ test("fake core → localhost service → atomic execution → settled report is
     process.env.PYTHONPATH,
   ].filter(Boolean).join(path.delimiter);
   const stderr = [];
-  const child = spawn(python, ["-m", "mota_lab", "serve", "--host", HOST, "--port", String(port)], {
+  const testServer = [
+    "from dataclasses import replace",
+    "from pathlib import Path",
+    "import os, uvicorn",
+    "from mota_lab.api import Settings, create_app",
+    "settings=replace(Settings.from_env(), bundled_data_dir=Path(os.environ['MOTA_LAB_TEST_BUNDLED_DATA_DIR']))",
+    `uvicorn.run(create_app(settings), host='${HOST}', port=${port})`,
+  ].join("; ");
+  const child = spawn(python, ["-c", testServer], {
     cwd: projectDir,
     env: Object.assign({}, process.env, {
       PYTHONPATH: pythonPath,
       MOTA_LAB_STATE_DIR: stateDir,
       MOTA_LAB_KNOWLEDGE_DIR: knowledgeDir,
+      MOTA_LAB_TEST_BUNDLED_DATA_DIR: knowledgeDir,
     }),
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -250,19 +260,9 @@ test("fake core → localhost service → atomic execution → settled report is
   const confirmationRequired = await client.postCycle(firstRequest);
   assert.equal(confirmationRequired.status, "pause");
   assert.equal(confirmationRequired.pause_kind, "SESSION_CONFIRMATION_REQUIRED");
-  const unknownFloor = await client.postCycle(MotaLab.createCycleRequest({
-    observation: firstObservation,
-    session: { mode: "new_game", command: "confirm" },
-    recovery: firstRequest.recovery,
-  }));
-  assert.equal(unknownFloor.status, "pause");
-  assert.equal(unknownFloor.pause_kind, "UNKNOWN_FLOOR");
-
-  writeKnowledge(knowledgeDir);
-
   const issuedBeforeRefresh = await client.postCycle(MotaLab.createCycleRequest({
     observation: firstObservation,
-    session: { mode: "resume_existing_ledger", command: "observe" },
+    session: { mode: "new_game", command: "confirm" },
     recovery: firstRequest.recovery,
   }));
   assert.equal(issuedBeforeRefresh.status, "execute");
@@ -372,16 +372,5 @@ test("fake core → localhost service → atomic execution → settled report is
   )), JSON.stringify(fake.calls.authoritativeWrites));
   assert.ok(panelUpdates.length > 0);
 
-  const manifestPath = path.join(stateDir, ".mota-lab.sqlite3.manifest.json");
-  assert.ok(fs.existsSync(manifestPath));
-  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-  assert.equal(manifest.protocol, 2);
-  assert.ok(fs.existsSync(path.join(
-    stateDir, ".mota-lab.sqlite3.generations", manifest.generation, manifest.database,
-  )));
-  assert.ok(fs.existsSync(path.join(stateDir, "decisions.jsonl")));
-  const pauseRoot = path.join(stateDir, "pauses");
-  assert.ok(fs.readdirSync(pauseRoot, { withFileTypes: true }).some((entry) => (
-    entry.isDirectory() && fs.existsSync(path.join(pauseRoot, entry.name, "pause.json"))
-  )));
+  assert.equal(fs.existsSync(stateDir), false, "serve must not create runtime state files");
 });

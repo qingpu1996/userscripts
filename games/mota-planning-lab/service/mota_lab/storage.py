@@ -187,13 +187,86 @@ class ActionRecord:
 
 
 class Store:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self._lock = RLock()
+        self._memory_only = path is None
+        if self._memory_only:
+            self.import_path = None
+            self.path = None
+            self._connection = sqlite3.connect(":memory:", check_same_thread=False)
+            self._connection.row_factory = sqlite3.Row
+            self._schema_classification = "v2-memory-only"
+        else:
+            self._initialize_persistent(Path(path))
+        with self._connection:
+            self._connection.execute("PRAGMA foreign_keys=ON")
+            if not self._memory_only:
+                self._connection.execute("PRAGMA journal_mode=WAL")
+                self._connection.execute("PRAGMA synchronous=FULL")
+            self._connection.executescript(
+                self._schema_sql()
+            )
+        if not self._memory_only:
+            self._schema_classification = "v2"
+            self._cleanup_abandoned_candidates()
+
+    @staticmethod
+    def _schema_sql() -> str:
+        return """
+                CREATE TABLE IF NOT EXISTS observations (
+                    fingerprint TEXT PRIMARY KEY, floor_id TEXT NOT NULL, payload_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, seen_count INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS actions (
+                    action_id TEXT PRIMARY KEY, pre_fingerprint TEXT NOT NULL, response_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('issued','completed','mismatch','superseded')),
+                    post_fingerprint TEXT, replacement_action_id TEXT, created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL, FOREIGN KEY(pre_fingerprint) REFERENCES observations(fingerprint));
+                CREATE INDEX IF NOT EXISTS actions_pre_idx ON actions(pre_fingerprint, status);
+                CREATE TABLE IF NOT EXISTS decisions (
+                    decision_key TEXT PRIMARY KEY, observation_fingerprint TEXT NOT NULL,
+                    knowledge_fingerprint TEXT NOT NULL, response_json TEXT NOT NULL, action_id TEXT,
+                    created_at INTEGER NOT NULL, FOREIGN KEY(observation_fingerprint) REFERENCES observations(fingerprint));
+                CREATE TABLE IF NOT EXISTS action_id_sequence (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1), next_value INTEGER NOT NULL CHECK(next_value >= 1));
+                INSERT OR IGNORE INTO action_id_sequence(singleton, next_value) VALUES (1, 1);
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id TEXT PRIMARY KEY, mode TEXT NOT NULL, status TEXT NOT NULL,
+                    expected_guard_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS map_instances (
+                    session_id TEXT NOT NULL, map_instance_id TEXT NOT NULL, floor_id TEXT NOT NULL,
+                    floor_number INTEGER, topology_fingerprint TEXT NOT NULL, dimensions_json TEXT NOT NULL,
+                    topology_json TEXT NOT NULL, first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+                    PRIMARY KEY(session_id, map_instance_id));
+                CREATE INDEX IF NOT EXISTS map_instances_floor_idx ON map_instances(session_id, floor_id, topology_fingerprint);
+                CREATE TABLE IF NOT EXISTS map_snapshots (
+                    fingerprint TEXT PRIMARY KEY, session_id TEXT NOT NULL, map_instance_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL, captured_at INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS transitions (
+                    session_id TEXT NOT NULL, action_id TEXT NOT NULL UNIQUE, from_map_instance_id TEXT NOT NULL,
+                    to_map_instance_id TEXT NOT NULL, from_x INTEGER NOT NULL, from_y INTEGER NOT NULL,
+                    to_x INTEGER NOT NULL, to_y INTEGER NOT NULL, reversible INTEGER NOT NULL DEFAULT 0,
+                    observed_at INTEGER NOT NULL, PRIMARY KEY(session_id, action_id));
+                CREATE TABLE IF NOT EXISTS frontiers (
+                    session_id TEXT NOT NULL, map_instance_id TEXT NOT NULL, x INTEGER NOT NULL, y INTEGER NOT NULL,
+                    block_id TEXT NOT NULL, state TEXT NOT NULL, last_snapshot_fingerprint TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL, PRIMARY KEY(session_id, map_instance_id, x, y));
+                CREATE TABLE IF NOT EXISTS takeover_scans (
+                    session_id TEXT PRIMARY KEY, phase TEXT NOT NULL, anchor_map_instance_id TEXT NOT NULL,
+                    current_map_instance_id TEXT NOT NULL, scanned_json TEXT NOT NULL, pending_json TEXT NOT NULL,
+                    traversed_json TEXT NOT NULL, reason TEXT NOT NULL, updated_at INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS scan_audit (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, action_id TEXT,
+                    phase TEXT NOT NULL, event TEXT NOT NULL, details_json TEXT NOT NULL, created_at INTEGER NOT NULL);
+                CREATE INDEX IF NOT EXISTS scan_audit_session_idx ON scan_audit(session_id, sequence);
+                PRAGMA user_version=2;
+                """
+
+    def _initialize_persistent(self, path: Path) -> None:
         self.import_path = Path(path)
         self.import_path.parent.mkdir(parents=True, exist_ok=True)
         self._generation_root = self.import_path.parent / f".{self.import_path.name}.generations"
         self._manifest_path = self.import_path.parent / f".{self.import_path.name}.manifest.json"
         self._generation_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self._lock = RLock()
         self._source_path, manifest = self._authoritative_source()
         if manifest is not None:
             self._assert_import_identity(manifest["import_identity"])
@@ -226,12 +299,7 @@ class Store:
             self._rollback_manifest_after_connect_failure()
             raise
         self._connection.row_factory = sqlite3.Row
-        with self._connection:
-            self._connection.execute("PRAGMA foreign_keys=ON")
-            self._connection.execute("PRAGMA journal_mode=WAL")
-            self._connection.execute("PRAGMA synchronous=FULL")
-            self._connection.executescript(
-                """
+        """Legacy persistent schema retained only for offline migration tooling.
                 CREATE TABLE IF NOT EXISTS observations (
                     fingerprint TEXT PRIMARY KEY,
                     floor_id TEXT NOT NULL,
@@ -348,9 +416,6 @@ class Store:
                     ON scan_audit(session_id, sequence);
                 PRAGMA user_version=2;
                 """
-            )
-        self._schema_classification = "v2"
-        self._cleanup_abandoned_candidates()
 
     @staticmethod
     def _identity_payload(path: Path) -> Dict[str, Any]:

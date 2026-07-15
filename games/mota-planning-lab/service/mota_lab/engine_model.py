@@ -62,7 +62,7 @@ def _numeric_expression(source: str, observation: Observation, ratio: float) -> 
     except SyntaxError as exc:
         raise UnsupportedItemEffect("invalid numeric expression") from exc
     for node in ast.walk(tree):
-        if isinstance(node, ast.Expression | ast.Load | ast.Constant):
+        if isinstance(node, (ast.Expression, ast.Load, ast.Constant)):
             continue
         if isinstance(node, ast.BinOp) and isinstance(node.op, _ALLOWED_BINARY):
             continue

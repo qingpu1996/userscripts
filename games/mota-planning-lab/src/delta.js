@@ -119,6 +119,27 @@ MotaLab.compareBlockRefs = function compareBlockRefs(references, actualBlocks) {
   return remaining.length === 0;
 };
 
+MotaLab.blockDeltaProjection = function blockDeltaProjection(block) {
+  if (!MotaLab.isProtocolObject(block)) throw new TypeError("Invalid observed block");
+  const isEnemy = block.trigger === "battle"
+    || (typeof block.cls === "string" && /^enemy/i.test(block.cls));
+  if (isEnemy && block.damage !== null && block.damage !== "???"
+    && (!MotaLab.isFiniteInteger(block.damage) || block.damage < 0)) {
+    throw new TypeError("Invalid observed enemy damage");
+  }
+  const projection = {};
+  for (const [field, value] of Object.entries(block)) {
+    // `damage` is calculated against the current hero.  It is planning data,
+    // not part of a monster's stable map identity, so an attribute pickup can
+    // legitimately change it for every visible monster at once.  Keep every
+    // other observed (including unknown future) field in the projection so a
+    // real block semantic change still fails closed.
+    if (isEnemy && field === "damage") continue;
+    projection[field] = value;
+  }
+  return projection;
+};
+
 MotaLab.compareExpectedDelta = function compareExpectedDelta(before, after, expected, options = {}) {
   MotaLab.validateExpectedDelta(expected, Object.assign({
     dimensions: before.dimensions,
@@ -196,6 +217,10 @@ MotaLab.compareExpectedDelta = function compareExpectedDelta(before, after, expe
       actual: { map_instance_changed: true, removed: [], added: [] },
     };
   }
+  // Validate the complete compared block sets, including blocks that were
+  // actually removed or added and therefore have no same-coordinate peer.
+  before.blocks.forEach(MotaLab.blockDeltaProjection);
+  after.blocks.forEach(MotaLab.blockDeltaProjection);
   const beforeByCoordinate = new Map(before.blocks.map((block) => [`${block.x},${block.y}`, block]));
   const afterByCoordinate = new Map(after.blocks.map((block) => [`${block.x},${block.y}`, block]));
   const coordinates = new Set([...beforeByCoordinate.keys(), ...afterByCoordinate.keys()]);
@@ -205,7 +230,8 @@ MotaLab.compareExpectedDelta = function compareExpectedDelta(before, after, expe
     const beforeBlock = beforeByCoordinate.get(coordinate);
     const afterBlock = afterByCoordinate.get(coordinate);
     if (beforeBlock && afterBlock
-      && MotaLab.canonicalize(beforeBlock) === MotaLab.canonicalize(afterBlock)) continue;
+      && MotaLab.canonicalize(MotaLab.blockDeltaProjection(beforeBlock))
+        === MotaLab.canonicalize(MotaLab.blockDeltaProjection(afterBlock))) continue;
     if (beforeBlock) removed.push(beforeBlock);
     if (afterBlock) added.push(afterBlock);
   }

@@ -540,6 +540,44 @@ test("稳定超时按交互态或引擎态归入允许的 pause_kind", async () 
   );
 });
 
+test("menu_choice 的错误 index/cost/effect/count 在任何引擎输入前 fail closed", async () => {
+  const choice = {
+    choice_id: "moneyShop1:1:attack:4:25", index: 1, text: "攻击+4", cost: 25,
+    effect: { field: "attack", amount: 4 }, counter_flag: "shop_atk", purchase_count: 2,
+  };
+  const before = makeObservation({ hero: { gold: 54 }, shops: [{
+    supported: true, shop_id: "moneyShop1", repeatable: true, choices: [null, choice],
+  }] });
+  const base = {
+    type: "menu_choice", shop_id: "moneyShop1", menu_id: `sha256:${"a".repeat(64)}`,
+    choice_id: choice.choice_id, choice_index: 1, expected_cost: 25,
+    expected_effect: { field: "attack", amount: 4 }, expected_purchase_count: 2,
+  };
+  const variants = [
+    { ...base, choice_index: 0 },
+    { ...base, choice_id: "stale-choice" },
+    { ...base, expected_cost: 24 },
+    { ...base, expected_effect: { field: "defense", amount: 4 } },
+    { ...base, expected_effect: { field: "attack", amount: 5 } },
+    { ...base, expected_purchase_count: 1 },
+    { ...base, shop_id: "foreign" },
+  ];
+  for (const operation of variants) {
+    const adapter = makeAdapter();
+    let menuInputs = 0;
+    adapter.chooseShopChoice = () => { menuInputs += 1; };
+    adapter.closeShopMenu = () => { menuInputs += 1; };
+    const action = makeAction(before, [operation], { gold: -25, attack: 4 });
+    action.action_kind = "PURCHASE_UPGRADE";
+    await assert.rejects(lab.executeAction({
+      action, initialObservation: before, registry: lab.createBlockRegistry(), adapter,
+      observe: () => before, stabilityOptions: fastStability,
+    }), (error) => error.detail_code === "SHOP_PRESTATE_MISMATCH");
+    assert.equal(menuInputs, 0);
+    assert.equal(adapter.calls.direct.length + adapter.calls.route.length, 0);
+  }
+});
+
 test("只有已登记 stair 可用 floor_id=null 执行未知目的换层", async () => {
   const stair = {
     x: 9, y: 3, numeric_id: 90, id: "syntheticStair", cls: "terrains",

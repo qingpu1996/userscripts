@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from mota_lab.api import CycleCoordinator
 from mota_lab.combat import UnknownDamage, combat_outcome
-from mota_lab.deltas import validate_expected_delta
+from mota_lab.deltas import block_delta_projection, validate_expected_delta
 from mota_lab.guards import compare_guard, guard_from_observation
 from mota_lab.models import BlockLabel, CycleRequest, ExpectedDelta, Observation
 from mota_lab.search import SearchCandidate, dominates, limited_depth_search
@@ -28,6 +28,26 @@ from mota_test_support import (
 
 
 class GraphAndModelTests(unittest.TestCase):
+    def test_block_delta_projection_matches_shared_browser_contract(self) -> None:
+        fixture_path = Path(__file__).parents[1] / "fixtures" / "block-delta-projection-contract.json"
+        cases = json.loads(fixture_path.read_text(encoding="utf-8"))["cases"]
+        for sample in cases:
+            with self.subTest(case=sample["name"]):
+                if sample.get("error"):
+                    with self.assertRaises(TypeError):
+                        block_delta_projection(sample["before"])
+                    continue
+                self.assertEqual(
+                    block_delta_projection(sample["before"])
+                    == block_delta_projection(sample["after"]),
+                    sample["equal"],
+                )
+        base = cases[0]["before"]
+        for damage in (float("nan"), float("inf"), float("-inf")):
+            malformed = dict(base, damage=damage)
+            with self.subTest(non_json_damage=damage), self.assertRaises(TypeError):
+                block_delta_projection(malformed)
+
     def test_graph_respects_known_wall_and_finds_reachable_boundary(self) -> None:
         walls = [make_block(x=1, y=y, block_id="wall", cls="terrains", trigger=None) for y in range(11)]
         resource = make_block(x=0, y=3)
@@ -157,6 +177,27 @@ class PlannerCycleTests(unittest.TestCase):
             return coordinator.cycle(request)
         finally:
             coordinator.store.close()
+
+    def test_affordable_restricted_shop_emits_bound_menu_choice(self) -> None:
+        mark_floor(self.settings)
+        shop_block = make_block(x=1, y=0, block_id="moneyShop", cls="npcs", trigger="action")
+        shop_block["shop_id"] = "moneyShop1"
+        label_block(self.settings, shop_block, category="npc", supported=False)
+        observation = make_observation(gold=54, blocks=[shop_block])
+        observation["shops"] = [{
+            "supported": True, "shop_id": "moneyShop1", "repeatable": True,
+            "choices": [
+                {"choice_id": "moneyShop1:0:hp:800:25", "index": 0, "text": "生命+800", "cost": 25, "effect": {"field": "hp", "amount": 800}, "counter_flag": "shop_hp", "purchase_count": 0},
+                {"choice_id": "moneyShop1:1:attack:4:25", "index": 1, "text": "攻击+4", "cost": 25, "effect": {"field": "attack", "amount": 4}, "counter_flag": "shop_atk", "purchase_count": 2},
+                {"choice_id": "moneyShop1:2:defense:4:25", "index": 2, "text": "防御+4", "cost": 25, "effect": {"field": "defense", "amount": 4}, "counter_flag": "shop_def", "purchase_count": 0},
+            ],
+        }]
+        response = self.cycle(observation)
+        self.assertEqual(response["status"], "execute")
+        self.assertEqual(response["action_kind"], "PURCHASE_UPGRADE")
+        self.assertEqual(response["operations"][-1]["type"], "menu_choice")
+        self.assertEqual(response["operations"][-1]["choice_id"], "moneyShop1:1:attack:4:25")
+        self.assertEqual(response["expected_delta"], {"attack": 4, "gold": -25})
 
     def test_unknown_floor_then_unknown_block_pause(self) -> None:
         block = make_block(x=2, y=0)
@@ -612,6 +653,72 @@ class PlannerCycleTests(unittest.TestCase):
         self.assertFalse(
             validate_expected_delta(pre, wrong, expected, action_kind="MOVE_TO_RESOURCE").matches
         )
+
+    def test_auto_f_resource_recovery_ignores_only_derived_enemy_damage(self) -> None:
+        red_gem = make_block(
+            x=3, y=4, block_id="redGem", cls="items", trigger="getItem",
+            numeric_id=27, no_pass=False,
+        )
+        coordinates = [(2, 4), (9, 5), (2, 6), (7, 6), (2, 9)]
+        before_damage = [24, 210, 931, None, 931]
+        after_damage = [20, 168, 456, 3596, 456]
+        before_enemies = [
+            make_enemy_block(x=x, y=y, damage=damage, block_id=f"enemy-{index}")
+            for index, ((x, y), damage) in enumerate(zip(coordinates, before_damage))
+        ]
+        after_enemies = [
+            make_enemy_block(x=x, y=y, damage=damage, block_id=f"enemy-{index}")
+            for index, ((x, y), damage) in enumerate(zip(coordinates, after_damage))
+        ]
+        pre = Observation.model_validate(make_observation(
+            x=3, y=3, attack=23, blocks=[red_gem, *before_enemies],
+        ))
+        post_payload = make_observation(
+            x=3, y=3, attack=26, blocks=after_enemies,
+        )
+        expected = ExpectedDelta.model_validate({
+            "attack": 3,
+            "removed_blocks": [{"x": 3, "y": 4, "id": "redGem"}],
+        })
+        result = validate_expected_delta(
+            pre, Observation.model_validate(post_payload), expected,
+            action_kind="MOVE_TO_RESOURCE",
+        )
+        self.assertTrue(result.matches, result.differences)
+        self.assertEqual(result.actual["changed_block_coordinates"], [{"x": 3, "y": 4}])
+
+        mutations = {
+            "wrong gain": lambda value: value["hero"].__setitem__("attack", 27),
+            "resource remains": lambda value: value["blocks"].append(red_gem),
+            "extra stable block": lambda value: value["blocks"].append(
+                make_block(x=10, y=10, block_id="unexpected")
+            ),
+            "enemy id": lambda value: value["blocks"][0].__setitem__("id", "changed"),
+            "enemy type": lambda value: value["blocks"][0].__setitem__("cls", "enemyChanged"),
+            "enemy position": lambda value: value["blocks"][0].__setitem__("x", 1),
+            "nested enemy": lambda value: value["blocks"][0]["enemy"].__setitem__("hp", 51),
+        }
+        for name, mutate in mutations.items():
+            wrong_payload = json.loads(json.dumps(post_payload))
+            mutate(wrong_payload)
+            wrong = Observation.model_validate(wrong_payload)
+            with self.subTest(case=name):
+                self.assertFalse(validate_expected_delta(
+                    pre, wrong, expected, action_kind="MOVE_TO_RESOURCE",
+                ).matches)
+
+        non_enemy_pre = make_block(x=10, y=9, block_id="mechanism", cls="mechanisms", trigger=None)
+        non_enemy_post = dict(non_enemy_pre, damage=0)
+        pre_with_mechanism = Observation.model_validate(make_observation(
+            x=3, y=3, attack=23, blocks=[red_gem, *before_enemies, non_enemy_pre],
+        ))
+        post_with_changed_mechanism = Observation.model_validate(make_observation(
+            x=3, y=3, attack=26, blocks=[*after_enemies, non_enemy_post],
+        ))
+        self.assertFalse(validate_expected_delta(
+            pre_with_mechanism, post_with_changed_mechanism, expected,
+            action_kind="MOVE_TO_RESOURCE",
+        ).matches)
 
 
 if __name__ == "__main__":

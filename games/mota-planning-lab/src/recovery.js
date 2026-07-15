@@ -15,6 +15,23 @@ MotaLab.classifyPendingRecovery = function classifyPendingRecovery(pending, obse
   if (!pending.pre_observation || !pending.expected_delta) {
     return { phase: "mismatch", detail_code: "RECOVERY_STATE_AMBIGUOUS" };
   }
+  const menuOperation = Array.isArray(pending.operations)
+    ? pending.operations.find((item) => item.type === "menu_choice") : null;
+  if (menuOperation && observation.active_menu
+    && observation.active_menu.shop_id === menuOperation.shop_id
+    && observation.active_menu.menu_id === menuOperation.menu_id) {
+    const before = pending.pre_observation;
+    const unchanged = ["hp", "attack", "defense", "gold", "experience"].every(
+      (field) => before.hero[field] === observation.hero[field],
+    ) && ["yellow", "blue", "red"].every(
+      (color) => before.keys[color] === observation.keys[color],
+    ) && before.map_instance_id === observation.map_instance_id;
+    if (unchanged) return {
+      phase: "not_executed", pending_action_id: pending.action_id,
+      pre_fingerprint: pending.pre_fingerprint, current_fingerprint: fingerprint,
+      detail_code: "SHOP_MENU_OPEN_NOT_EXECUTED",
+    };
+  }
   const declaredFields = pending.expected_delta
     && typeof pending.expected_delta === "object" && !Array.isArray(pending.expected_delta)
     ? Object.keys(pending.expected_delta) : [];
@@ -66,6 +83,16 @@ MotaLab.classifyPendingRecovery = function classifyPendingRecovery(pending, obse
     };
   }
   if (delta.ok) {
+    if (menuOperation) {
+      const shop = (observation.shops || []).find((item) => item.shop_id === menuOperation.shop_id);
+      const choice = shop && shop.choices[menuOperation.choice_index];
+      if (!choice || choice.choice_id !== menuOperation.choice_id
+        || choice.purchase_count !== menuOperation.expected_purchase_count + 1) {
+        return { phase: "mismatch", detail_code: "SHOP_COUNTER_MISMATCH",
+          pending_action_id: pending.action_id,
+          pre_fingerprint: pending.pre_fingerprint, current_fingerprint: fingerprint };
+      }
+    }
     return {
       phase: "completed",
       pending_action_id: pending.action_id,

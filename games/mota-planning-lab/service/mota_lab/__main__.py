@@ -29,8 +29,14 @@ def _boolean_pair(parser: argparse.ArgumentParser, name: str, positive: str, neg
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m mota_lab")
-    parser.add_argument("--state-dir", type=Path)
-    parser.add_argument("--knowledge-dir", type=Path)
+    parser.add_argument(
+        "--state-dir", type=Path,
+        help="deprecated compatibility option; serve ignores it and keeps runtime state in memory",
+    )
+    parser.add_argument(
+        "--knowledge-dir", type=Path,
+        help="deprecated compatibility option; serve ignores it and loads packaged rules read-only",
+    )
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     serve = subcommands.add_parser("serve", help="run the localhost decision service")
@@ -101,6 +107,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
             from .api import create_app
 
+            # Compatibility directory options are deliberately ignored by
+            # production serve.  They remain available only to offline label
+            # authoring subcommands below.
+            settings = Settings.from_env()
             settings = replace(settings, direct_mount_origin=args.allow_direct_mount_origin)
             uvicorn.run(create_app(settings), host="127.0.0.1", port=args.port)
             return 0

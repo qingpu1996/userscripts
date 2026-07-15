@@ -59,6 +59,11 @@ def historical_map_fact_payload(observation: Observation, fingerprint: str) -> d
 
 def fingerprint_payload(observation: Observation) -> dict:
     payload = observation_payload(observation, include_timestamp=False)
+    blocks = []
+    for block in payload["blocks"]:
+        normalized = dict(block)
+        normalized["shop_id"] = normalized.get("shop_id")
+        blocks.append(normalized)
     result = {
         "floor_id": payload["floor_id"],
         "session_id": payload["session_id"],
@@ -68,11 +73,13 @@ def fingerprint_payload(observation: Observation) -> dict:
         "topology_fingerprint": payload["topology_fingerprint"],
         "hero": payload["hero"],
         "keys": payload["keys"],
-        "blocks": payload["blocks"],
+        "blocks": blocks,
     }
     if observation.engine_model is not None:
         result["catalog_hash"] = observation.engine_model.catalog_hash
         result["engine_model_hash"] = observation.engine_model.model_hash
+    if "shops" in observation.model_fields_set:
+        result["shops"] = payload.get("shops", [])
     return result
 
 

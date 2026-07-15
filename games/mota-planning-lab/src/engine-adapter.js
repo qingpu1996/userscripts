@@ -300,6 +300,9 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
     const disabled = block.disable === true || (event && event.disable === true);
     const noPassValue = event && event.noPass !== undefined ? event.noPass
       : block.noPass !== undefined ? block.noPass : block.no_pass;
+    const actions = event && Array.isArray(event.data) ? event.data : [];
+    const shopActions = actions.filter((item) => item && item.type === "openShop"
+      && typeof item.id === "string" && item.open === true);
     return {
       x: block.x,
       y: block.y,
@@ -309,6 +312,7 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
       trigger: trigger === undefined || trigger === null ? null : String(trigger),
       no_pass: Boolean(noPassValue),
       disabled,
+      shop_id: shopActions.length === 1 ? shopActions[0].id : null,
     };
   }
 
@@ -506,6 +510,19 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
       const afterProjection = fenceProjection(after);
       if (sameRuntime
         && MotaLab.canonicalize(beforeProjection) === MotaLab.canonicalize(afterProjection)) {
+        let shopSource = {};
+        try {
+          shopSource = runtime.status.shops || {};
+        } catch (_error) {
+          shopSource = {};
+        }
+        const flagValues = runtime.status.hero && runtime.status.hero.flags
+          && typeof runtime.status.hero.flags === "object" ? runtime.status.hero.flags : {};
+        const shops = Object.entries(shopSource).map(([id, raw]) => (
+          MotaLab.parseRestrictedShop(id, raw, flagValues)
+        )).filter((shop) => shop.supported);
+        const activeMenus = shops.map((shop) => MotaLab.readRestrictedShopMenu(runtime, shop))
+          .filter(Boolean);
         return {
           floor_id: before.floor_id,
           map,
@@ -513,6 +530,8 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
           blocks,
           busy: before.busy,
           engine_model: engineModel,
+          shops,
+          active_menu: activeMenus.length === 1 ? activeMenus[0] : null,
         };
       }
       attempts.push({
@@ -592,6 +611,26 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
     if (runtime && typeof runtime.stopAutomaticRoute === "function") runtime.stopAutomaticRoute();
   }
 
+  function chooseShopChoice(expectedShop, choiceIndex) {
+    const runtime = requireRuntime();
+    const menu = MotaLab.readRestrictedShopMenu(runtime, expectedShop);
+    if (!menu || menu.ready !== true || menu.choices[choiceIndex] !== expectedShop.choices[choiceIndex].choice_id
+      || choiceIndex < 0 || choiceIndex > 8 || !runtime.actions
+      || typeof runtime.actions.keyUp !== "function") {
+      throw MotaLab.createPauseError("UNSUPPORTED_INTERACTION", "SHOP_MENU_IDENTITY_MISMATCH");
+    }
+    return runtime.actions.keyUp({ keyCode: 49 + choiceIndex });
+  }
+
+  function closeShopMenu(expectedShop) {
+    const runtime = requireRuntime();
+    if (!MotaLab.readRestrictedShopMenu(runtime, expectedShop) || !runtime.actions
+      || typeof runtime.actions.keyUp !== "function") {
+      throw MotaLab.createPauseError("UNSUPPORTED_INTERACTION", "SHOP_MENU_IDENTITY_MISMATCH");
+    }
+    return runtime.actions.keyUp({ keyCode: 27 });
+  }
+
   function physicalSaveLoad() {
     return { executed: false, reason: "PHYSICAL_SAVE_LOAD_DISABLED" };
   }
@@ -607,6 +646,8 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
     moveDirectly,
     setAutomaticRoute,
     stopAutomaticRoute,
+    chooseShopChoice,
+    closeShopMenu,
     physicalSaveLoad,
   });
 };

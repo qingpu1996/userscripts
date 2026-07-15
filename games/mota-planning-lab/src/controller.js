@@ -15,7 +15,12 @@ MotaLab.createController = function createController(dependencies, options = {})
   const logger = dependencies.logger || console;
   const autoSchedule = options.autoSchedule === true;
   const cycleDelayMs = MotaLab.isFiniteInteger(options.cycleDelayMs) ? options.cycleDelayMs : 300;
+  const idleMaxDelayMs = MotaLab.isFiniteInteger(options.idleMaxDelayMs)
+    ? Math.max(cycleDelayMs, options.idleMaxDelayMs) : 5000;
+  const busySampleMs = MotaLab.isFiniteInteger(options.busySampleMs) ? options.busySampleMs : 100;
+  const busyTimeoutMs = MotaLab.isFiniteInteger(options.busyTimeoutMs) ? options.busyTimeoutMs : 1500;
   const schedule = options.schedule || ((callback, delay) => setTimeout(callback, delay));
+  const sleep = dependencies.sleep || ((delay) => new Promise((resolve) => setTimeout(resolve, delay)));
   let state = "STOPPED";
   let currentObservation = null;
   let currentActionId = null;
@@ -27,6 +32,14 @@ MotaLab.createController = function createController(dependencies, options = {})
     ? globalThis.performance.now() : Date.now());
   const timingHistory = [];
   let activeTiming = null;
+  let idleFingerprint = null;
+  let idleDelayMs = cycleDelayMs;
+  let loopEpoch = 0;
+  const loopDiagnostics = {
+    idle_probes: 0, idle_service_skips: 0, idle_wakeups: 0,
+    idle_last_delay_ms: 0, busy_samples: 0, busy_waits: 0,
+    busy_transient_recoveries: 0, busy_timeouts: 0,
+  };
 
   function locationText(observation) {
     return observation
@@ -123,6 +136,62 @@ MotaLab.createController = function createController(dependencies, options = {})
   function scheduleNext(delay = cycleDelayMs) {
     if (!autoSchedule || !journal.snapshot().autopilot_enabled) return;
     schedule(() => { runSingleCycle(); }, delay);
+  }
+
+  function resetIdleBackoff() {
+    loopEpoch += 1;
+    idleFingerprint = null;
+    idleDelayMs = cycleDelayMs;
+    loopDiagnostics.idle_last_delay_ms = 0;
+  }
+
+  function scheduleIdleProbe(fingerprint) {
+    if (!autoSchedule || !journal.snapshot().autopilot_enabled) return;
+    idleFingerprint = fingerprint;
+    const delay = idleDelayMs;
+    loopDiagnostics.idle_last_delay_ms = delay;
+    idleDelayMs = Math.min(idleMaxDelayMs, Math.max(cycleDelayMs, delay * 2));
+    const scheduledEpoch = loopEpoch;
+    schedule(() => {
+      if (scheduledEpoch !== loopEpoch || !journal.snapshot().autopilot_enabled || cyclePromise) return;
+      loopDiagnostics.idle_probes += 1;
+      let observation;
+      try { observation = capture(); }
+      catch (error) { handleError(error); return; }
+      const nextFingerprint = MotaLab.fingerprintObservation(observation);
+      const snapshot = journal.snapshot();
+      if (!observation.busy && !snapshot.pending_action && nextFingerprint === idleFingerprint) {
+        loopDiagnostics.idle_service_skips += 1;
+        scheduleIdleProbe(idleFingerprint);
+        return;
+      }
+      loopDiagnostics.idle_wakeups += 1;
+      resetIdleBackoff();
+      runSingleCycle();
+    }, delay);
+  }
+
+  async function waitForStableNotBusy(initialObservation) {
+    let observation = initialObservation;
+    let elapsed = 0;
+    let clearSamples = 0;
+    while (observation.busy && elapsed < busyTimeoutMs || clearSamples === 1) {
+      loopDiagnostics.busy_waits += 1;
+      await sleep(busySampleMs);
+      elapsed += busySampleMs;
+      observation = capture();
+      loopDiagnostics.busy_samples += 1;
+      if (observation.busy) clearSamples = 0;
+      else clearSamples += 1;
+      if (clearSamples >= 2) {
+        loopDiagnostics.busy_transient_recoveries += 1;
+        return observation;
+      }
+      if (elapsed >= busyTimeoutMs && observation.busy) break;
+    }
+    if (!observation.busy) return observation;
+    loopDiagnostics.busy_timeouts += 1;
+    return null;
   }
 
   async function initialize() {
@@ -305,6 +374,7 @@ MotaLab.createController = function createController(dependencies, options = {})
         if (!result || !result.verified) return result;
       }
       journal.setAutopilot(true);
+      resetIdleBackoff();
       state = "OBSERVING";
       lastReason = "用户已启动自动驾驶";
       refreshPanel({ autopilot: true, pause_kind: null });
@@ -317,6 +387,7 @@ MotaLab.createController = function createController(dependencies, options = {})
   function manualPause() {
     try { adapter.stopAutomaticRoute(); } catch (_) { /* best-effort stop */ }
     try {
+      resetIdleBackoff();
       journal.setAutopilot(false);
       state = "STOPPED";
       lastReason = "用户手动暂停";
@@ -373,9 +444,22 @@ MotaLab.createController = function createController(dependencies, options = {})
   async function cycleBody() {
     if (!journal.snapshot().autopilot_enabled) return { skipped: "disabled" };
     state = "OBSERVING";
-    const observation = capture();
-    if (observation.busy) {
-      return pause("UNSUPPORTED_INTERACTION", "GAME_BUSY_BEFORE_DECISION", {}, observation);
+    let observation = capture();
+    const pendingAtCapture = journal.snapshot().pending_action;
+    const pendingMenu = pendingAtCapture && Array.isArray(pendingAtCapture.operations)
+      ? pendingAtCapture.operations.find((item) => item.type === "menu_choice") : null;
+    const recoverableShopMenu = pendingMenu && observation.active_menu
+      && observation.active_menu.shop_id === pendingMenu.shop_id
+      && observation.active_menu.menu_id === pendingMenu.menu_id;
+    if (observation.busy && !recoverableShopMenu) {
+      const settled = await waitForStableNotBusy(observation);
+      if (!settled) {
+        return pause("UNSUPPORTED_INTERACTION", "GAME_BUSY_BEFORE_DECISION", {
+          busy_timeout_ms: busyTimeoutMs,
+          busy_sample_ms: busySampleMs,
+        }, currentObservation);
+      }
+      observation = settled;
     }
     const fingerprint = MotaLab.fingerprintObservation(observation);
     let snapshot = journal.snapshot();
@@ -454,7 +538,12 @@ MotaLab.createController = function createController(dependencies, options = {})
       state = "OBSERVING";
       lastReason = response.reason;
       refreshPanel({ connected: true });
-      scheduleNext();
+      if (journal.snapshot().pending_action || completedActionId) {
+        resetIdleBackoff();
+        scheduleNext();
+      } else {
+        scheduleIdleProbe(fingerprint);
+      }
       return { idle: true };
     }
 
@@ -568,7 +657,10 @@ MotaLab.createController = function createController(dependencies, options = {})
     let planned;
     let actionConstraints;
     try {
-      planned = MotaLab.planOperations(response, freshObservation, registry, adapter);
+      const responseMenu = response.operations.find((item) => item.type === "menu_choice");
+      planned = MotaLab.planOperations(responseMenu
+        ? Object.assign({}, response, { operations: response.operations.filter((item) => item.type === "grid") })
+        : response, freshObservation, registry, adapter);
       const allowUnknownFloor = response.expected_delta.floor_id === null
         && planned.length > 0 && planned[planned.length - 1].category === "stair";
       const allowUnknownMapInstance = response.expected_delta.map_instance_id === null
@@ -579,7 +671,8 @@ MotaLab.createController = function createController(dependencies, options = {})
         dimensions: freshObservation.dimensions,
         topology: freshObservation.topology,
       });
-      actionConstraints = MotaLab.validateActionPostconditions(planned, response.expected_delta);
+      actionConstraints = responseMenu ? { requires_non_position_change: true }
+        : MotaLab.validateActionPostconditions(planned, response.expected_delta);
     } catch (error) {
       if (MotaLab.isPauseError(error)
         && ["UNSAFE_MULTI_BOUNDARY_RESPONSE", "UNSAFE_ROUTE_RESPONSE"].includes(error.detail_code)) {
@@ -690,6 +783,7 @@ MotaLab.createController = function createController(dependencies, options = {})
       completed_at: Date.now(),
       recovered: false,
     });
+    resetIdleBackoff();
     state = "REPORTING";
     lastReason = `行动 ${response.action_id} 已完成并通过差分校验`;
     refreshPanel();
@@ -857,6 +951,7 @@ MotaLab.createController = function createController(dependencies, options = {})
         cycles: MotaLab.cloneJsonValue(timingHistory),
         active: activeTiming ? MotaLab.cloneJsonValue(activeTiming) : null,
         journal: typeof journal.getDiagnostics === "function" ? journal.getDiagnostics() : null,
+        loop: MotaLab.cloneJsonValue(loopDiagnostics),
       };
     },
     getState: () => state,

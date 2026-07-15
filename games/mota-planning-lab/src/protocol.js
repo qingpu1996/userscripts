@@ -37,7 +37,7 @@ MotaLab.cloneObservationForWire = function cloneObservationForWire(observation) 
       red: observation.keys.red,
     },
     busy: observation.busy,
-    blocks: observation.blocks.map((block) => ({
+    blocks: observation.blocks.map((block) => Object.assign({
       x: block.x,
       y: block.y,
       numeric_id: block.numeric_id,
@@ -54,11 +54,16 @@ MotaLab.cloneObservationForWire = function cloneObservationForWire(observation) 
         experience: block.enemy.experience,
         special: block.enemy.special.slice(),
       } : null,
-    })),
+    }, typeof block.shop_id === "string" ? { shop_id: block.shop_id } : {})),
     captured_at: observation.captured_at,
   };
   if (observation.engine_model !== undefined) {
     wire.engine_model = MotaLab.cloneJsonValue(observation.engine_model);
+  }
+  if (Array.isArray(observation.shops)) wire.shops = MotaLab.cloneJsonValue(observation.shops);
+  if (observation.active_menu !== undefined) {
+    wire.active_menu = observation.active_menu === null
+      ? null : MotaLab.cloneJsonValue(observation.active_menu);
   }
   return wire;
 };
@@ -234,10 +239,26 @@ MotaLab.validateResponseGuard = function validateResponseGuard(value) {
 };
 
 MotaLab.validateOperation = function validateOperation(operation, dimensions) {
-  MotaLab.assertProtocolShape(operation, ["type", "x", "y"], [], "operation");
-  if (operation.type !== "grid") {
-    throw new TypeError("Only grid operations are supported");
+  if (operation && operation.type === "menu_choice") {
+    MotaLab.assertProtocolShape(operation, [
+      "type", "shop_id", "menu_id", "choice_id", "choice_index", "expected_cost",
+      "expected_effect", "expected_purchase_count",
+    ], [], "menu choice operation");
+    if (typeof operation.shop_id !== "string" || operation.shop_id.length < 1
+      || typeof operation.choice_id !== "string" || operation.choice_id.length < 1
+      || typeof operation.menu_id !== "string" || !/^sha256:[a-f0-9]{64}$/u.test(operation.menu_id)
+      || !MotaLab.isFiniteInteger(operation.choice_index) || operation.choice_index < 0
+      || operation.choice_index > 8 || !MotaLab.isFiniteInteger(operation.expected_cost)
+      || operation.expected_cost < 1 || !MotaLab.isFiniteInteger(operation.expected_purchase_count)
+      || operation.expected_purchase_count < 0 || !MotaLab.isProtocolObject(operation.expected_effect)
+      || !["hp", "attack", "defense"].includes(operation.expected_effect.field)
+      || !MotaLab.isFiniteInteger(operation.expected_effect.amount)
+      || operation.expected_effect.amount < 1) throw new TypeError("Invalid menu choice operation");
+    MotaLab.assertProtocolShape(operation.expected_effect, ["field", "amount"], [], "shop effect");
+    return MotaLab.cloneJsonValue(operation);
   }
+  MotaLab.assertProtocolShape(operation, ["type", "x", "y"], [], "operation");
+  if (operation.type !== "grid") throw new TypeError("Unsupported operation type");
   if (!MotaLab.isFiniteInteger(operation.x) || !MotaLab.isFiniteInteger(operation.y)
     || operation.x < 0 || operation.x >= dimensions.width
     || operation.y < 0 || operation.y >= dimensions.height) {
@@ -397,7 +418,7 @@ MotaLab.validateCycleResponse = function validateCycleResponse(value) {
   if (typeof value.reason !== "string" || value.reason.length < 1 || value.reason.length > 512) {
     throw new TypeError("Invalid action reason");
   }
-  if (!Array.isArray(value.operations) || value.operations.length < 1 || value.operations.length > 2) {
+  if (!Array.isArray(value.operations) || value.operations.length < 1 || value.operations.length > 3) {
     throw new TypeError("Invalid operations");
   }
   if (!MotaLab.isProtocolObject(value.expected_delta)

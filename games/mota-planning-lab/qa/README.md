@@ -1,5 +1,22 @@
 # QA 证据索引
 
+> 本索引包含旧版磁盘恢复方案的历史证据，仅用于版本追溯，不代表当前 production 契约。当前运行状态纯内存，重启后 fresh start。
+
+## 纯内存测试契约迁移
+
+本轮没有恢复旧版磁盘 journal、SQLite 文件恢复或跨进程 action replay 测试。整文件删除前仍适用于当前版本的契约，迁移到以下聚焦位置：
+
+| 旧测试来源 | 当前仍有效的契约 | 当前测试位置 |
+| --- | --- | --- |
+| `tests/python/test_runtime_v2.py` | world search、planning budget、verified transition、循环避免、不可战斗怪物、takeover scan | `tests/python/test_memory_planner_contracts.py`；独立进展分支同时在 `tests/python/test_state_planner.py` |
+| `tests/python/test_storage_recovery_cli.py` | 同进程 completed ACK、expected delta mismatch、reconnect-only、loopback host/默认端口/端口范围 | `tests/python/test_memory_planner_contracts.py` |
+| `tests/js/journal-client-controller.test.js` | localhost client、严格响应协议、controller single-flight、显式启动/停止、guard、completed ACK/delta report、重复 action identity | `tests/js/client-controller-memory-contract.test.js` |
+| `tests/js/journal-dual-slot.test.js` 与 `tests/js/runtime-v2.test.js` 的持久化部分 | 浏览器 storage、双槽 generation、legacy quarantine、刷新/重启恢复 | **不迁移**：与当前纯内存、fresh-session 契约冲突 |
+
+这些测试只锁定工程行为，不证明 planner 的战略正确性、门后全局可行性、全局最优或安全通关。
+
+当前完整离线测试计数：`112` 项 JavaScript、`70` 项 Python、`1` 项 integration，共 `183` 项；协议/Schema、静态完整性、双 dist 确定性重建和文档校验另行执行并全部通过。
+
 历史 v0.1 evidence 保留在既有日期目录，只描述当时固定尺寸执行原型，不代表 Protocol v2。
 
 本轮 v2 证据：[`runs/2026-07-14-runtime-v2/`](runs/2026-07-14-runtime-v2/)。覆盖动态 topology、session baseline、世界图、direct mount、CORS、构建确定性与完整离线闭环。

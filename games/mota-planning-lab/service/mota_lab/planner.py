@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import deque
+import hashlib
+import json
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 from .combat import UnknownDamage, combat_availability, combat_outcome
@@ -14,6 +16,7 @@ from .models import (
     ExecuteResponse,
     ExpectedDelta,
     GridOperation,
+    MenuChoiceOperation,
     HistoricalMapFact,
     IdleResponse,
     Observation,
@@ -108,7 +111,6 @@ class Planner:
             details=details,
             registry_entries=registry_entries,
         )
-
     def _pause_for_unsupported(
         self,
         boundaries: List[Boundary],
@@ -641,10 +643,10 @@ class Planner:
         Each simulated boundary is consumed before reachability is rebuilt.  A
         cross-map step is possible only through a transition that was recorded
         from a real completed action.  The returned action is still only the
-        first atomic boundary of the best audited path.  Enemy facts are the
-        exception: they may be consumed only from the untouched live root and
-        are terminal, because any simulated state change invalidates the live
-        combat panel even when the search later returns to the same map id.
+        first atomic boundary of the best audited path.  Historical enemy facts
+        may be terminal goals only after verified zero-delta transport and only
+        while the simulated resources still equal the live panel.  Any
+        simulated resource/block mutation invalidates their combat panel.
         """
         facts = self._world_facts(observation, world_context)
         transitions: Dict[Tuple[str, int, int], List[Mapping[str, Any]]] = {}
@@ -700,13 +702,61 @@ class Planner:
             graph = CurrentFloorGraph(simulated, labels)
             for boundary in graph.reachable_boundaries():
                 label = boundary.label
+                if boundary.block.shop_id and first is not None:
+                    shop = next((item for item in observation.shops
+                                 if item.shop_id == boundary.block.shop_id), None)
+                    affordable = [] if shop is None else [choice for choice in shop.choices
+                        if choice.index <= 8 and resources.gold >= choice.cost]
+                    if affordable:
+                        choice = max(affordable, key=lambda item: (
+                            item.effect.amount * {"attack": 100.0, "defense": 95.0, "hp": 0.1}[item.effect.field]
+                            - item.cost, -item.index,
+                        ))
+                        delta = {"gold": -choice.cost, choice.effect.field: choice.effect.amount}
+                        next_score = score + value_delta(delta, distance=boundary.distance,
+                                                         progress_bonus=20.0)
+                        target = PlannedBoundary(
+                            boundary=boundary,
+                            expected_delta=ExpectedDelta.model_validate(delta),
+                            search_candidate=SearchCandidate(
+                                key=f"{map_id}:{boundary.block.x},{boundary.block.y}:shop:{shop.shop_id}",
+                                delta=delta, distance=boundary.distance, progress_bonus=20.0,
+                            ),
+                        )
+                        if best is None or (next_score, -(depth + 1)) > (best.score, -best.path_length):
+                            best = WorldSearchResult(first, target, map_id, next_score,
+                                                     explored, depth + 1)
+                    continue
                 if not label.supported or block_label_execution_error(label) is not None:
                     continue
                 if label.category == "enemy" and not live_root:
-                    # Historical combat facts are audit-only.  This also
-                    # rejects same-map resource/door changes and A->B->A
-                    # returns: map identity alone never restores freshness.
-                    continue
+                    # A historical combat panel is usable only on a genuinely
+                    # remote map after verified zero-delta transport. Returning
+                    # to the live map does not make its old panel fresh again.
+                    if (
+                        map_id == observation.map_instance_id
+                        or resources != initial_resources
+                        or removed
+                    ):
+                        continue
+                    # Historical damage is not live engine truth.  Even if an
+                    # older fact contains a numeric damage value, never route
+                    # toward it when the simulated hero cannot penetrate the
+                    # coordinate-local defense recorded in that same fact.
+                    defense = None if boundary.block.enemy is None else boundary.block.enemy.defense
+                    if (
+                        isinstance(defense, int)
+                        and not isinstance(defense, bool)
+                        and resources.attack <= defense
+                    ):
+                        continue
+                    try:
+                        availability = combat_availability(block=boundary.block,
+                                                           hero_attack=resources.attack)
+                    except UnknownDamage:
+                        continue
+                    if availability != "fightable":
+                        continue
                 try:
                     expected = self._expected_for(boundary)
                 except (ValueError, UnknownDamage):
@@ -771,7 +821,18 @@ class Planner:
                     distance=boundary.distance,
                     progress_bonus=PROGRESS_BONUS.get(label.category, 0.0),
                 )
-                if best is None or (next_score, -path_length) > (best.score, -best.path_length):
+                # A scarce blue/red door is transport to a possible payoff,
+                # not progress by itself. A negative standalone door may
+                # become the first step only if a later reachable supported
+                # frontier makes the complete branch preferable.
+                key_delta = delta.get("keys") or {}
+                consumes_scarce_key = any(
+                    key_delta.get(color, 0) < 0 for color in ("blue", "red")
+                )
+                terminal_door = consumes_scarce_key and next_score < score
+                if not terminal_door and (
+                    best is None or (next_score, -path_length) > (best.score, -best.path_length)
+                ):
                     best = WorldSearchResult(
                         first_candidate, candidate, map_id, next_score, explored, path_length
                     )
@@ -869,6 +930,55 @@ class Planner:
 
         graph = CurrentFloorGraph(observation, labels)
         boundaries = graph.reachable_boundaries()
+        shop_by_id = {shop.shop_id: shop for shop in observation.shops}
+        shop_candidates = []
+        for boundary in boundaries:
+            shop_id = boundary.block.shop_id
+            shop = shop_by_id.get(shop_id) if shop_id else None
+            if shop is None:
+                continue
+            for choice in shop.choices:
+                if choice.index > 8 or observation.hero.gold < choice.cost:
+                    continue
+                # Stable, generic marginal utility. Attack/defense upgrades are
+                # preferred over HP when all are affordable; no floor/route is hard-coded.
+                weight = {"attack": 100.0, "defense": 95.0, "hp": 0.1}[choice.effect.field]
+                score = choice.effect.amount * weight - choice.cost - boundary.distance
+                if score > 0:
+                    shop_candidates.append((score, boundary, shop, choice))
+        if shop_candidates:
+            _, boundary, shop, choice = max(shop_candidates, key=lambda item: (
+                item[0], -item[1].distance, -item[3].index,
+            ))
+            menu_payload = [{
+                "text": item.text, "cost": item.cost,
+                "effect": item.effect.model_dump(mode="json"),
+                "counter_flag": item.counter_flag,
+            } for item in shop.choices]
+            menu_id = "sha256:" + hashlib.sha256(json.dumps(
+                menu_payload, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            operations: List[Any] = []
+            start = (observation.hero.loc.x, observation.hero.loc.y)
+            path = graph.reachable().path_to(boundary.approach)
+            if boundary.approach != start and path:
+                operations.append(GridOperation(type="grid", x=boundary.approach[0], y=boundary.approach[1]))
+            operations.append(GridOperation(type="grid", x=boundary.block.x, y=boundary.block.y))
+            operations.append(MenuChoiceOperation(
+                type="menu_choice", shop_id=shop.shop_id, menu_id=menu_id,
+                choice_id=choice.choice_id, choice_index=choice.index,
+                expected_cost=choice.cost, expected_effect=choice.effect,
+                expected_purchase_count=choice.purchase_count,
+            ))
+            delta = {"gold": -choice.cost, choice.effect.field: choice.effect.amount}
+            return ExecuteResponse(
+                status="execute", action_id=action_id_factory(), action_kind="PURCHASE_UPGRADE",
+                operations=operations, guard=guard_from_observation(observation),
+                expected_delta=ExpectedDelta.model_validate(delta),
+                reason=f"购买已静态验证的商店升级 {shop.shop_id}/{choice.choice_id}。",
+                supersedes_action_id=supersedes_action_id, registry_entries=registry_entries,
+            )
         unsupported = [boundary for boundary in boundaries if not boundary.label.supported]
         planned: List[PlannedBoundary] = []
         for boundary in boundaries:
@@ -991,6 +1101,15 @@ class Planner:
                 distance=candidate.distance,
                 progress_bonus=candidate.progress_bonus,
             )
+            key_delta = candidate.delta.get("keys") or {}
+            consumes_scarce_key = any(
+                key_delta.get(color, 0) < 0 for color in ("blue", "red")
+            )
+            if consumes_scarce_key and score < 0:
+                # Do not spend a scarce blue/red key merely because every
+                # alternative also has a negative score. World search can
+                # still select it when a downstream payoff justifies it.
+                continue
             scored.append((score, -candidate.distance, item))
         if len(scored) > self.planning_budget:
             return self._pause(

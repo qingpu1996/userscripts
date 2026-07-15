@@ -824,32 +824,21 @@ test("唯一页面运行时入口与 localhost metadata 均满足约束", () => 
   assert.equal(config.metadata.downloadURL, undefined);
   assert.deepEqual(config.metadata.match, ["https://h5mota.com/games/24/*"]);
   assert.deepEqual(config.metadata.grant, [
-    "unsafeWindow", "GM_getValue", "GM_setValue", "GM_deleteValue", "GM_listValues",
-    "GM_registerMenuCommand", "GM_xmlhttpRequest",
+    "unsafeWindow", "GM_registerMenuCommand", "GM_xmlhttpRequest",
   ]);
   assert.equal(config.metadata["run-at"], "document-idle");
   assert.equal(config.metadata.connect, "127.0.0.1");
 });
 
-test("双构建物均包含 A/B generation、canonical 写后验证与底层删除门禁", () => {
+test("双构建物均为纯内存且不含浏览器持久化写入口", () => {
   const repoDir = path.resolve(projectDir, "../..");
   for (const name of [
     "mota-planning-lab.user.js",
     "mota-planning-lab.direct-mount.js",
   ]) {
     const artifact = fs.readFileSync(path.join(repoDir, "dist", name), "utf8");
-    for (const marker of [
-      "JOURNAL_STORAGE_UNSTABLE",
-      "GM_setValue-readback-1",
-      "GM_setValue-readback-2",
-      "GM_deleteValue-readback",
-      "localStorage.setItem-readback",
-      "localStorage.removeItem-readback",
-      "JOURNAL_SLOT_KEYS",
-      "previous_commit_hash",
-      "journal-generation-write",
-      "candidate-readback-invalid",
-      "complete_candidate_observed",
-    ]) assert.match(artifact, new RegExp(marker.replaceAll(".", "\\."), "u"), `${name}: ${marker}`);
+    assert.match(artifact, /memory_only/u);
+    for (const marker of ["localStorage.setItem", "GM_setValue(", "journal-generation-write",
+      "unresolved_action_replayed"]) assert.equal(artifact.includes(marker), false, `${name}: ${marker}`);
   }
 });

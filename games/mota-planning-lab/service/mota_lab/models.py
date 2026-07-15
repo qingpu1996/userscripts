@@ -100,6 +100,37 @@ class Block(StrictModel):
     # runtime API failure into an apparently known engine sentinel.
     damage: Union[NonNegativeInt, Literal["???"], None]
     enemy: Optional[Enemy] = None
+    shop_id: Optional[CatalogId] = None
+
+
+class ShopEffect(StrictModel):
+    field: Literal["hp", "attack", "defense"]
+    amount: conint(strict=True, ge=1, le=1_000_000_000)
+
+
+class ShopChoice(StrictModel):
+    choice_id: NonEmptyString
+    index: conint(strict=True, ge=0, le=31)
+    text: NonEmptyString
+    cost: conint(strict=True, ge=1, le=1_000_000_000)
+    effect: ShopEffect
+    counter_flag: NonEmptyString
+    purchase_count: NonNegativeInt
+
+
+class Shop(StrictModel):
+    supported: Literal[True]
+    shop_id: CatalogId
+    repeatable: Literal[True]
+    choices: List[ShopChoice] = Field(min_length=1, max_length=32)
+
+
+class ActiveMenu(StrictModel):
+    shop_id: CatalogId
+    menu_id: Fingerprint
+    ready: Literal[True]
+    selection: Optional[conint(strict=True, ge=0, le=31)]
+    choices: List[NonEmptyString] = Field(min_length=1, max_length=32)
 
 
 class Topology(StrictModel):
@@ -277,6 +308,8 @@ class Observation(StrictModel):
     busy: StrictBool
     blocks: List[Block] = Field(max_length=8192)
     engine_model: Optional[EngineModel] = None
+    shops: List[Shop] = Field(default_factory=list, max_length=64)
+    active_menu: Optional[ActiveMenu] = None
     captured_at: NonNegativeInt
 
     @model_validator(mode="before")
@@ -557,6 +590,20 @@ class GridOperation(StrictModel):
     y: Coordinate
 
 
+class MenuChoiceOperation(StrictModel):
+    type: Literal["menu_choice"]
+    shop_id: CatalogId
+    menu_id: Fingerprint
+    choice_id: NonEmptyString
+    choice_index: conint(strict=True, ge=0, le=8)
+    expected_cost: conint(strict=True, ge=1, le=1_000_000_000)
+    expected_effect: ShopEffect
+    expected_purchase_count: NonNegativeInt
+
+
+Operation = Union[GridOperation, MenuChoiceOperation]
+
+
 class RegistryEntry(StrictModel):
     id: NonEmptyString
     cls: NonEmptyString
@@ -640,7 +687,7 @@ class ExecuteResponse(StrictModel):
     status: Literal["execute"]
     action_id: ActionId
     action_kind: constr(strict=True, pattern=r"^[A-Z][A-Z0-9_]{2,63}$")
-    operations: List[GridOperation] = Field(min_length=1, max_length=2)
+    operations: List[Operation] = Field(min_length=1, max_length=3)
     guard: Guard
     expected_delta: ExpectedDelta
     reason: constr(strict=True, min_length=1, max_length=512)
@@ -664,6 +711,8 @@ class ExecuteResponse(StrictModel):
         if not self.expected_delta.model_fields_set:
             raise ValueError("execute expected_delta must declare at least one postcondition")
         for operation in self.operations:
+            if operation.type != "grid":
+                continue
             if operation.x >= self.guard.dimensions.width or operation.y >= self.guard.dimensions.height:
                 raise ValueError("operation coordinate is outside guard dimensions")
         return self

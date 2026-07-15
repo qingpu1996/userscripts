@@ -66,6 +66,139 @@ function fakeCore() {
   };
 }
 
+function decode(dynamicMap, definitionMap, width, height) {
+  const fail = (code, details) => {
+    const error = new Error(code);
+    error.detail_code = code;
+    error.details = details;
+    throw error;
+  };
+  return lab.decodeDetachedDynamicMap("MT-test", dynamicMap, definitionMap, width, height, fail);
+}
+
+test("detached dynamic map 解压官方 0/-1 token，保留动态值且不修改输入", () => {
+  const definition = [[1, 2, 3], [4, 5, 6]];
+  const dynamic = [0, [-1, 0, 124]];
+  const beforeDefinition = structuredClone(definition);
+  const beforeDynamic = structuredClone(dynamic);
+  const decoded = decode(dynamic, definition, 3, 2);
+  assert.deepEqual(decoded, [[1, 2, 3], [4, 0, 124]]);
+  assert.deepEqual(definition, beforeDefinition);
+  assert.deepEqual(dynamic, beforeDynamic);
+  assert.notEqual(decoded[0], definition[0]);
+  assert.notEqual(decoded[1], dynamic[1]);
+});
+
+test("detached dynamic map 支持全压缩、部分压缩、动态尺寸和完整二维回归", () => {
+  const definition = [[7, 8], [9, 10], [11, 12]];
+  assert.deepEqual(decode([0, 0, 0], definition, 2, 3), definition);
+  assert.deepEqual(decode([0, [-1, 23], [0, -1]], definition, 2, 3), [
+    [7, 8], [9, 23], [0, 12],
+  ]);
+  const full = [[0, 2], [3, 4], [5, 6]];
+  const decoded = decode(full, definition, 2, 3);
+  assert.deepEqual(decoded, full);
+  assert.notEqual(decoded, full);
+  assert.notEqual(decoded[0], full[0]);
+  assert.deepEqual(decode(undefined, definition, 2, 3), definition);
+});
+
+test("detached dynamic map 对非法压缩 token、定义和尺寸 fail closed", () => {
+  const definition = [[1, 2], [3, 4]];
+  const cases = [
+    { dynamic: [1, 0], definition, width: 2, height: 2, reason: "dynamic_row_token_invalid" },
+    { dynamic: [[-2, -1], 0], definition, width: 2, height: 2, reason: "dynamic_cell_token_invalid" },
+    { dynamic: [[NaN, -1], 0], definition, width: 2, height: 2, reason: "dynamic_cell_token_invalid" },
+    { dynamic: [[1.5, -1], 0], definition, width: 2, height: 2, reason: "dynamic_cell_token_invalid" },
+    { dynamic: [["1", -1], 0], definition, width: 2, height: 2, reason: "dynamic_cell_token_invalid" },
+    { dynamic: [[null, -1], 0], definition, width: 2, height: 2, reason: "dynamic_cell_token_invalid" },
+    { dynamic: [[{}, -1], 0], definition, width: 2, height: 2, reason: "dynamic_cell_token_invalid" },
+    { dynamic: [[-1], 0], definition, width: 2, height: 2, reason: "dynamic_width_mismatch" },
+    { dynamic: [[-1, -1, -1], 0], definition, width: 2, height: 2, reason: "dynamic_width_mismatch" },
+    { dynamic: [0], definition, width: 2, height: 2, reason: "dynamic_height_mismatch" },
+    { dynamic: [0, 0], definition: undefined, width: 2, height: 2, reason: "definition_height_mismatch" },
+    { dynamic: [0, 0], definition: [[1, 2]], width: 2, height: 2, reason: "definition_height_mismatch" },
+    { dynamic: [0, 0], definition: [[1], [2]], width: 2, height: 2, reason: "definition_width_mismatch" },
+    { dynamic: [0, 0], definition: [[1, -1], [2, 3]], width: 2, height: 2, reason: "definition_cell_invalid" },
+  ];
+  for (const item of cases) {
+    assert.throws(
+      () => decode(item.dynamic, item.definition, item.width, item.height),
+      (error) => error.detail_code === "ENGINE_MODEL_MAP_COMPRESSION_INVALID"
+        && error.details.floor_id === "MT-test" && error.details.reason === item.reason,
+      item.reason,
+    );
+  }
+});
+
+test("真实 MT0/MT1/MT3 压缩 token 与 MT4 完整地图均可采集且不调用解压 API", () => {
+  const staticMap = grid(13, 13, 7);
+  const maps = {
+    MT0: { width: 13, height: 13, map: [
+      0, 0, 0, 0, 0, 0, 0, 0,
+      [-1, -1, -1, -1, -1, -1, 0, -1, -1, -1, -1, -1, -1],
+      [-1, -1, -1, -1, -1, 124, -1, -1, -1, -1, -1, -1, -1],
+      0, 0, 0,
+    ] },
+    MT1: { width: 13, height: 13, map: [
+      0, [-1, -1, -1, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1],
+      0, 0, 0, 0, 0, 0, 0,
+      [-1, -1, -1, -1, -1, -1, 0, -1, -1, -1, -1, -1, -1],
+      0, 0, 0,
+    ] },
+    MT3: { width: 13, height: 13, map: [
+      0,
+      [-1, 0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+      [-1, 0, 0, -1, -1, -1, -1, -1, -1, -1, 0, -1, -1],
+      [-1, 0, 0, -1, -1, -1, 0, -1, -1, -1, -1, -1, -1],
+      [-1, -1, 0, -1, -1, -1, 0, -1, -1, 0, -1, 0, -1],
+      [-1, -1, -1, -1, -1, -1, -1, -1, -1, 0, -1, 0, -1],
+      [-1, 0, -1, -1, 0, 0, 0, -1, -1, 0, -1, 0, -1],
+      [-1, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+      [-1, -1, -1, -1, -1, -1, -1, -1, 0, -1, -1, -1, -1],
+      [-1, -1, -1, -1, -1, 0, -1, 0, -1, 0, -1, -1, -1],
+      [-1, -1, -1, -1, -1, -1, -1, 0, 0, 0, -1, -1, -1],
+      [-1, -1, -1, -1, -1, -1, -1, 0, 0, 0, -1, -1, -1],
+      0,
+    ] },
+    MT4: { width: 13, height: 13, map: grid(13, 13, 4) },
+  };
+  let blockCalls = 0;
+  const core = {
+    status: { maps, hero: { items: {} } },
+    floors: Object.fromEntries(Object.keys(maps).map((id) => [id, {
+      width: 13, height: 13, map: structuredClone(staticMap),
+    }])),
+    maps: { blocksInfo: {} }, material: { items: {}, enemys: {} }, values: {},
+    getMapBlocksObj() { blockCalls += 1; return []; },
+    decompressMap() { throw new Error("runtime decompressMap must not be called"); },
+    extractBlocks() { throw new Error("runtime extractBlocks must not be called"); },
+  };
+  const model = lab.collectEngineModel(core, {});
+  assert.equal(blockCalls, 4);
+  for (const floor of model.floors) {
+    assert.equal(floor.map.length, 13);
+    assert.ok(floor.map.every((row) => row.length === 13));
+  }
+  assert.equal(model.floors.find((floor) => floor.floor_id === "MT0").map[9][5], 124);
+  assert.equal(model.floors.find((floor) => floor.floor_id === "MT1").map[1][6], 0);
+  assert.equal(model.floors.find((floor) => floor.floor_id === "MT3").map[6][5], 0);
+  assert.equal(model.floors.find((floor) => floor.floor_id === "MT4").map[2][11], 4);
+});
+
+test("engine model cache warm refresh 也只解码 detached 当前楼层", () => {
+  const core = fakeCore();
+  core.status.maps.MT0.map = Array.from({ length: 11 }, (_, y) => (
+    y === 5 ? Array.from({ length: 11 }, (_, x) => x === 4 ? 23 : -1) : 0
+  ));
+  const before = structuredClone(core.status.maps.MT0.map);
+  const cache = {};
+  lab.collectEngineModel(core, {}, { cache, currentFloorId: "MT0" });
+  const warm = lab.collectEngineModel(core, {}, { cache, currentFloorId: "MT0" });
+  assert.equal(warm.floors.find((floor) => floor.floor_id === "MT0").map[5][4], 23);
+  assert.deepEqual(core.status.maps.MT0.map, before);
+});
+
 test("完整 engine_model 采集多地图、13x13、异形拓扑和动态 blocks", () => {
   const core = fakeCore();
   const model = lab.collectEngineModel(core, {

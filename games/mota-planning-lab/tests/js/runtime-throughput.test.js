@@ -44,7 +44,7 @@ function largeObservation() {
   return observation;
 }
 
-test("journal 热路径仅持久化最小恢复证据并满足尺寸与时延预算", (t) => {
+test("journal 热路径只用内存、零持久写并满足时延预算", (t) => {
   const observation = largeObservation();
   const storage = lab.createMemoryStorage();
   const journal = lab.createJournal(storage);
@@ -80,16 +80,10 @@ test("journal 热路径仅持久化最小恢复证据并满足尺寸与时延预
   });
   const completedMs = performance.now() - completedStarted;
 
-  const encodedSlots = lab.JOURNAL_SLOT_KEYS.map((key) => storage.get(key, null))
-    .filter(Boolean).map((value) => JSON.stringify(value));
-  const maximumBytes = Math.max(...encodedSlots.map((value) => Buffer.byteLength(value)));
-  for (const encoded of encodedSlots) {
-    assert.equal(encoded.includes('"engine_model"'), false);
-    assert.equal(encoded.includes('"floors"'), false);
-  }
   const medianSnapshot = percentile(snapshots, 0.5);
-  t.diagnostic(`slot_max=${maximumBytes}B snapshot_p50=${medianSnapshot.toFixed(3)}ms prepared=${preparedMs.toFixed(3)}ms completed=${completedMs.toFixed(3)}ms`);
-  assert.ok(maximumBytes <= 128 * 1024, `slot=${maximumBytes}`);
+  t.diagnostic(`persistent_writes=0 snapshot_p50=${medianSnapshot.toFixed(3)}ms prepared=${preparedMs.toFixed(3)}ms completed=${completedMs.toFixed(3)}ms`);
+  assert.equal(journal.getDiagnostics().persistent_writes, 0);
+  for (const key of lab.JOURNAL_SLOT_KEYS) assert.equal(storage.get(key, null), null);
   assert.ok(medianSnapshot <= 2, `snapshot=${medianSnapshot}`);
   assert.ok(preparedMs <= 50, `prepared=${preparedMs}`);
   assert.ok(completedMs <= 50, `completed=${completedMs}`);

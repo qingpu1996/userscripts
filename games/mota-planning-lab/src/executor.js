@@ -148,7 +148,7 @@ MotaLab.executeAction = async function executeAction({
   // The observation used to request the decision is evidence, not a lease on
   // mutable game state.  Re-read the complete current runtime immediately
   // before the first engine API call and require it to be byte-equivalent under
-  // the protocol fingerprint.  This closes the journal-persistence window
+  // the protocol fingerprint.  This closes the in-memory scheduling window
   // between the controller guard check and actual execution.
   const executionObservation = observeFast();
   const guardResult = MotaLab.compareGuard(executionObservation, action.guard);
@@ -171,6 +171,82 @@ MotaLab.executeAction = async function executeAction({
         observation: executionObservation,
       },
     );
+  }
+  const menuOperation = action.operations[action.operations.length - 1];
+  if (menuOperation && menuOperation.type === "menu_choice") {
+    if (action.action_kind !== "PURCHASE_UPGRADE") {
+      throw MotaLab.createPauseError("UNSUPPORTED_INTERACTION", "SHOP_ACTION_KIND_INVALID");
+    }
+    const shop = (executionObservation.shops || []).find((item) => item.shop_id === menuOperation.shop_id);
+    const choice = shop && shop.choices[menuOperation.choice_index];
+    if (!shop || !choice || choice.choice_id !== menuOperation.choice_id
+      || choice.cost !== menuOperation.expected_cost
+      || choice.purchase_count !== menuOperation.expected_purchase_count
+      || choice.effect.field !== menuOperation.expected_effect.field
+      || choice.effect.amount !== menuOperation.expected_effect.amount) {
+      throw MotaLab.createPauseError("GUARD_MISMATCH", "SHOP_PRESTATE_MISMATCH");
+    }
+    const gridAction = Object.assign({}, action, { operations: action.operations.slice(0, -1) });
+    const gridPlan = MotaLab.planOperations(gridAction, executionObservation, registry, adapter);
+    let before = executionObservation;
+    for (let index = 0; index < gridPlan.length; index += 1) {
+      const step = gridPlan[index];
+      const isTrigger = index === gridPlan.length - 1;
+      if (!isTrigger) {
+        adapter.setAutomaticRoute(step.operation.x, step.operation.y);
+        const settled = await MotaLab.waitForStability({ adapter, observe: observeFast,
+          finalizeObservation: observeFast,
+          preFingerprint: MotaLab.fingerprintRuntimeObservation(before), ...stabilityOptions });
+        before = settled.observation;
+        continue;
+      }
+      adapter.setAutomaticRoute(step.operation.x, step.operation.y);
+      const deadline = Date.now() + (stabilityOptions.timeoutMs || 5000);
+      let menuObservation = null;
+      while (Date.now() < deadline) {
+        const sampled = observeFast();
+        if (sampled.active_menu && sampled.active_menu.shop_id === shop.shop_id
+          && sampled.active_menu.menu_id === menuOperation.menu_id
+          && sampled.active_menu.ready === true) {
+          menuObservation = sampled;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, stabilityOptions.sampleMs || 25));
+      }
+      if (!menuObservation) {
+        adapter.stopAutomaticRoute();
+        throw MotaLab.createPauseError("UNSUPPORTED_INTERACTION", "SHOP_MENU_NOT_READY");
+      }
+      adapter.chooseShopChoice(shop, menuOperation.choice_index);
+      let purchasedObservation = null;
+      const purchaseDeadline = Date.now() + (stabilityOptions.timeoutMs || 5000);
+      while (Date.now() < purchaseDeadline) {
+        const sampled = observeFast();
+        const updatedShop = (sampled.shops || []).find((item) => item.shop_id === shop.shop_id);
+        const updatedChoice = updatedShop && updatedShop.choices[menuOperation.choice_index];
+        if (sampled.hero.gold === executionObservation.hero.gold - menuOperation.expected_cost
+          && sampled.hero[menuOperation.expected_effect.field]
+            === executionObservation.hero[menuOperation.expected_effect.field]
+              + menuOperation.expected_effect.amount
+          && updatedChoice && updatedChoice.purchase_count === menuOperation.expected_purchase_count + 1
+          && sampled.active_menu && sampled.active_menu.menu_id === menuOperation.menu_id) {
+          purchasedObservation = sampled;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, stabilityOptions.sampleMs || 25));
+      }
+      if (!purchasedObservation) {
+        throw MotaLab.createPauseError("EXPECTED_DELTA_MISMATCH", "SHOP_PURCHASE_NOT_CONFIRMED");
+      }
+      adapter.closeShopMenu(shop);
+      const settled = await MotaLab.waitForStability({ adapter, observe: observeFast,
+        finalizeObservation: observe,
+        preFingerprint: MotaLab.fingerprintRuntimeObservation(menuObservation), ...stabilityOptions });
+      return { observation: settled.observation, fingerprint: settled.fingerprint,
+        plan: [...gridPlan, { operation: menuOperation, category: "shop" }],
+        completed_operations: action.operations.length, boundary_reached: true,
+        engine_timings: [] };
+    }
   }
   const plan = MotaLab.planOperations(action, executionObservation, registry, adapter);
   const allowUnknownFloor = action.expected_delta.floor_id === null

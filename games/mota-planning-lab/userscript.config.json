@@ -11,10 +11,6 @@
     ],
     "grant": [
       "unsafeWindow",
-      "GM_getValue",
-      "GM_setValue",
-      "GM_deleteValue",
-      "GM_listValues",
       "GM_registerMenuCommand",
       "GM_xmlhttpRequest"
     ],
@@ -26,6 +22,7 @@
     "games/mota-planning-lab/src/runtime-mode.js",
     "games/mota-planning-lab/src/runtime-environment.js",
     "games/mota-planning-lab/src/engine-adapter.js",
+    "games/mota-planning-lab/src/shop-model.js",
     "games/mota-planning-lab/src/observer.js",
     "games/mota-planning-lab/src/block-registry.js",
     "games/mota-planning-lab/src/protocol.js",

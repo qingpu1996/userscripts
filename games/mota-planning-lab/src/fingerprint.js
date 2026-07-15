@@ -118,6 +118,7 @@ MotaLab.fingerprintProjection = function fingerprintProjection(observation) {
       no_pass: block.no_pass,
       damage: block.damage,
       enemy: block.enemy,
+      shop_id: block.shop_id || null,
     })).sort((a, b) => a.y - b.y || a.x - b.x
       || a.numeric_id - b.numeric_id || a.id.localeCompare(b.id)),
   };
@@ -125,6 +126,7 @@ MotaLab.fingerprintProjection = function fingerprintProjection(observation) {
     projection.catalog_hash = observation.engine_model.catalog_hash;
     projection.engine_model_hash = observation.engine_model.model_hash;
   }
+  if (Array.isArray(observation.shops)) projection.shops = observation.shops;
   return projection;
 };
 

@@ -114,9 +114,12 @@ if (fs.existsSync(configPath)) {
   }
   const grants = new Set(config.metadata?.grant || []);
   for (const required of [
-    "GM_getValue", "GM_setValue", "GM_deleteValue", "GM_listValues", "GM_xmlhttpRequest",
+    "GM_xmlhttpRequest",
   ]) {
     if (!grants.has(required)) fail(configPath, `required userscript API grant is missing: ${required}`);
+  }
+  for (const forbidden of ["GM_getValue", "GM_setValue", "GM_deleteValue", "GM_listValues"]) {
+    if (grants.has(forbidden)) fail(configPath, `runtime persistence grant is forbidden: ${forbidden}`);
   }
 }
 

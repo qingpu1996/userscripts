@@ -112,321 +112,38 @@ MotaLab.createRuntimeEnvironment = function createRuntimeEnvironment(
   scope = globalThis,
   explicitMode = MotaLab.RUNTIME_MODE,
 ) {
-  function evidenceText(raw) {
-    try {
-      const text = typeof raw === "string" ? raw : JSON.stringify(raw);
-      return typeof text === "string" ? text : `[${typeof raw}]`;
-    } catch (_) {
-      return `[unserializable:${typeof raw}]`;
-    }
-  }
-
-  function storageFailure(key, reason = "storage-unstable") {
-    return {
-      status: "storage_unstable",
-      key,
-      raw_length: 0,
-      content_hash: `sha256:${MotaLab.sha256(reason)}`,
-    };
-  }
-
-  function inspectRaw(key, raw, { nullishMeansAbsent = false } = {}) {
-    if (nullishMeansAbsent && (raw === null || raw === undefined)) {
-      return { status: "absent", key };
-    }
-    const rawText = evidenceText(raw);
-    const evidence = {
-      key,
-      raw_length: rawText.length,
-      content_hash: `sha256:${MotaLab.sha256(rawText)}`,
-    };
-    if (typeof raw !== "string") {
-      try {
-        return Object.assign({ status: "parsed", value: JSON.parse(rawText) }, evidence);
-      } catch (_) {
-        return Object.assign({ status: "wrong_shape" }, evidence);
-      }
-    }
-    try {
-      return Object.assign({ status: "parsed", value: JSON.parse(raw) }, evidence);
-    } catch (_) {
-      return Object.assign({ status: "parse_failed" }, evidence);
-    }
-  }
-
-  function stableValueSignature(value) {
-    if (value === undefined) return "undefined";
-    if (value === null) return "null";
-    if (typeof value === "number" && Object.is(value, -0)) return "number:-0";
-    if (["string", "number", "boolean"].includes(typeof value)) {
-      return `${typeof value}:${String(value)}`;
-    }
-    try { return `${typeof value}:canonical:${MotaLab.canonicalize(value)}`; }
-    catch (_) { return `${typeof value}:${evidenceText(value)}`; }
-  }
-
-  function journalStorageError(operation, details = {}) {
-    return MotaLab.createPauseError(
-      "ENGINE_API_INCOMPATIBLE",
-      "JOURNAL_STORAGE_UNSTABLE",
-      Object.assign({ operation }, details),
-    );
-  }
-
-  function assertCanonicalInspection(inspected, expected, operation) {
-    if (!inspected || inspected.status !== "parsed") {
-      throw journalStorageError(operation, {
-        observed_status: inspected && inspected.status ? inspected.status : "missing",
-      });
-    }
-    let actualCanonical;
-    let expectedCanonical;
-    try {
-      actualCanonical = MotaLab.canonicalize(inspected.value);
-      expectedCanonical = MotaLab.canonicalize(expected);
-    } catch (_) {
-      throw journalStorageError(operation, { reason: "canonicalization-failed" });
-    }
-    if (actualCanonical !== expectedCanonical) {
-      throw journalStorageError(operation, {
-        reason: "readback-mismatch",
-        expected_hash: `sha256:${MotaLab.sha256(expectedCanonical)}`,
-        actual_hash: `sha256:${MotaLab.sha256(actualCanonical)}`,
-      });
-    }
-    return `sha256:${MotaLab.sha256(expectedCanonical)}`;
-  }
-
-  function unavailableUserscript(missing) {
-    const detailCode = "USERSCRIPT_API_UNAVAILABLE";
+  const unavailable = (missing) => {
     const error = () => MotaLab.createPauseError(
-      "ENGINE_API_INCOMPATIBLE",
-      detailCode,
-      { missing: missing.slice() },
+      "ENGINE_API_INCOMPATIBLE", "USERSCRIPT_API_UNAVAILABLE", { missing: missing.slice() },
     );
-    const blockedStorage = Object.freeze({
-      inspect(key) { return storageFailure(key, detailCode); },
-      get(_key, fallback) { return fallback; },
-      set() { throw error(); },
-      delete() { throw error(); },
-    });
     return Object.freeze({
-      mode: "userscript",
-      available: false,
-      detail_code: detailCode,
-      missing: Object.freeze(missing.slice()),
-      storage: blockedStorage,
-      request() { throw error(); },
-      registerMenu: null,
-      assertAvailable() { throw error(); },
+      mode: "userscript", available: false, detail_code: "USERSCRIPT_API_UNAVAILABLE",
+      missing: Object.freeze(missing.slice()), storage: MotaLab.createMemoryStorage(),
+      request() { throw error(); }, registerMenu: null, assertAvailable() { throw error(); },
     });
-  }
-
-  if (!['userscript', 'direct-mount'].includes(explicitMode)) {
+  };
+  if (!["userscript", "direct-mount"].includes(explicitMode)) {
     throw new TypeError(`Invalid explicit runtime mode: ${String(explicitMode)}`);
   }
-
   if (explicitMode === "userscript") {
-    const required = [
-      "GM_getValue", "GM_setValue", "GM_deleteValue", "GM_listValues",
-      "GM_xmlhttpRequest",
-    ];
+    const required = ["GM_xmlhttpRequest"];
     const missing = required.filter((name) => typeof scope[name] !== "function");
-    if (missing.length > 0) return unavailableUserscript(missing);
-    let probeSequence = 0;
-    const storage = {
-      inspect(key) {
-        let firstList;
-        let secondList;
-        let first;
-        let second;
-        const tokenBase = `${key}:${Date.now()}:${probeSequence += 1}`;
-        const firstDefault = { __mota_lab_absent_probe__: `${tokenBase}:A` };
-        const secondDefault = { __mota_lab_absent_probe__: `${tokenBase}:B` };
-        try {
-          firstList = scope.GM_listValues();
-          first = scope.GM_getValue(key, firstDefault);
-          second = scope.GM_getValue(key, secondDefault);
-          secondList = scope.GM_listValues();
-        } catch (_) {
-          return storageFailure(key, "GM-storage-call-failed");
-        }
-        if (!Array.isArray(firstList) || !Array.isArray(secondList)
-          || firstList.some((item) => typeof item !== "string")
-          || secondList.some((item) => typeof item !== "string")) {
-          return storageFailure(key, "GM_listValues-invalid");
-        }
-        const normalizedFirstList = JSON.stringify([...new Set(firstList)].sort());
-        const normalizedSecondList = JSON.stringify([...new Set(secondList)].sort());
-        if (normalizedFirstList !== normalizedSecondList) {
-          return storageFailure(key, "GM_listValues-changed");
-        }
-        const firstIsDefault = stableValueSignature(first) === stableValueSignature(firstDefault);
-        const secondIsDefault = stableValueSignature(second) === stableValueSignature(secondDefault);
-        if (firstIsDefault && secondIsDefault) return { status: "absent", key };
-        if (firstIsDefault !== secondIsDefault
-          || stableValueSignature(first) !== stableValueSignature(second)) {
-          return storageFailure(key, "GM_getValue-changed");
-        }
-        // The two value probes are authoritative.  GM_listValues is used as a
-        // stability signal only because some managers can return a stale list.
-        return inspectRaw(key, first);
-      },
-      get(key, fallback) {
-        const inspected = this.inspect(key);
-        return inspected.status === "parsed" ? inspected.value : fallback;
-      },
-      set(key, value) {
-        try { scope.GM_setValue(key, value); }
-        catch (_) { throw journalStorageError("GM_setValue", { reason: "write-threw" }); }
-        const first = this.inspect(key);
-        const hash = assertCanonicalInspection(first, value, "GM_setValue-readback-1");
-        const second = this.inspect(key);
-        assertCanonicalInspection(second, value, "GM_setValue-readback-2");
-        return Object.freeze({ verified: true, key, canonical_hash: hash });
-      },
-      delete(key) {
-        try { scope.GM_deleteValue(key); }
-        catch (_) { throw journalStorageError("GM_deleteValue", { reason: "delete-threw" }); }
-        const first = this.inspect(key);
-        const second = this.inspect(key);
-        if (first.status !== "absent" || second.status !== "absent") {
-          throw journalStorageError("GM_deleteValue-readback", {
-            first_status: first.status, second_status: second.status,
-          });
-        }
-        return Object.freeze({ verified: true, key, absent: true });
-      },
-    };
-    const request = (options) => {
-      try { return scope.GM_xmlhttpRequest(options); }
-      catch (_) {
-        throw MotaLab.createPauseError(
-          "ENGINE_API_INCOMPATIBLE", "USERSCRIPT_API_UNAVAILABLE",
-          { api: "GM_xmlhttpRequest", failure: "throw" },
-        );
-      }
-    };
+    if (missing.length) return unavailable(missing);
     return Object.freeze({
-      mode: "userscript",
-      available: true,
-      detail_code: null,
-      storage,
-      request,
+      mode: "userscript", available: true, detail_code: null,
+      storage: MotaLab.createMemoryStorage(),
+      request(options) { return scope.GM_xmlhttpRequest(options); },
       registerMenu: typeof scope.GM_registerMenuCommand === "function"
         ? scope.GM_registerMenuCommand : null,
       assertAvailable() { return true; },
     });
   }
-
-  const directKey = "mota-planning-lab:direct-mount:journal:v2";
-  const directSlotKeys = Object.freeze([
-    "mota-planning-lab:direct-mount:journal:v2:slot:a",
-    "mota-planning-lab:direct-mount:journal:v2:slot:b",
-  ]);
-  const directLegacyKey = "mota-planning-lab:direct-mount:journal:v1";
-  function directPhysicalKey(key) {
-    if (key === MotaLab.JOURNAL_KEY) return directKey;
-    const slotIndex = MotaLab.JOURNAL_SLOT_KEYS.indexOf(key);
-    if (slotIndex >= 0) return directSlotKeys[slotIndex];
-    if (MotaLab.LEGACY_JOURNAL_KEYS.includes(key)) return directLegacyKey;
-    return null;
-  }
-  const storage = {
-    subscribeChanges(callback) {
-      if (typeof scope.addEventListener !== "function") return () => {};
-      const physical = new Set(directSlotKeys);
-      const listener = (event) => {
-        if (event && physical.has(event.key)) callback({ key: event.key, remote: true });
-      };
-      scope.addEventListener("storage", listener);
-      return () => {
-        if (typeof scope.removeEventListener === "function") {
-          scope.removeEventListener("storage", listener);
-        }
-      };
-    },
-    inspect(key) {
-      const physicalKey = directPhysicalKey(key);
-      if (physicalKey === null) return { status: "absent", key };
-      if (!scope.localStorage) return storageFailure(key, "localStorage-unavailable");
-      let raw;
-      try { raw = scope.localStorage.getItem(physicalKey); }
-      catch (_) { return storageFailure(key, "localStorage-read-failed"); }
-      return inspectRaw(key, raw, { nullishMeansAbsent: true });
-    },
-    get(key, fallback) {
-      const inspected = this.inspect(key);
-      return inspected.status === "parsed" ? inspected.value : fallback;
-    },
-    set(key, value) {
-      const physicalKey = directPhysicalKey(key);
-      if (physicalKey === null || MotaLab.LEGACY_JOURNAL_KEYS.includes(key)) {
-        throw new TypeError("Direct mount storage namespace violation");
-      }
-      if (!scope.localStorage) throw journalStorageError("localStorage.setItem", { reason: "unavailable" });
-      let encoded;
-      try {
-        encoded = JSON.stringify(value);
-        scope.localStorage.setItem(physicalKey, encoded);
-      } catch (_) {
-        throw journalStorageError("localStorage.setItem", { reason: "write-threw" });
-      }
-      let first;
-      let second;
-      try {
-        first = scope.localStorage.getItem(physicalKey);
-        second = scope.localStorage.getItem(physicalKey);
-      } catch (_) {
-        throw journalStorageError("localStorage.setItem-readback", { reason: "read-threw" });
-      }
-      if (first !== encoded || second !== encoded) {
-        throw journalStorageError("localStorage.setItem-readback", {
-          reason: first !== second ? "readback-changed" : "readback-mismatch",
-        });
-      }
-      return Object.freeze({
-        verified: true,
-        key,
-        canonical_hash: `sha256:${MotaLab.sha256(MotaLab.canonicalize(value))}`,
-      });
-    },
-    delete(key) {
-      const physicalKey = directPhysicalKey(key);
-      if (physicalKey === null || MotaLab.LEGACY_JOURNAL_KEYS.includes(key)) {
-        throw new TypeError("Direct mount storage namespace violation");
-      }
-      if (!scope.localStorage || typeof scope.localStorage.removeItem !== "function") {
-        throw journalStorageError("localStorage.removeItem", { reason: "unavailable" });
-      }
-      try { scope.localStorage.removeItem(physicalKey); }
-      catch (_) { throw journalStorageError("localStorage.removeItem", { reason: "delete-threw" }); }
-      let first;
-      let second;
-      try {
-        first = scope.localStorage.getItem(physicalKey);
-        second = scope.localStorage.getItem(physicalKey);
-      } catch (_) {
-        throw journalStorageError("localStorage.removeItem-readback", { reason: "read-threw" });
-      }
-      if (first !== null || second !== null) {
-        throw journalStorageError("localStorage.removeItem-readback", {
-          reason: first !== second ? "readback-changed" : "still-present",
-        });
-      }
-      return Object.freeze({ verified: true, key, absent: true });
-    },
-  };
-  const request = (options) => {
+  const directRequest = (options) => {
     const controller = new AbortController();
     const timer = scope.setTimeout(() => controller.abort(), options.timeout);
     scope.fetch(options.url, {
-      method: options.method,
-      headers: options.headers,
-      body: options.data,
-      signal: controller.signal,
-      credentials: "omit",
-      mode: "cors",
+      method: options.method, headers: options.headers, body: options.data,
+      signal: controller.signal, credentials: "omit", mode: "cors",
     }).then(async (response) => {
       scope.clearTimeout(timer);
       options.onload({ status: response.status, responseText: await response.text() });
@@ -439,7 +156,9 @@ MotaLab.createRuntimeEnvironment = function createRuntimeEnvironment(
   };
   return Object.freeze({
     mode: "direct-mount", available: true, detail_code: null,
-    storage, request, registerMenu: null, assertAvailable() { return true; },
+    storage: MotaLab.createMemoryStorage(),
+    request: directRequest,
+    registerMenu: null, assertAvailable() { return true; },
   });
 };
 
@@ -745,6 +464,9 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
     const disabled = block.disable === true || (event && event.disable === true);
     const noPassValue = event && event.noPass !== undefined ? event.noPass
       : block.noPass !== undefined ? block.noPass : block.no_pass;
+    const actions = event && Array.isArray(event.data) ? event.data : [];
+    const shopActions = actions.filter((item) => item && item.type === "openShop"
+      && typeof item.id === "string" && item.open === true);
     return {
       x: block.x,
       y: block.y,
@@ -754,6 +476,7 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
       trigger: trigger === undefined || trigger === null ? null : String(trigger),
       no_pass: Boolean(noPassValue),
       disabled,
+      shop_id: shopActions.length === 1 ? shopActions[0].id : null,
     };
   }
 
@@ -951,6 +674,19 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
       const afterProjection = fenceProjection(after);
       if (sameRuntime
         && MotaLab.canonicalize(beforeProjection) === MotaLab.canonicalize(afterProjection)) {
+        let shopSource = {};
+        try {
+          shopSource = runtime.status.shops || {};
+        } catch (_error) {
+          shopSource = {};
+        }
+        const flagValues = runtime.status.hero && runtime.status.hero.flags
+          && typeof runtime.status.hero.flags === "object" ? runtime.status.hero.flags : {};
+        const shops = Object.entries(shopSource).map(([id, raw]) => (
+          MotaLab.parseRestrictedShop(id, raw, flagValues)
+        )).filter((shop) => shop.supported);
+        const activeMenus = shops.map((shop) => MotaLab.readRestrictedShopMenu(runtime, shop))
+          .filter(Boolean);
         return {
           floor_id: before.floor_id,
           map,
@@ -958,6 +694,8 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
           blocks,
           busy: before.busy,
           engine_model: engineModel,
+          shops,
+          active_menu: activeMenus.length === 1 ? activeMenus[0] : null,
         };
       }
       attempts.push({
@@ -1037,6 +775,26 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
     if (runtime && typeof runtime.stopAutomaticRoute === "function") runtime.stopAutomaticRoute();
   }
 
+  function chooseShopChoice(expectedShop, choiceIndex) {
+    const runtime = requireRuntime();
+    const menu = MotaLab.readRestrictedShopMenu(runtime, expectedShop);
+    if (!menu || menu.ready !== true || menu.choices[choiceIndex] !== expectedShop.choices[choiceIndex].choice_id
+      || choiceIndex < 0 || choiceIndex > 8 || !runtime.actions
+      || typeof runtime.actions.keyUp !== "function") {
+      throw MotaLab.createPauseError("UNSUPPORTED_INTERACTION", "SHOP_MENU_IDENTITY_MISMATCH");
+    }
+    return runtime.actions.keyUp({ keyCode: 49 + choiceIndex });
+  }
+
+  function closeShopMenu(expectedShop) {
+    const runtime = requireRuntime();
+    if (!MotaLab.readRestrictedShopMenu(runtime, expectedShop) || !runtime.actions
+      || typeof runtime.actions.keyUp !== "function") {
+      throw MotaLab.createPauseError("UNSUPPORTED_INTERACTION", "SHOP_MENU_IDENTITY_MISMATCH");
+    }
+    return runtime.actions.keyUp({ keyCode: 27 });
+  }
+
   function physicalSaveLoad() {
     return { executed: false, reason: "PHYSICAL_SAVE_LOAD_DISABLED" };
   }
@@ -1052,8 +810,112 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
     moveDirectly,
     setAutomaticRoute,
     stopAutomaticRoute,
+    chooseShopChoice,
+    closeShopMenu,
     physicalSaveLoad,
   });
+};
+
+MotaLab.parseRestrictedShop = function parseRestrictedShop(shopId, rawShop, flagValues = {}) {
+  const reject = (reason, details = {}) => ({ supported: false, reason, details });
+  if (typeof shopId !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/u.test(shopId)
+    || !rawShop || typeof rawShop !== "object" || Array.isArray(rawShop)) {
+    return reject("SHOP_IDENTITY_INVALID");
+  }
+  if (!Array.isArray(rawShop.choices) || rawShop.choices.length < 1 || rawShop.choices.length > 32) {
+    return reject("SHOP_CHOICES_INVALID");
+  }
+  const choices = [];
+  for (let index = 0; index < rawShop.choices.length; index += 1) {
+    const choice = rawShop.choices[index];
+    if (!choice || typeof choice !== "object" || Array.isArray(choice)
+      || typeof choice.text !== "string" || choice.text.length < 1 || choice.text.length > 256
+      || typeof choice.need !== "string" || !Array.isArray(choice.action)) {
+      return reject("SHOP_CHOICE_SHAPE_UNSUPPORTED", { index });
+    }
+    const need = choice.need.trim().match(/^status:money\s*>=\s*(\d{1,9})$/u);
+    if (!need) return reject("SHOP_COST_EXPRESSION_UNSUPPORTED", { index });
+    const cost = Number(need[1]);
+    if (choice.action.length !== 3) {
+      return reject("SHOP_EFFECT_UNSUPPORTED", { index });
+    }
+    const parsedActions = [];
+    for (const action of choice.action) {
+      if (!action || action.type !== "setValue" || typeof action.name !== "string"
+        || typeof action.operator !== "string" || typeof action.value !== "string"
+        || !/^\d{1,9}$/u.test(action.value)) {
+        return reject("SHOP_EFFECT_UNSUPPORTED", { index });
+      }
+      parsedActions.push({ name: action.name, operator: action.operator, amount: Number(action.value) });
+    }
+    const [debitAction, effectAction, counterAction] = parsedActions;
+    const effectFields = {
+      "status:hp": "hp", "status:atk": "attack", "status:def": "defense",
+    };
+    if (debitAction.name !== "status:money" || debitAction.operator !== "-="
+      || debitAction.amount !== cost
+      || !Object.prototype.hasOwnProperty.call(effectFields, effectAction.name)
+      || effectAction.operator !== "+="
+      || !/^flag:[A-Za-z0-9_.:-]{1,128}$/u.test(counterAction.name)
+      || counterAction.operator !== "+=" || counterAction.amount !== 1) {
+      return reject("SHOP_EFFECT_UNSUPPORTED", { index });
+    }
+    const effect = { field: effectFields[effectAction.name], amount: effectAction.amount };
+    const counter = counterAction.name.slice(5);
+    if (cost < 1 || effect.amount < 1) {
+      return reject("SHOP_EFFECT_INCOMPLETE", { index });
+    }
+    const count = Object.prototype.hasOwnProperty.call(flagValues, counter) ? flagValues[counter] : 0;
+    if (!MotaLab.isFiniteInteger(count) || count < 0) {
+      return reject("SHOP_COUNTER_INVALID", { index, counter });
+    }
+    choices.push({
+      choice_id: `${shopId}:${index}:${effect.field}:${effect.amount}:${cost}`,
+      index, text: choice.text, cost, effect, counter_flag: counter,
+      purchase_count: count,
+    });
+  }
+  return { supported: true, shop_id: shopId, repeatable: true, choices };
+};
+
+MotaLab.readRestrictedShopMenu = function readRestrictedShopMenu(runtime, expectedShop) {
+  if (!expectedShop || expectedShop.supported !== true) return null;
+  const event = runtime && runtime.status && runtime.status.event;
+  const data = event && event.data;
+  const current = data && data.current;
+  if (event.id !== "action" || data.type !== "choices" || !current
+    || current.type !== "choices" || !Array.isArray(current.choices)) return null;
+  if (current.choices.length !== expectedShop.choices.length + 1) return null;
+  const exit = current.choices[current.choices.length - 1];
+  if (!exit || exit.text !== "离开" || !Array.isArray(exit.action)
+    || exit.action.length !== 2 || exit.action[0].type !== "playSound"
+    || exit.action[1].type !== "break") return null;
+  const actual = current.choices.slice(0, -1).map((choice, index) => {
+    if (!Array.isArray(choice.action) || choice.action[0] == null
+      || choice.action[0].type !== "playSound" || choice.action[0].name !== "商店") return null;
+    const expected = expectedShop.choices[index];
+    const normalized = { text: choice.text, need: `status:money>=${expected.cost}`,
+      action: choice.action.slice(1) };
+    const parsed = MotaLab.parseRestrictedShop(expectedShop.shop_id, { choices: [normalized] }, {
+      [expected.counter_flag]: expected.purchase_count,
+    });
+    return parsed.supported ? parsed.choices[0] : null;
+  });
+  if (actual.some((item, index) => !item
+    || item.text !== expectedShop.choices[index].text
+    || item.cost !== expectedShop.choices[index].cost
+    || item.effect.field !== expectedShop.choices[index].effect.field
+    || item.effect.amount !== expectedShop.choices[index].effect.amount
+    || item.counter_flag !== expectedShop.choices[index].counter_flag)) return null;
+  return {
+    shop_id: expectedShop.shop_id,
+    menu_id: `sha256:${MotaLab.sha256(MotaLab.canonicalize(actual.map((item) => ({
+      text: item.text, cost: item.cost, effect: item.effect, counter_flag: item.counter_flag,
+    }))))}`,
+    ready: true,
+    selection: MotaLab.isFiniteInteger(event.selection) ? event.selection : null,
+    choices: expectedShop.choices.map((item) => item.choice_id),
+  };
 };
 
 MotaLab.parseFloorNumber = function parseFloorNumber(floorName, floorId) {
@@ -1185,21 +1047,110 @@ MotaLab.engineJsonLiteral = function engineJsonLiteral(value, state = null, dept
   return { value: Object.fromEntries(entries), complex: context.complex };
 };
 
+MotaLab.detachEngineData = function detachEngineData(value) {
+  return JSON.parse(JSON.stringify(MotaLab.engineJsonLiteral(value).value));
+};
+
+MotaLab.decodeDetachedDynamicMap = function decodeDetachedDynamicMap(
+  floorId, dynamicMap, definitionMap, width, height, fail,
+) {
+  if (!Array.isArray(dynamicMap)) {
+    return Array.isArray(definitionMap)
+      ? definitionMap.map((row) => Array.isArray(row) ? row.slice() : row)
+      : definitionMap;
+  }
+  const compressed = dynamicMap.some((row) => !Array.isArray(row))
+    || dynamicMap.some((row) => row.some((cell) => cell < 0));
+  if (!compressed) return dynamicMap.map((row) => Array.isArray(row) ? row.slice() : row);
+
+  const reject = (reason, details = {}) => fail("ENGINE_MODEL_MAP_COMPRESSION_INVALID", {
+    floor_id: floorId, reason, ...details,
+  });
+  if (dynamicMap.length !== height) {
+    reject("dynamic_height_mismatch", { expected: height, actual: dynamicMap.length });
+  }
+  let needsDefinition = false;
+  for (let y = 0; y < height; y += 1) {
+    const row = dynamicMap[y];
+    if (row === 0) {
+      needsDefinition = true;
+      continue;
+    }
+    if (!Array.isArray(row)) {
+      reject("dynamic_row_token_invalid", {
+        y, token: MotaLab.runtimeScalarEvidence(row),
+      });
+    }
+    if (row.length !== width) {
+      reject("dynamic_width_mismatch", { y, expected: width, actual: row.length });
+    }
+    for (let x = 0; x < width; x += 1) {
+      const cell = row[x];
+      if (cell === -1) needsDefinition = true;
+      else if (!MotaLab.isFiniteInteger(cell) || cell < 0) {
+        reject("dynamic_cell_token_invalid", {
+          x, y, token: MotaLab.runtimeScalarEvidence(cell),
+        });
+      }
+    }
+  }
+  if (needsDefinition) {
+    if (!Array.isArray(definitionMap) || definitionMap.length !== height) {
+      reject("definition_height_mismatch", {
+        expected: height, actual: Array.isArray(definitionMap) ? definitionMap.length : null,
+      });
+    }
+    for (let y = 0; y < height; y += 1) {
+      const definitionRow = definitionMap[y];
+      if (!Array.isArray(definitionRow) || definitionRow.length !== width) {
+        reject("definition_width_mismatch", {
+          y, expected: width, actual: Array.isArray(definitionRow) ? definitionRow.length : null,
+        });
+      }
+      for (let x = 0; x < width; x += 1) {
+        const inherited = dynamicMap[y] === 0 || dynamicMap[y][x] === -1;
+        const value = definitionRow[x];
+        if (inherited && (!MotaLab.isFiniteInteger(value) || value < 0)) {
+          reject("definition_cell_invalid", {
+            x, y, token: MotaLab.runtimeScalarEvidence(value),
+          });
+        }
+      }
+    }
+  }
+  const decoded = Array.from({ length: height }, () => Array(width));
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      decoded[y][x] = dynamicMap[y] === 0 || dynamicMap[y][x] === -1
+        ? definitionMap[y][x] : dynamicMap[y][x];
+    }
+  }
+  return decoded;
+};
+
 MotaLab.collectEngineFloor = function collectEngineFloor(
   engine, floorId, definition, dynamic, fail,
 ) {
-  const source = Array.isArray(dynamic.map) ? dynamic.map : definition.map;
-  if (!Array.isArray(source) || source.some((row) => !Array.isArray(row))) {
-    fail("ENGINE_MODEL_MAP_MISSING", { floor_id: floorId });
-  }
-  const inferredWidth = source.reduce((maximum, row) => Math.max(maximum, row.length), 0);
+  const selected = Array.isArray(dynamic.map) ? dynamic.map : definition.map;
+  if (!Array.isArray(selected)) fail("ENGINE_MODEL_MAP_MISSING", { floor_id: floorId });
+  const inferredWidth = selected.reduce(
+    (maximum, row) => Math.max(maximum, Array.isArray(row) ? row.length : 0), 0,
+  );
   const width = MotaLab.isFiniteInteger(dynamic.width) ? dynamic.width
     : MotaLab.isFiniteInteger(definition.width) ? definition.width : inferredWidth;
   const height = MotaLab.isFiniteInteger(dynamic.height) ? dynamic.height
-    : MotaLab.isFiniteInteger(definition.height) ? definition.height : source.length;
+    : MotaLab.isFiniteInteger(definition.height) ? definition.height : selected.length;
   if (width < 1 || height < 1 || width > MotaLab.MAX_MAP_AXIS
-    || height > MotaLab.MAX_MAP_AXIS || width * height > MotaLab.MAX_MAP_CELLS
-    || source.length > height || source.some((row) => row.length > width)) {
+    || height > MotaLab.MAX_MAP_AXIS || width * height > MotaLab.MAX_MAP_CELLS) {
+    fail("ENGINE_MODEL_DIMENSIONS_EXCEEDED", { floor_id: floorId, width, height });
+  }
+  const source = MotaLab.decodeDetachedDynamicMap(
+    floorId, dynamic.map, definition.map, width, height, fail,
+  );
+  if (!Array.isArray(source) || source.some((row) => !Array.isArray(row))) {
+    fail("ENGINE_MODEL_MAP_MISSING", { floor_id: floorId });
+  }
+  if (source.length > height || source.some((row) => row.length > width)) {
     fail("ENGINE_MODEL_DIMENSIONS_EXCEEDED", { floor_id: floorId, width, height });
   }
   const validCells = [];
@@ -1311,7 +1262,7 @@ MotaLab.collectEngineModel = function collectEngineModel(engine, keySlotIds = {}
       engine, keySlotIds, cache, String(currentFloorId),
     );
   }
-  const detach = (value) => JSON.parse(JSON.stringify(MotaLab.engineJsonLiteral(value).value));
+  const detach = MotaLab.detachEngineData;
   const floorDefinitions = detach(engine.floors);
   const statusMaps = engine.status && engine.status.maps && typeof engine.status.maps === "object"
     ? detach(engine.status.maps) : {};
@@ -1470,8 +1421,10 @@ MotaLab.refreshEngineModel = function refreshEngineModel(
   const fail = (code, details = {}) => {
     throw MotaLab.createPauseError("ENGINE_API_INCOMPATIBLE", code, details);
   };
-  const definition = engine.floors[currentFloorId] || {};
-  const dynamic = engine.status && engine.status.maps && engine.status.maps[currentFloorId] || {};
+  const definition = MotaLab.detachEngineData(engine.floors[currentFloorId] || {});
+  const dynamic = MotaLab.detachEngineData(
+    engine.status && engine.status.maps && engine.status.maps[currentFloorId] || {},
+  );
   const previous = cache.model.floors.find((floor) => floor.floor_id === currentFloorId);
   if (!previous) {
     cache.invalidated = true;
@@ -1668,6 +1621,7 @@ MotaLab.collectObservation = function collectObservation(adapter, now = Date.now
       damage: normalizedDamage,
       enemy: isEnemy ? normalizedEnemy : null,
     };
+    if (typeof raw.shop_id === "string") normalizedBlock.shop_id = raw.shop_id;
     blocks.push(normalizedBlock);
     if (issue) {
       collectionIssues.push(Object.assign(issue, {
@@ -1735,6 +1689,8 @@ MotaLab.collectObservation = function collectObservation(adapter, now = Date.now
     captured_at: now(),
   };
   if (snapshot.engine_model) observation.engine_model = snapshot.engine_model;
+  if (Array.isArray(snapshot.shops)) observation.shops = snapshot.shops;
+  if (snapshot.active_menu) observation.active_menu = snapshot.active_menu;
   if (collectionIssues.length) {
     const primary = collectionIssues[0];
     const error = MotaLab.createPauseError(
@@ -1849,7 +1805,7 @@ MotaLab.cloneObservationForWire = function cloneObservationForWire(observation) 
       red: observation.keys.red,
     },
     busy: observation.busy,
-    blocks: observation.blocks.map((block) => ({
+    blocks: observation.blocks.map((block) => Object.assign({
       x: block.x,
       y: block.y,
       numeric_id: block.numeric_id,
@@ -1866,11 +1822,16 @@ MotaLab.cloneObservationForWire = function cloneObservationForWire(observation) 
         experience: block.enemy.experience,
         special: block.enemy.special.slice(),
       } : null,
-    })),
+    }, typeof block.shop_id === "string" ? { shop_id: block.shop_id } : {})),
     captured_at: observation.captured_at,
   };
   if (observation.engine_model !== undefined) {
     wire.engine_model = MotaLab.cloneJsonValue(observation.engine_model);
+  }
+  if (Array.isArray(observation.shops)) wire.shops = MotaLab.cloneJsonValue(observation.shops);
+  if (observation.active_menu !== undefined) {
+    wire.active_menu = observation.active_menu === null
+      ? null : MotaLab.cloneJsonValue(observation.active_menu);
   }
   return wire;
 };
@@ -2046,10 +2007,26 @@ MotaLab.validateResponseGuard = function validateResponseGuard(value) {
 };
 
 MotaLab.validateOperation = function validateOperation(operation, dimensions) {
-  MotaLab.assertProtocolShape(operation, ["type", "x", "y"], [], "operation");
-  if (operation.type !== "grid") {
-    throw new TypeError("Only grid operations are supported");
+  if (operation && operation.type === "menu_choice") {
+    MotaLab.assertProtocolShape(operation, [
+      "type", "shop_id", "menu_id", "choice_id", "choice_index", "expected_cost",
+      "expected_effect", "expected_purchase_count",
+    ], [], "menu choice operation");
+    if (typeof operation.shop_id !== "string" || operation.shop_id.length < 1
+      || typeof operation.choice_id !== "string" || operation.choice_id.length < 1
+      || typeof operation.menu_id !== "string" || !/^sha256:[a-f0-9]{64}$/u.test(operation.menu_id)
+      || !MotaLab.isFiniteInteger(operation.choice_index) || operation.choice_index < 0
+      || operation.choice_index > 8 || !MotaLab.isFiniteInteger(operation.expected_cost)
+      || operation.expected_cost < 1 || !MotaLab.isFiniteInteger(operation.expected_purchase_count)
+      || operation.expected_purchase_count < 0 || !MotaLab.isProtocolObject(operation.expected_effect)
+      || !["hp", "attack", "defense"].includes(operation.expected_effect.field)
+      || !MotaLab.isFiniteInteger(operation.expected_effect.amount)
+      || operation.expected_effect.amount < 1) throw new TypeError("Invalid menu choice operation");
+    MotaLab.assertProtocolShape(operation.expected_effect, ["field", "amount"], [], "shop effect");
+    return MotaLab.cloneJsonValue(operation);
   }
+  MotaLab.assertProtocolShape(operation, ["type", "x", "y"], [], "operation");
+  if (operation.type !== "grid") throw new TypeError("Unsupported operation type");
   if (!MotaLab.isFiniteInteger(operation.x) || !MotaLab.isFiniteInteger(operation.y)
     || operation.x < 0 || operation.x >= dimensions.width
     || operation.y < 0 || operation.y >= dimensions.height) {
@@ -2209,7 +2186,7 @@ MotaLab.validateCycleResponse = function validateCycleResponse(value) {
   if (typeof value.reason !== "string" || value.reason.length < 1 || value.reason.length > 512) {
     throw new TypeError("Invalid action reason");
   }
-  if (!Array.isArray(value.operations) || value.operations.length < 1 || value.operations.length > 2) {
+  if (!Array.isArray(value.operations) || value.operations.length < 1 || value.operations.length > 3) {
     throw new TypeError("Invalid operations");
   }
   if (!MotaLab.isProtocolObject(value.expected_delta)
@@ -2361,6 +2338,7 @@ MotaLab.fingerprintProjection = function fingerprintProjection(observation) {
       no_pass: block.no_pass,
       damage: block.damage,
       enemy: block.enemy,
+      shop_id: block.shop_id || null,
     })).sort((a, b) => a.y - b.y || a.x - b.x
       || a.numeric_id - b.numeric_id || a.id.localeCompare(b.id)),
   };
@@ -2368,6 +2346,7 @@ MotaLab.fingerprintProjection = function fingerprintProjection(observation) {
     projection.catalog_hash = observation.engine_model.catalog_hash;
     projection.engine_model_hash = observation.engine_model.model_hash;
   }
+  if (Array.isArray(observation.shops)) projection.shops = observation.shops;
   return projection;
 };
 
@@ -2638,6 +2617,27 @@ MotaLab.compareBlockRefs = function compareBlockRefs(references, actualBlocks) {
   return remaining.length === 0;
 };
 
+MotaLab.blockDeltaProjection = function blockDeltaProjection(block) {
+  if (!MotaLab.isProtocolObject(block)) throw new TypeError("Invalid observed block");
+  const isEnemy = block.trigger === "battle"
+    || (typeof block.cls === "string" && /^enemy/i.test(block.cls));
+  if (isEnemy && block.damage !== null && block.damage !== "???"
+    && (!MotaLab.isFiniteInteger(block.damage) || block.damage < 0)) {
+    throw new TypeError("Invalid observed enemy damage");
+  }
+  const projection = {};
+  for (const [field, value] of Object.entries(block)) {
+    // `damage` is calculated against the current hero.  It is planning data,
+    // not part of a monster's stable map identity, so an attribute pickup can
+    // legitimately change it for every visible monster at once.  Keep every
+    // other observed (including unknown future) field in the projection so a
+    // real block semantic change still fails closed.
+    if (isEnemy && field === "damage") continue;
+    projection[field] = value;
+  }
+  return projection;
+};
+
 MotaLab.compareExpectedDelta = function compareExpectedDelta(before, after, expected, options = {}) {
   MotaLab.validateExpectedDelta(expected, Object.assign({
     dimensions: before.dimensions,
@@ -2715,6 +2715,10 @@ MotaLab.compareExpectedDelta = function compareExpectedDelta(before, after, expe
       actual: { map_instance_changed: true, removed: [], added: [] },
     };
   }
+  // Validate the complete compared block sets, including blocks that were
+  // actually removed or added and therefore have no same-coordinate peer.
+  before.blocks.forEach(MotaLab.blockDeltaProjection);
+  after.blocks.forEach(MotaLab.blockDeltaProjection);
   const beforeByCoordinate = new Map(before.blocks.map((block) => [`${block.x},${block.y}`, block]));
   const afterByCoordinate = new Map(after.blocks.map((block) => [`${block.x},${block.y}`, block]));
   const coordinates = new Set([...beforeByCoordinate.keys(), ...afterByCoordinate.keys()]);
@@ -2724,7 +2728,8 @@ MotaLab.compareExpectedDelta = function compareExpectedDelta(before, after, expe
     const beforeBlock = beforeByCoordinate.get(coordinate);
     const afterBlock = afterByCoordinate.get(coordinate);
     if (beforeBlock && afterBlock
-      && MotaLab.canonicalize(beforeBlock) === MotaLab.canonicalize(afterBlock)) continue;
+      && MotaLab.canonicalize(MotaLab.blockDeltaProjection(beforeBlock))
+        === MotaLab.canonicalize(MotaLab.blockDeltaProjection(afterBlock))) continue;
     if (beforeBlock) removed.push(beforeBlock);
     if (afterBlock) added.push(afterBlock);
   }
@@ -3019,7 +3024,7 @@ MotaLab.executeAction = async function executeAction({
   // The observation used to request the decision is evidence, not a lease on
   // mutable game state.  Re-read the complete current runtime immediately
   // before the first engine API call and require it to be byte-equivalent under
-  // the protocol fingerprint.  This closes the journal-persistence window
+  // the protocol fingerprint.  This closes the in-memory scheduling window
   // between the controller guard check and actual execution.
   const executionObservation = observeFast();
   const guardResult = MotaLab.compareGuard(executionObservation, action.guard);
@@ -3042,6 +3047,82 @@ MotaLab.executeAction = async function executeAction({
         observation: executionObservation,
       },
     );
+  }
+  const menuOperation = action.operations[action.operations.length - 1];
+  if (menuOperation && menuOperation.type === "menu_choice") {
+    if (action.action_kind !== "PURCHASE_UPGRADE") {
+      throw MotaLab.createPauseError("UNSUPPORTED_INTERACTION", "SHOP_ACTION_KIND_INVALID");
+    }
+    const shop = (executionObservation.shops || []).find((item) => item.shop_id === menuOperation.shop_id);
+    const choice = shop && shop.choices[menuOperation.choice_index];
+    if (!shop || !choice || choice.choice_id !== menuOperation.choice_id
+      || choice.cost !== menuOperation.expected_cost
+      || choice.purchase_count !== menuOperation.expected_purchase_count
+      || choice.effect.field !== menuOperation.expected_effect.field
+      || choice.effect.amount !== menuOperation.expected_effect.amount) {
+      throw MotaLab.createPauseError("GUARD_MISMATCH", "SHOP_PRESTATE_MISMATCH");
+    }
+    const gridAction = Object.assign({}, action, { operations: action.operations.slice(0, -1) });
+    const gridPlan = MotaLab.planOperations(gridAction, executionObservation, registry, adapter);
+    let before = executionObservation;
+    for (let index = 0; index < gridPlan.length; index += 1) {
+      const step = gridPlan[index];
+      const isTrigger = index === gridPlan.length - 1;
+      if (!isTrigger) {
+        adapter.setAutomaticRoute(step.operation.x, step.operation.y);
+        const settled = await MotaLab.waitForStability({ adapter, observe: observeFast,
+          finalizeObservation: observeFast,
+          preFingerprint: MotaLab.fingerprintRuntimeObservation(before), ...stabilityOptions });
+        before = settled.observation;
+        continue;
+      }
+      adapter.setAutomaticRoute(step.operation.x, step.operation.y);
+      const deadline = Date.now() + (stabilityOptions.timeoutMs || 5000);
+      let menuObservation = null;
+      while (Date.now() < deadline) {
+        const sampled = observeFast();
+        if (sampled.active_menu && sampled.active_menu.shop_id === shop.shop_id
+          && sampled.active_menu.menu_id === menuOperation.menu_id
+          && sampled.active_menu.ready === true) {
+          menuObservation = sampled;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, stabilityOptions.sampleMs || 25));
+      }
+      if (!menuObservation) {
+        adapter.stopAutomaticRoute();
+        throw MotaLab.createPauseError("UNSUPPORTED_INTERACTION", "SHOP_MENU_NOT_READY");
+      }
+      adapter.chooseShopChoice(shop, menuOperation.choice_index);
+      let purchasedObservation = null;
+      const purchaseDeadline = Date.now() + (stabilityOptions.timeoutMs || 5000);
+      while (Date.now() < purchaseDeadline) {
+        const sampled = observeFast();
+        const updatedShop = (sampled.shops || []).find((item) => item.shop_id === shop.shop_id);
+        const updatedChoice = updatedShop && updatedShop.choices[menuOperation.choice_index];
+        if (sampled.hero.gold === executionObservation.hero.gold - menuOperation.expected_cost
+          && sampled.hero[menuOperation.expected_effect.field]
+            === executionObservation.hero[menuOperation.expected_effect.field]
+              + menuOperation.expected_effect.amount
+          && updatedChoice && updatedChoice.purchase_count === menuOperation.expected_purchase_count + 1
+          && sampled.active_menu && sampled.active_menu.menu_id === menuOperation.menu_id) {
+          purchasedObservation = sampled;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, stabilityOptions.sampleMs || 25));
+      }
+      if (!purchasedObservation) {
+        throw MotaLab.createPauseError("EXPECTED_DELTA_MISMATCH", "SHOP_PURCHASE_NOT_CONFIRMED");
+      }
+      adapter.closeShopMenu(shop);
+      const settled = await MotaLab.waitForStability({ adapter, observe: observeFast,
+        finalizeObservation: observe,
+        preFingerprint: MotaLab.fingerprintRuntimeObservation(menuObservation), ...stabilityOptions });
+      return { observation: settled.observation, fingerprint: settled.fingerprint,
+        plan: [...gridPlan, { operation: menuOperation, category: "shop" }],
+        completed_operations: action.operations.length, boundary_reached: true,
+        engine_timings: [] };
+    }
   }
   const plan = MotaLab.planOperations(action, executionObservation, registry, adapter);
   const allowUnknownFloor = action.expected_delta.floor_id === null
@@ -3155,43 +3236,18 @@ MotaLab.executeAction = async function executeAction({
   throw new Error("Unreachable empty execution plan");
 };
 
-MotaLab.createMemoryStorage = function createMemoryStorage(seed = {}) {
-  const values = new Map(Object.entries(seed));
-  let revision = 0;
-  return {
-    getRevision() { return revision; },
-    inspect(key) {
-      if (!values.has(key)) return { status: "absent", key };
-      const raw = values.get(key);
-      let rawText;
-      try { rawText = typeof raw === "string" ? raw : JSON.stringify(raw); } catch (_) { rawText = ""; }
-      const evidence = { key, raw_length: rawText ? rawText.length : 0,
-        content_hash: `sha256:${MotaLab.sha256(rawText || `[${typeof raw}]`)}` };
-      if (typeof raw === "string") {
-        try { return Object.assign({ status: "parsed", value: JSON.parse(raw) }, evidence); }
-        catch (_) { return Object.assign({ status: "parse_failed" }, evidence); }
-      }
-      try { return Object.assign({ status: "parsed", value: JSON.parse(rawText) }, evidence); }
-      catch (_) { return Object.assign({ status: "wrong_shape" }, evidence); }
-    },
-    get(key, fallback) { return values.has(key) ? values.get(key) : fallback; },
-    set(key, value) {
-      const clone = MotaLab.cloneJsonValue(value);
-      values.set(key, clone);
-      revision += 1;
-      return Object.freeze({ verified: true, key,
-        canonical_hash: `sha256:${MotaLab.sha256(MotaLab.canonicalize(clone))}` });
-    },
-    delete(key) {
-      values.delete(key);
-      revision += 1;
-      return Object.freeze({ verified: true, key, absent: true });
-    },
-  };
+/* Ephemeral controller state.  The game runtime is authoritative; this object
+ * deliberately never reads or writes GM storage/localStorage. */
+MotaLab.createMemoryStorage = function createMemoryStorage() {
+  return Object.freeze({
+    inspect(key) { return { status: "absent", key }; },
+    get(_key, fallback) { return fallback; },
+    set() { throw new TypeError("Runtime persistence is disabled"); },
+    delete() { return Object.freeze({ verified: true, absent: true }); },
+  });
 };
 
-MotaLab.createJournal = function createJournal(storage) {
-  const STORAGE_PROTOCOL = 1;
+MotaLab.createJournal = function createJournal(_ignoredStorage) {
   const defaults = () => ({
     protocol: MotaLab.PROTOCOL_VERSION,
     autopilot_enabled: false,
@@ -3215,636 +3271,58 @@ MotaLab.createJournal = function createJournal(storage) {
     last_pause: null,
     registry_entries: [],
   });
-  const JOURNAL_FIELDS = Object.freeze(Object.keys(defaults()).sort());
-  const ENVELOPE_FIELDS = Object.freeze([
-    "commit_hash", "generation", "import_witness", "previous_commit_hash",
-    "previous_generation", "state", "state_hash", "storage_protocol",
-  ].sort());
-  let cachedContext = null;
-  let cachedState = null;
-  let cachedRevision = null;
-  let externallyInvalidated = false;
-  const diagnostics = { cold_load_ms: 0, snapshots: 0, snapshot_ms: 0, writes: [] };
-  const now = () => (globalThis.performance && typeof globalThis.performance.now === "function"
-    ? globalThis.performance.now() : Date.now());
-  if (storage && typeof storage.subscribeChanges === "function") {
-    storage.subscribeChanges(() => { externallyInvalidated = true; });
-  }
-
-  function pauseStorage(operation, details = {}) {
-    return MotaLab.createPauseError(
-      "ENGINE_API_INCOMPATIBLE", "JOURNAL_STORAGE_UNSTABLE",
-      Object.assign({ operation }, details),
-    );
-  }
-
-  function inspectKey(key) {
-    if (storage && typeof storage.inspect === "function") return storage.inspect(key);
-    try {
-      const marker = Object.freeze({ absent: true });
-      const value = storage.get(key, marker);
-      if (value === marker) return { status: "absent", key };
-      const raw = JSON.stringify(value);
-      return { status: "parsed", key, value: MotaLab.cloneJsonValue(value),
-        raw_length: raw.length, content_hash: `sha256:${MotaLab.sha256(raw)}` };
-    } catch (_) {
-      return { status: "read_failed", key, raw_length: 0,
-        content_hash: `sha256:${MotaLab.sha256("storage-read-failed")}` };
-    }
-  }
-
-  function isPlainObject(value) {
-    return Boolean(value && Object.prototype.toString.call(value) === "[object Object]");
-  }
-
-  function validateV2State(value) {
-    if (!isPlainObject(value) || value.protocol !== MotaLab.PROTOCOL_VERSION) return false;
-    if (Object.keys(value).sort().join("\u0000") !== JOURNAL_FIELDS.join("\u0000")) return false;
-    if (typeof value.autopilot_enabled !== "boolean"
-      || typeof value.service_session_confirmed !== "boolean"
-      || typeof value.migration_required !== "boolean"
-      || typeof value.corruption_required !== "boolean") return false;
-    for (const field of ["session_id", "session_mode", "last_acknowledged_action_id"]) {
-      if (value[field] !== null && (typeof value[field] !== "string" || value[field].length < 1)) return false;
-    }
-    if (value.session_mode !== null && !MotaLab.SESSION_MODES.includes(value.session_mode)) return false;
-    for (const field of [
-      "expected_guard", "baseline", "legacy_archive", "legacy_disposition",
-      "corrupt_archive", "corrupt_disposition", "scan_state", "pending_action",
-      "last_completed_action", "last_pause",
-    ]) {
-      if (value[field] !== null && !isPlainObject(value[field])) return false;
-    }
-    if (!isPlainObject(value.seen_action_ids) || !Array.isArray(value.registry_entries)
-      || !Array.isArray(value.corrupt_evidence)) return false;
-    if (Object.values(value.seen_action_ids).some((item) => typeof item !== "string")) return false;
-    for (const field of ["pending_action", "last_completed_action"]) {
-      if (value[field] !== null
-        && (typeof value[field].action_id !== "string" || value[field].action_id.length < 1)) return false;
-    }
-    return value.corrupt_evidence.every((item) => isPlainObject(item)
-      && typeof item.key === "string" && Number.isInteger(item.raw_length)
-      && typeof item.content_hash === "string" && /^sha256:[a-f0-9]{64}$/.test(item.content_hash));
-  }
-
-  function rawInspectionIdentity(inspected) {
-    if (!inspected) return "missing";
-    if (inspected.status === "parsed") {
-      try { return `parsed:sha256:${MotaLab.sha256(MotaLab.canonicalize(inspected.value))}`; }
-      catch (_) { return `parsed-invalid:${inspected.raw_length || 0}:${inspected.content_hash || "missing"}`; }
-    }
-    return `${inspected.status}:${inspected.raw_length || 0}:${inspected.content_hash || "none"}`;
-  }
-
-  function inspectionIdentity(inspected) {
-    if (!inspected || ["storage_unstable", "read_failed"].includes(inspected.status)) {
-      throw pauseStorage("journal-storage-witness", {
-        observed_status: inspected && inspected.status,
-        key: inspected && inspected.key,
-      });
-    }
-    return rawInspectionIdentity(inspected);
-  }
-
-  function importWitness(inspected, classification, evidence = null) {
-    return {
-      key: MotaLab.JOURNAL_KEY,
-      identity: inspectionIdentity(inspected),
-      classification,
-      evidence: evidence ? MotaLab.cloneJsonValue(evidence) : null,
-    };
-  }
-
-  function envelopeCore(envelope) {
-    return {
-      storage_protocol: envelope.storage_protocol,
-      generation: envelope.generation,
-      previous_generation: envelope.previous_generation,
-      previous_commit_hash: envelope.previous_commit_hash,
-      state: envelope.state,
-      state_hash: envelope.state_hash,
-      import_witness: envelope.import_witness,
-    };
-  }
-
-  function validateEnvelope(value) {
-    if (!isPlainObject(value)
-      || Object.keys(value).sort().join("\u0000") !== ENVELOPE_FIELDS.join("\u0000")
-      || value.storage_protocol !== STORAGE_PROTOCOL
-      || !Number.isSafeInteger(value.generation) || value.generation < 1
-      || !isPlainObject(value.import_witness)
-      || value.import_witness.key !== MotaLab.JOURNAL_KEY
-      || typeof value.import_witness.identity !== "string"
-      || !["absent", "valid_v2", "corrupt"].includes(value.import_witness.classification)
-      || (value.import_witness.evidence !== null && !isPlainObject(value.import_witness.evidence))
-      || (value.import_witness.classification === "corrupt" && !isPlainObject(value.import_witness.evidence))
-      || !validateV2State(value.state)) return false;
-    if (value.generation === 1) {
-      if (value.previous_generation !== 0 || value.previous_commit_hash !== null) return false;
-    } else if (!Number.isSafeInteger(value.previous_generation)
-      || value.previous_generation < 1
-      || value.previous_generation !== value.generation - 1
-      || typeof value.previous_commit_hash !== "string"
-      || !/^sha256:[a-f0-9]{64}$/.test(value.previous_commit_hash)) return false;
-    if (typeof value.state_hash !== "string" || typeof value.commit_hash !== "string") return false;
-    const stateHash = `sha256:${MotaLab.sha256(MotaLab.canonicalize(value.state))}`;
-    if (stateHash !== value.state_hash) return false;
-    const commitHash = `sha256:${MotaLab.sha256(MotaLab.canonicalize(envelopeCore(value)))}`;
-    return commitHash === value.commit_hash;
-  }
-
-  function buildEnvelope(state, active, witness) {
-    if (active && active.envelope.generation >= Number.MAX_SAFE_INTEGER) {
-      throw pauseStorage("journal-generation-build", { reason: "generation-overflow" });
-    }
-    const envelope = {
-      storage_protocol: STORAGE_PROTOCOL,
-      generation: active ? active.envelope.generation + 1 : 1,
-      previous_generation: active ? active.envelope.generation : 0,
-      previous_commit_hash: active ? active.envelope.commit_hash : null,
-      state: MotaLab.cloneJsonValue(state),
-      state_hash: `sha256:${MotaLab.sha256(MotaLab.canonicalize(state))}`,
-      import_witness: MotaLab.cloneJsonValue(witness),
-      commit_hash: null,
-    };
-    envelope.commit_hash = `sha256:${MotaLab.sha256(MotaLab.canonicalize(envelopeCore(envelope)))}`;
-    return envelope;
-  }
-
-  function evidenceFromInspection(inspected, reason = null) {
-    return {
-      key: inspected.key,
-      status: reason || inspected.status,
-      raw_length: Number.isInteger(inspected.raw_length) ? inspected.raw_length : 0,
-      content_hash: typeof inspected.content_hash === "string"
-        ? inspected.content_hash : `sha256:${MotaLab.sha256("unreadable")}`,
-    };
-  }
-
-  function loadContextOnce() {
-    const slotInspections = MotaLab.JOURNAL_SLOT_KEYS.map(inspectKey);
-    for (const inspected of slotInspections) inspectionIdentity(inspected);
-    const valid = [];
-    for (let index = 0; index < slotInspections.length; index += 1) {
-      const inspected = slotInspections[index];
-      if (inspected.status === "parsed" && validateEnvelope(inspected.value)) {
-        valid.push({ key: MotaLab.JOURNAL_SLOT_KEYS[index], envelope: inspected.value });
-      }
-    }
-    let active = null;
-    if (valid.length === 2) {
-      const sorted = valid.slice().sort((left, right) => left.envelope.generation - right.envelope.generation);
-      const lower = sorted[0].envelope;
-      const higher = sorted[1].envelope;
-      if (lower.generation === higher.generation) {
-        throw pauseStorage("journal-slot-selection", { reason: "same-generation-conflict" });
-      }
-      if (higher.generation !== lower.generation + 1
-        || higher.previous_generation !== lower.generation
-        || higher.previous_commit_hash !== lower.commit_hash
-        || MotaLab.canonicalize(higher.import_witness) !== MotaLab.canonicalize(lower.import_witness)) {
-        throw pauseStorage("journal-slot-selection", { reason: "generation-chain-broken" });
-      }
-      active = sorted[1];
-    } else if (valid.length === 1) {
-      active = valid[0];
-      for (const inspected of slotInspections) {
-        const rawGeneration = inspected.status === "parsed" && isPlainObject(inspected.value)
-          ? inspected.value.generation : null;
-        if (Number.isSafeInteger(rawGeneration)
-          && rawGeneration > active.envelope.generation + 1) {
-          throw pauseStorage("journal-slot-selection", { reason: "unexpected-higher-generation" });
-        }
-      }
-    } else if (slotInspections.some((item) => item.status !== "absent")) {
-      throw pauseStorage("journal-slot-selection", { reason: "no-valid-generation" });
-    }
-
-    const singleV2 = inspectKey(MotaLab.JOURNAL_KEY);
-    const legacy = MotaLab.LEGACY_JOURNAL_KEYS.map(inspectKey);
-    const corruptEvidence = [];
-    let sourceState = null;
-    let witness = null;
-    if (active) {
-      inspectionIdentity(singleV2);
-      sourceState = active.envelope.state;
-      witness = active.envelope.import_witness;
-      if (witness.identity !== rawInspectionIdentity(singleV2)) {
-        corruptEvidence.push(evidenceFromInspection(singleV2, "legacy_v2_witness_changed"));
-      } else if (witness.classification === "corrupt") {
-        corruptEvidence.push(MotaLab.cloneJsonValue(witness.evidence));
-      }
-    } else if (singleV2.status === "parsed" && validateV2State(singleV2.value)) {
-      sourceState = singleV2.value;
-      witness = importWitness(singleV2, "valid_v2");
-    } else if (singleV2.status === "absent") {
-      witness = importWitness(singleV2, "absent");
-    } else if (singleV2.status !== "absent") {
-      const reason = singleV2.status === "parsed"
-        ? (isPlainObject(singleV2.value) && singleV2.value.protocol !== MotaLab.PROTOCOL_VERSION
-          ? "wrong_protocol" : "wrong_shape") : null;
-      const evidence = evidenceFromInspection(singleV2, reason);
-      if (!["storage_unstable", "read_failed"].includes(singleV2.status)) {
-        witness = importWitness(singleV2, "corrupt", evidence);
-      }
-      corruptEvidence.push(evidence);
-    }
-
-    const legacyEntries = [];
-    for (const inspected of legacy) {
-      if (inspected.status === "absent") continue;
-      if (inspected.status === "parsed" && isPlainObject(inspected.value)
-        && inspected.value.protocol === 1) {
-        legacyEntries.push({ key: inspected.key, payload: MotaLab.cloneJsonValue(inspected.value) });
-      } else {
-        corruptEvidence.push(evidenceFromInspection(
-          inspected, inspected.status === "parsed" ? "wrong_shape_or_protocol" : null,
-        ));
-      }
-    }
-    return { active, sourceState, witness, slotInspections, singleV2,
-      legacyEntries, corruptEvidence };
-  }
-
-  function contextIdentity(context) {
-    return MotaLab.canonicalize({
-      slots: context.slotInspections.map(inspectionIdentity),
-      single: rawInspectionIdentity(context.singleV2),
-      legacy: context.legacyEntries,
-      active: context.active ? {
-        key: context.active.key,
-        generation: context.active.envelope.generation,
-        commit_hash: context.active.envelope.commit_hash,
-      } : null,
-      corruption: context.corruptEvidence,
-    });
-  }
-
-  function loadStableContext(operation = "journal-read") {
-    const first = loadContextOnce();
-    const second = loadContextOnce();
-    if (contextIdentity(first) !== contextIdentity(second)) {
-      throw pauseStorage(operation, { reason: "two-slot-read-changed" });
-    }
-    return second;
-  }
-
-  function legacyArchiveId(entries) {
-    return `legacy-archive:${MotaLab.sha256(MotaLab.canonicalize(entries))}`;
-  }
-
-  function stateFromContext(context) {
-    const result = context.sourceState ? MotaLab.cloneJsonValue(context.sourceState) : defaults();
-    result.autopilot_enabled = result.autopilot_enabled === true;
-    result.corrupt_evidence = MotaLab.cloneJsonValue(context.corruptEvidence);
-    if (context.legacyEntries.length > 0) {
-      const currentArchiveId = legacyArchiveId(context.legacyEntries);
-      const dispositionMatches = Boolean(
-        result.legacy_archive && result.legacy_archive.archive_id === currentArchiveId
-        && result.legacy_disposition && result.legacy_disposition.archive_id === currentArchiveId
-      );
-      result.migration_required = !dispositionMatches;
-    } else if (result.legacy_archive && !result.legacy_disposition) {
-      result.migration_required = true;
-    }
-    if (context.corruptEvidence.length > 0) {
-      const currentArchiveId = `corrupt-archive:${MotaLab.sha256(MotaLab.canonicalize(context.corruptEvidence))}`;
-      const dispositionMatches = Boolean(
-        result.corrupt_archive && result.corrupt_archive.archive_id === currentArchiveId
-        && result.corrupt_disposition && result.corrupt_disposition.archive_id === currentArchiveId
-      );
-      result.corruption_required = !dispositionMatches;
-    } else if (result.corrupt_archive && !result.corrupt_disposition) {
-      result.corruption_required = true;
-    }
-    if (result.corruption_required) result.autopilot_enabled = false;
-    if (result.pending_action && result.pending_action.pre_observation) {
-      result.pending_action.pre_observation = MotaLab.recoveryObservationProjection(
-        result.pending_action.pre_observation,
-      );
-    }
-    if (result.last_completed_action) delete result.last_completed_action.observation;
-    if (result.last_pause) {
-      if (result.last_pause.observation) {
-        result.last_pause.observation = MotaLab.recoveryObservationProjection(
-          result.last_pause.observation,
-        );
-      }
-      if (result.last_pause.details) {
-        result.last_pause.details = MotaLab.compactJournalDetails(result.last_pause.details);
-      }
-    }
-    return result;
-  }
-
-  function ensureCache() {
-    if (externallyInvalidated) {
-      throw pauseStorage("journal-cache", { reason: "external-storage-change" });
-    }
-    const currentRevision = storage && typeof storage.getRevision === "function"
-      ? storage.getRevision() : null;
-    const quarantinedWitness = cachedContext && (
-      (cachedContext.witness && cachedContext.witness.classification === "corrupt")
-      || cachedContext.legacyEntries.length > 0
-      || cachedContext.corruptEvidence.length > 0
-    );
-    if (quarantinedWitness) {
-      cachedContext = null;
-      cachedState = null;
-    }
-    if (cachedContext && currentRevision !== null && currentRevision !== cachedRevision) {
-      cachedContext = null;
-      cachedState = null;
-    }
-    if (!cachedContext) {
-      const started = now();
-      cachedContext = loadStableContext();
-      cachedState = stateFromContext(cachedContext);
-      cachedRevision = currentRevision;
-      diagnostics.cold_load_ms = now() - started;
-    }
-  }
-
-  function read() {
-    const started = now();
-    ensureCache();
-    const result = MotaLab.cloneJsonValue(cachedState);
-    diagnostics.snapshots += 1;
-    diagnostics.snapshot_ms += now() - started;
-    return result;
-  }
-
-  function write(next, context, allowInitialCorruptArchive = false) {
-    const writeStarted = now();
-    if (next.corruption_required && !next.corrupt_archive && !allowInitialCorruptArchive) {
-      throw new TypeError("Corrupt journal evidence must be archived before a generation is written");
-    }
-    if (!validateV2State(next)) throw pauseStorage("journal-write", { reason: "invalid-state" });
-    if (!context.witness) {
-      throw pauseStorage("journal-write", { reason: "unstable-import-witness" });
-    }
-    const precondition = loadContextOnce();
-    if (contextIdentity(precondition) !== contextIdentity(context)) {
-      throw pauseStorage("journal-write-precondition", { reason: "read-write-witness-changed" });
-    }
-    const target = context.active
-      ? MotaLab.JOURNAL_SLOT_KEYS.find((key) => key !== context.active.key)
-      : MotaLab.JOURNAL_SLOT_KEYS[0];
-    const envelope = buildEnvelope(next, context.active, context.witness);
-    let writeError = null;
-    // Runtime storage adapters already perform two independent canonical
-    // readbacks.  This layer then parses the target once and re-selects the
-    // complete A/B generation set below; repeating both full-slot probes here
-    // was the former hot-path multiplier.
-    try { storage.set(target, MotaLab.cloneJsonValue(envelope)); }
-    catch (error) { writeError = error; }
-    const first = inspectKey(target);
-    const second = first;
-    let committed = false;
-    try {
-      committed = first.status === "parsed" && second.status === "parsed"
-        && validateEnvelope(first.value) && validateEnvelope(second.value)
-        && MotaLab.canonicalize(first.value) === MotaLab.canonicalize(envelope)
-        && MotaLab.canonicalize(second.value) === MotaLab.canonicalize(envelope);
-    } catch (_) { committed = false; }
-    if (!committed || writeError) {
-      throw pauseStorage("journal-generation-write", {
-        reason: writeError ? "write-call-uncertain" : "candidate-readback-invalid",
-        target_slot: target,
-        candidate_generation: envelope.generation,
-        complete_candidate_observed: committed,
-      });
-    }
-    const after = loadContextOnce();
-    if (!after.active || after.active.key !== target
-      || after.active.envelope.commit_hash !== envelope.commit_hash) {
-      throw pauseStorage("journal-generation-commit", { reason: "candidate-not-selected" });
-    }
-    cachedContext = after;
-    cachedState = stateFromContext(after);
-    cachedRevision = storage && typeof storage.getRevision === "function"
-      ? storage.getRevision() : null;
-    diagnostics.writes.push({ generation: envelope.generation, ms: now() - writeStarted,
-      bytes: MotaLab.canonicalize(envelope).length });
-    if (diagnostics.writes.length > 32) diagnostics.writes.shift();
-    return Object.freeze({
-      verified: true,
-      state: MotaLab.cloneJsonValue(next),
-      generation: envelope.generation,
-      commit_hash: envelope.commit_hash,
-    });
-  }
-
-  function update(mutator) {
-    ensureCache();
-    const context = cachedContext;
-    const state = MotaLab.cloneJsonValue(cachedState);
-    mutator(state);
-    return write(state, context);
-  }
-
-  function hasV2RecoveryEvidence(state) {
-    return Boolean(state.session_id || state.session_mode || state.baseline || state.expected_guard
-      || state.service_session_confirmed || state.scan_state || state.pending_action
-      || state.last_completed_action || state.last_acknowledged_action_id
-      || Object.keys(state.seen_action_ids || {}).length > 0);
-  }
-
+  let state = defaults();
+  let mutations = 0;
+  const clone = (value) => MotaLab.cloneJsonValue(value);
+  const result = () => Object.freeze({ verified: true, memory_only: true });
+  function update(mutator) { mutator(state); mutations += 1; return result(); }
   return Object.freeze({
-    snapshot: read,
-    getDiagnostics() {
-      return MotaLab.cloneJsonValue(Object.assign({}, diagnostics, {
-        average_snapshot_ms: diagnostics.snapshots
-          ? diagnostics.snapshot_ms / diagnostics.snapshots : 0,
-        cached: Boolean(cachedContext), externally_invalidated: externallyInvalidated,
-      }));
-    },
-    setAutopilot(enabled) { return update((state) => { state.autopilot_enabled = enabled === true; }); },
+    snapshot() { return clone(state); },
+    getDiagnostics() { return { memory_only: true, mutations, persistent_writes: 0 }; },
+    setAutopilot(enabled) { return update((s) => { s.autopilot_enabled = enabled === true; }); },
     establishSession({ session_id, mode, baseline, expected_guard = null }) {
-      if (typeof session_id !== "string" || session_id.length < 1
-        || !MotaLab.SESSION_MODES.includes(mode) || !baseline) throw new TypeError("Invalid session baseline");
-      return update((state) => {
-        if (state.migration_required || state.corruption_required) {
-          throw new TypeError("Journal quarantine requires explicit archived disposition");
-        }
-        state.session_id = session_id;
-        state.session_mode = mode;
-        state.baseline = MotaLab.cloneJsonValue(baseline);
-        state.expected_guard = expected_guard ? MotaLab.cloneJsonValue(expected_guard) : null;
-        state.service_session_confirmed = false;
-      });
-    },
-    archiveLegacyJournal() {
-      const context = loadStableContext("legacy-archive-read");
-      if (context.legacyEntries.length === 0) throw new TypeError("No legacy journal is present");
-      const archiveId = legacyArchiveId(context.legacyEntries);
-      const archive = {
-        archive_id: archiveId,
-        archived_at: Date.now(),
-        has_pending_or_recovery: context.legacyEntries.some((entry) => Boolean(entry.payload
-          && (entry.payload.pending_action || entry.payload.recovery || entry.payload.last_completed_action))),
-        entries: MotaLab.cloneJsonValue(context.legacyEntries),
-      };
-      const result = update((state) => {
-        state.migration_required = true;
-        state.legacy_archive = archive;
-        state.legacy_disposition = null;
-        state.autopilot_enabled = false;
-      });
-      if (legacyArchiveId(loadStableContext().legacyEntries) !== archiveId) {
-        throw pauseStorage("legacy-archive-postcondition", { reason: "legacy-content-changed" });
+      if (typeof session_id !== "string" || !session_id || !MotaLab.SESSION_MODES.includes(mode)) {
+        throw new TypeError("Invalid session baseline");
       }
-      return MotaLab.cloneJsonValue(archive);
-    },
-    authorizeV2AfterLegacyArchive({ archive_id, confirmation }) {
-      if (confirmation !== "START_V2_NEW_SESSION") {
-        throw new TypeError("Explicit legacy disposition confirmation is required");
-      }
-      const result = update((state) => {
-        const current = loadStableContext("legacy-disposition-read").legacyEntries;
-        const currentArchiveId = current.length > 0 ? legacyArchiveId(current) : null;
-        if (!state.migration_required || !state.legacy_archive
-          || state.legacy_archive.archive_id !== archive_id || currentArchiveId !== archive_id) {
-          throw new TypeError("Legacy archive identity does not match");
-        }
-        if (hasV2RecoveryEvidence(state)) {
-          throw new TypeError("Existing v2 recovery evidence requires a separate audited disposition");
-        }
-        state.legacy_disposition = {
-          kind: "archived_then_new_v2_session", archive_id, command: confirmation,
-          confirmed_at: Date.now(),
-          had_pending_or_recovery: state.legacy_archive.has_pending_or_recovery === true,
-        };
-        state.migration_required = false;
-      });
-      const current = loadStableContext().legacyEntries;
-      if (current.length === 0 || legacyArchiveId(current) !== archive_id) {
-        throw pauseStorage("legacy-disposition-postcondition", { reason: "legacy-content-changed" });
-      }
-      return result;
-    },
-    archiveCorruptJournal() {
-      const context = loadStableContext("corrupt-archive-read");
-      if (context.corruptEvidence.length === 0) throw new TypeError("No corrupt journal is present");
-      const archive = {
-        archive_id: `corrupt-archive:${MotaLab.sha256(MotaLab.canonicalize(context.corruptEvidence))}`,
-        archived_at: Date.now(), evidence: MotaLab.cloneJsonValue(context.corruptEvidence),
-      };
-      const state = stateFromContext(context);
-      if (hasV2RecoveryEvidence(state)) {
-        throw new TypeError("Existing v2 recovery evidence requires a separate audited corrupt-journal disposition");
-      }
-      state.autopilot_enabled = false;
-      state.corruption_required = true;
-      state.corrupt_evidence = MotaLab.cloneJsonValue(context.corruptEvidence);
-      state.corrupt_archive = archive;
-      state.corrupt_disposition = null;
-      write(state, context, true);
-      if (MotaLab.canonicalize(loadStableContext().corruptEvidence)
-        !== MotaLab.canonicalize(archive.evidence)) {
-        throw pauseStorage("corrupt-archive-postcondition", { reason: "content-changed" });
-      }
-      return MotaLab.cloneJsonValue(archive);
-    },
-    authorizeV2AfterCorruptArchive({ archive_id, confirmation }) {
-      if (confirmation !== "ARCHIVE_CORRUPT_AND_START_V2") {
-        throw new TypeError("Explicit corrupt journal disposition confirmation is required");
-      }
-      const result = update((state) => {
-        if (!state.corruption_required || !state.corrupt_archive
-          || state.corrupt_archive.archive_id !== archive_id) {
-          throw new TypeError("Corrupt journal archive identity does not match");
-        }
-        if (hasV2RecoveryEvidence(state)) {
-          throw new TypeError("Existing v2 recovery evidence requires a separate audited disposition");
-        }
-        const current = loadStableContext("corrupt-disposition-read").corruptEvidence;
-        if (MotaLab.canonicalize(current) !== MotaLab.canonicalize(state.corrupt_archive.evidence)) {
-          throw new TypeError("Corrupt journal content changed after archive");
-        }
-        state.corrupt_disposition = {
-          kind: "fingerprint_bound_corrupt_archive", archive_id,
-          command: confirmation, confirmed_at: Date.now(),
-        };
-        state.corruption_required = false;
-        state.corrupt_evidence = [];
-      });
-      return result;
-    },
-    markServiceSessionConfirmed() { return update((state) => { state.service_session_confirmed = true; }); },
-    setPending(pending) {
-      return update((state) => {
-        state.pending_action = MotaLab.cloneJsonValue(pending);
-        if (state.pending_action.pre_observation) {
-          state.pending_action.pre_observation = MotaLab.recoveryObservationProjection(
-            state.pending_action.pre_observation,
-          );
-        }
-        state.seen_action_ids[pending.action_id] = "pending";
+      return update((s) => {
+        s.session_id = session_id; s.session_mode = mode; s.baseline = clone(baseline);
+        s.expected_guard = expected_guard ? clone(expected_guard) : null;
+        s.service_session_confirmed = false; s.pending_action = null;
+        s.last_completed_action = null; s.last_acknowledged_action_id = null;
+        s.seen_action_ids = {}; s.scan_state = null;
       });
     },
-    updatePending(fields) {
-      return update((state) => { if (state.pending_action) Object.assign(state.pending_action, fields); });
-    },
-    abandonPending() {
-      return update((state) => {
-        if (state.pending_action) state.seen_action_ids[state.pending_action.action_id] = "abandoned";
-        state.pending_action = null;
-      });
-    },
-    clearPending() {
-      return update((state) => {
-        if (state.pending_action) state.seen_action_ids[state.pending_action.action_id] = "cleared";
-        state.pending_action = null;
-      });
-    },
-    markCompleted(record) {
-      return update((state) => {
-        state.last_completed_action = MotaLab.cloneJsonValue(record);
-        delete state.last_completed_action.observation;
-        state.pending_action = null;
-        state.seen_action_ids[record.action_id] = "completed";
-      });
-    },
-    markCompletedAndAcknowledge(record, actionId) {
-      return update((state) => {
-        state.last_completed_action = MotaLab.cloneJsonValue(record);
-        delete state.last_completed_action.observation;
-        state.pending_action = null;
-        state.seen_action_ids[record.action_id] = "completed";
-        state.last_acknowledged_action_id = actionId;
-      });
-    },
-    acknowledge(actionId) { return update((state) => { state.last_acknowledged_action_id = actionId; }); },
-    actionState(actionId) { return read().seen_action_ids[actionId] || null; },
-    setPause(pause) {
-      return update((state) => {
-        state.last_pause = MotaLab.cloneJsonValue(pause);
-        if (state.last_pause.observation) {
-          state.last_pause.observation = MotaLab.recoveryObservationProjection(
-            state.last_pause.observation,
-          );
-        }
-        if (state.last_pause.details) {
-          state.last_pause.details = MotaLab.compactJournalDetails(state.last_pause.details);
-        }
-        state.autopilot_enabled = false;
-      });
-    },
-    setRegistryEntries(entries) {
-      ensureCache();
-      if (MotaLab.canonicalize(cachedState.registry_entries)
-        === MotaLab.canonicalize(entries)) return Object.freeze({ verified: true, skipped: true });
-      return update((state) => { state.registry_entries = MotaLab.cloneJsonValue(entries); });
-    },
-    setScanState(scanState) {
-      ensureCache();
-      const next = scanState ? MotaLab.cloneJsonValue(scanState) : null;
-      if (MotaLab.canonicalize(cachedState.scan_state) === MotaLab.canonicalize(next)) {
-        return Object.freeze({ verified: true, skipped: true });
-      }
-      return update((state) => { state.scan_state = scanState ? MotaLab.cloneJsonValue(scanState) : null; });
-    },
+    markServiceSessionConfirmed() { return update((s) => { s.service_session_confirmed = true; }); },
+    setPending(pending) { return update((s) => {
+      s.pending_action = clone(pending); s.seen_action_ids[pending.action_id] = "pending";
+    }); },
+    updatePending(fields) { return update((s) => { if (s.pending_action) Object.assign(s.pending_action, clone(fields)); }); },
+    abandonPending() { return update((s) => {
+      if (s.pending_action) s.seen_action_ids[s.pending_action.action_id] = "abandoned";
+      s.pending_action = null;
+    }); },
+    clearPending() { return update((s) => {
+      if (s.pending_action) s.seen_action_ids[s.pending_action.action_id] = "cleared";
+      s.pending_action = null;
+    }); },
+    markCompleted(record) { return update((s) => {
+      s.last_completed_action = clone(record); delete s.last_completed_action.observation;
+      s.pending_action = null; s.seen_action_ids[record.action_id] = "completed";
+    }); },
+    markCompletedAndAcknowledge(record, actionId) { return update((s) => {
+      s.last_completed_action = clone(record); delete s.last_completed_action.observation;
+      s.pending_action = null; s.seen_action_ids[record.action_id] = "completed";
+      s.last_acknowledged_action_id = actionId;
+    }); },
+    acknowledge(actionId) { return update((s) => { s.last_acknowledged_action_id = actionId; }); },
+    actionState(actionId) { return state.seen_action_ids[actionId] || null; },
+    setPause(pause) { return update((s) => { s.last_pause = clone(pause); s.autopilot_enabled = false; }); },
+    setRegistryEntries(entries) { return update((s) => { s.registry_entries = clone(entries); }); },
+    setScanState(scanState) { return update((s) => { s.scan_state = scanState ? clone(scanState) : null; }); },
+    archiveLegacyJournal() { throw new TypeError("Persistent journal is disabled"); },
+    authorizeV2AfterLegacyArchive() { throw new TypeError("Persistent journal is disabled"); },
+    archiveCorruptJournal() { throw new TypeError("Persistent journal is disabled"); },
+    authorizeV2AfterCorruptArchive() { throw new TypeError("Persistent journal is disabled"); },
   });
 };
 
@@ -3864,6 +3342,23 @@ MotaLab.classifyPendingRecovery = function classifyPendingRecovery(pending, obse
   }
   if (!pending.pre_observation || !pending.expected_delta) {
     return { phase: "mismatch", detail_code: "RECOVERY_STATE_AMBIGUOUS" };
+  }
+  const menuOperation = Array.isArray(pending.operations)
+    ? pending.operations.find((item) => item.type === "menu_choice") : null;
+  if (menuOperation && observation.active_menu
+    && observation.active_menu.shop_id === menuOperation.shop_id
+    && observation.active_menu.menu_id === menuOperation.menu_id) {
+    const before = pending.pre_observation;
+    const unchanged = ["hp", "attack", "defense", "gold", "experience"].every(
+      (field) => before.hero[field] === observation.hero[field],
+    ) && ["yellow", "blue", "red"].every(
+      (color) => before.keys[color] === observation.keys[color],
+    ) && before.map_instance_id === observation.map_instance_id;
+    if (unchanged) return {
+      phase: "not_executed", pending_action_id: pending.action_id,
+      pre_fingerprint: pending.pre_fingerprint, current_fingerprint: fingerprint,
+      detail_code: "SHOP_MENU_OPEN_NOT_EXECUTED",
+    };
   }
   const declaredFields = pending.expected_delta
     && typeof pending.expected_delta === "object" && !Array.isArray(pending.expected_delta)
@@ -3916,6 +3411,16 @@ MotaLab.classifyPendingRecovery = function classifyPendingRecovery(pending, obse
     };
   }
   if (delta.ok) {
+    if (menuOperation) {
+      const shop = (observation.shops || []).find((item) => item.shop_id === menuOperation.shop_id);
+      const choice = shop && shop.choices[menuOperation.choice_index];
+      if (!choice || choice.choice_id !== menuOperation.choice_id
+        || choice.purchase_count !== menuOperation.expected_purchase_count + 1) {
+        return { phase: "mismatch", detail_code: "SHOP_COUNTER_MISMATCH",
+          pending_action_id: pending.action_id,
+          pre_fingerprint: pending.pre_fingerprint, current_fingerprint: fingerprint };
+      }
+    }
     return {
       phase: "completed",
       pending_action_id: pending.action_id,
@@ -4154,36 +3659,14 @@ MotaLab.registerMenus = function registerMenus({
 }) {
   const registrations = [
     ["确认新会话基线", () => controller.confirmBaseline({ mode: "new_game" })],
-    ["归档旧 v1 journal 证据", () => controller.archiveLegacyJournal()],
-    ["确认归档后开始 v2 新会话", () => {
-      const archive = controller.getLegacyArchive();
-      if (!archive) return;
-      if (confirmAction("旧 v1 journal 已本地归档。明确放弃旧 pending/recovery 身份链并开始全新 v2 会话？")) {
-        controller.beginV2AfterLegacyArchive({
-          archive_id: archive.archive_id,
-          confirmation: "START_V2_NEW_SESSION",
-        });
-      }
-    }],
-    ["归档损坏 journal 摘要", () => controller.archiveCorruptJournal()],
-    ["确认损坏 journal 归档后开始 v2", () => {
-      const archive = controller.getCorruptArchive();
-      if (!archive) return;
-      if (confirmAction("损坏 journal 的 key、长度和内容哈希已归档。确认按该 fingerprint 处置并开始全新 v2 会话？")) {
-        controller.beginV2AfterCorruptArchive({
-          archive_id: archive.archive_id,
-          confirmation: "ARCHIVE_CORRUPT_AND_START_V2",
-        });
-      }
-    }],
     ["启动自动驾驶", () => controller.start()],
     ["暂停自动驾驶", () => controller.manualPause()],
     ["导出当前层运行态", () => {
       const observation = controller.getCurrentObservation();
       if (observation) exporter(observation);
     }],
-    ["清除待执行行动", () => {
-      if (confirmAction("只清除浏览器待执行账本，不会改变游戏现场。确定继续？")) {
+    ["清除当前内存待执行行动", () => {
+      if (confirmAction("只清除本页面内存中的待执行行动，不会改变游戏现场。确定继续？")) {
         controller.clearPending();
       }
     }],
@@ -4210,7 +3693,12 @@ MotaLab.createController = function createController(dependencies, options = {})
   const logger = dependencies.logger || console;
   const autoSchedule = options.autoSchedule === true;
   const cycleDelayMs = MotaLab.isFiniteInteger(options.cycleDelayMs) ? options.cycleDelayMs : 300;
+  const idleMaxDelayMs = MotaLab.isFiniteInteger(options.idleMaxDelayMs)
+    ? Math.max(cycleDelayMs, options.idleMaxDelayMs) : 5000;
+  const busySampleMs = MotaLab.isFiniteInteger(options.busySampleMs) ? options.busySampleMs : 100;
+  const busyTimeoutMs = MotaLab.isFiniteInteger(options.busyTimeoutMs) ? options.busyTimeoutMs : 1500;
   const schedule = options.schedule || ((callback, delay) => setTimeout(callback, delay));
+  const sleep = dependencies.sleep || ((delay) => new Promise((resolve) => setTimeout(resolve, delay)));
   let state = "STOPPED";
   let currentObservation = null;
   let currentActionId = null;
@@ -4222,6 +3710,14 @@ MotaLab.createController = function createController(dependencies, options = {})
     ? globalThis.performance.now() : Date.now());
   const timingHistory = [];
   let activeTiming = null;
+  let idleFingerprint = null;
+  let idleDelayMs = cycleDelayMs;
+  let loopEpoch = 0;
+  const loopDiagnostics = {
+    idle_probes: 0, idle_service_skips: 0, idle_wakeups: 0,
+    idle_last_delay_ms: 0, busy_samples: 0, busy_waits: 0,
+    busy_transient_recoveries: 0, busy_timeouts: 0,
+  };
 
   function locationText(observation) {
     return observation
@@ -4318,6 +3814,62 @@ MotaLab.createController = function createController(dependencies, options = {})
   function scheduleNext(delay = cycleDelayMs) {
     if (!autoSchedule || !journal.snapshot().autopilot_enabled) return;
     schedule(() => { runSingleCycle(); }, delay);
+  }
+
+  function resetIdleBackoff() {
+    loopEpoch += 1;
+    idleFingerprint = null;
+    idleDelayMs = cycleDelayMs;
+    loopDiagnostics.idle_last_delay_ms = 0;
+  }
+
+  function scheduleIdleProbe(fingerprint) {
+    if (!autoSchedule || !journal.snapshot().autopilot_enabled) return;
+    idleFingerprint = fingerprint;
+    const delay = idleDelayMs;
+    loopDiagnostics.idle_last_delay_ms = delay;
+    idleDelayMs = Math.min(idleMaxDelayMs, Math.max(cycleDelayMs, delay * 2));
+    const scheduledEpoch = loopEpoch;
+    schedule(() => {
+      if (scheduledEpoch !== loopEpoch || !journal.snapshot().autopilot_enabled || cyclePromise) return;
+      loopDiagnostics.idle_probes += 1;
+      let observation;
+      try { observation = capture(); }
+      catch (error) { handleError(error); return; }
+      const nextFingerprint = MotaLab.fingerprintObservation(observation);
+      const snapshot = journal.snapshot();
+      if (!observation.busy && !snapshot.pending_action && nextFingerprint === idleFingerprint) {
+        loopDiagnostics.idle_service_skips += 1;
+        scheduleIdleProbe(idleFingerprint);
+        return;
+      }
+      loopDiagnostics.idle_wakeups += 1;
+      resetIdleBackoff();
+      runSingleCycle();
+    }, delay);
+  }
+
+  async function waitForStableNotBusy(initialObservation) {
+    let observation = initialObservation;
+    let elapsed = 0;
+    let clearSamples = 0;
+    while (observation.busy && elapsed < busyTimeoutMs || clearSamples === 1) {
+      loopDiagnostics.busy_waits += 1;
+      await sleep(busySampleMs);
+      elapsed += busySampleMs;
+      observation = capture();
+      loopDiagnostics.busy_samples += 1;
+      if (observation.busy) clearSamples = 0;
+      else clearSamples += 1;
+      if (clearSamples >= 2) {
+        loopDiagnostics.busy_transient_recoveries += 1;
+        return observation;
+      }
+      if (elapsed >= busyTimeoutMs && observation.busy) break;
+    }
+    if (!observation.busy) return observation;
+    loopDiagnostics.busy_timeouts += 1;
+    return null;
   }
 
   async function initialize() {
@@ -4500,6 +4052,7 @@ MotaLab.createController = function createController(dependencies, options = {})
         if (!result || !result.verified) return result;
       }
       journal.setAutopilot(true);
+      resetIdleBackoff();
       state = "OBSERVING";
       lastReason = "用户已启动自动驾驶";
       refreshPanel({ autopilot: true, pause_kind: null });
@@ -4512,6 +4065,7 @@ MotaLab.createController = function createController(dependencies, options = {})
   function manualPause() {
     try { adapter.stopAutomaticRoute(); } catch (_) { /* best-effort stop */ }
     try {
+      resetIdleBackoff();
       journal.setAutopilot(false);
       state = "STOPPED";
       lastReason = "用户手动暂停";
@@ -4568,9 +4122,22 @@ MotaLab.createController = function createController(dependencies, options = {})
   async function cycleBody() {
     if (!journal.snapshot().autopilot_enabled) return { skipped: "disabled" };
     state = "OBSERVING";
-    const observation = capture();
-    if (observation.busy) {
-      return pause("UNSUPPORTED_INTERACTION", "GAME_BUSY_BEFORE_DECISION", {}, observation);
+    let observation = capture();
+    const pendingAtCapture = journal.snapshot().pending_action;
+    const pendingMenu = pendingAtCapture && Array.isArray(pendingAtCapture.operations)
+      ? pendingAtCapture.operations.find((item) => item.type === "menu_choice") : null;
+    const recoverableShopMenu = pendingMenu && observation.active_menu
+      && observation.active_menu.shop_id === pendingMenu.shop_id
+      && observation.active_menu.menu_id === pendingMenu.menu_id;
+    if (observation.busy && !recoverableShopMenu) {
+      const settled = await waitForStableNotBusy(observation);
+      if (!settled) {
+        return pause("UNSUPPORTED_INTERACTION", "GAME_BUSY_BEFORE_DECISION", {
+          busy_timeout_ms: busyTimeoutMs,
+          busy_sample_ms: busySampleMs,
+        }, currentObservation);
+      }
+      observation = settled;
     }
     const fingerprint = MotaLab.fingerprintObservation(observation);
     let snapshot = journal.snapshot();
@@ -4649,7 +4216,12 @@ MotaLab.createController = function createController(dependencies, options = {})
       state = "OBSERVING";
       lastReason = response.reason;
       refreshPanel({ connected: true });
-      scheduleNext();
+      if (journal.snapshot().pending_action || completedActionId) {
+        resetIdleBackoff();
+        scheduleNext();
+      } else {
+        scheduleIdleProbe(fingerprint);
+      }
       return { idle: true };
     }
 
@@ -4763,7 +4335,10 @@ MotaLab.createController = function createController(dependencies, options = {})
     let planned;
     let actionConstraints;
     try {
-      planned = MotaLab.planOperations(response, freshObservation, registry, adapter);
+      const responseMenu = response.operations.find((item) => item.type === "menu_choice");
+      planned = MotaLab.planOperations(responseMenu
+        ? Object.assign({}, response, { operations: response.operations.filter((item) => item.type === "grid") })
+        : response, freshObservation, registry, adapter);
       const allowUnknownFloor = response.expected_delta.floor_id === null
         && planned.length > 0 && planned[planned.length - 1].category === "stair";
       const allowUnknownMapInstance = response.expected_delta.map_instance_id === null
@@ -4774,7 +4349,8 @@ MotaLab.createController = function createController(dependencies, options = {})
         dimensions: freshObservation.dimensions,
         topology: freshObservation.topology,
       });
-      actionConstraints = MotaLab.validateActionPostconditions(planned, response.expected_delta);
+      actionConstraints = responseMenu ? { requires_non_position_change: true }
+        : MotaLab.validateActionPostconditions(planned, response.expected_delta);
     } catch (error) {
       if (MotaLab.isPauseError(error)
         && ["UNSAFE_MULTI_BOUNDARY_RESPONSE", "UNSAFE_ROUTE_RESPONSE"].includes(error.detail_code)) {
@@ -4885,6 +4461,7 @@ MotaLab.createController = function createController(dependencies, options = {})
       completed_at: Date.now(),
       recovered: false,
     });
+    resetIdleBackoff();
     state = "REPORTING";
     lastReason = `行动 ${response.action_id} 已完成并通过差分校验`;
     refreshPanel();
@@ -5052,6 +4629,7 @@ MotaLab.createController = function createController(dependencies, options = {})
         cycles: MotaLab.cloneJsonValue(timingHistory),
         active: activeTiming ? MotaLab.cloneJsonValue(activeTiming) : null,
         journal: typeof journal.getDiagnostics === "function" ? journal.getDiagnostics() : null,
+        loop: MotaLab.cloneJsonValue(loopDiagnostics),
       };
     },
     getState: () => state,
@@ -5089,7 +4667,7 @@ MotaLab.main = async function main() {
     return;
   }
   const adapter = MotaLab.createEngineAdapter();
-  const journal = MotaLab.createJournal(environment.storage);
+  const journal = MotaLab.createJournal();
   const registry = MotaLab.createBlockRegistry();
   const client = MotaLab.createLocalhostClient(environment.request);
   const controller = MotaLab.createController(

@@ -22,7 +22,6 @@ from .deltas import validate_expected_delta
 from .engine_model import derive_engine_authority, registry_entries as engine_registry_entries
 from .guards import compare_guard
 from .knowledge import KnowledgeError, KnowledgeRegistry
-from .logging import DecisionLogger, EvidenceWriter
 from .models import (
     CycleRequest,
     DecisionResponse,
@@ -159,17 +158,15 @@ class FixedWindowRateLimiter:
 
 class CycleCoordinator:
     def __init__(self, settings: Settings) -> None:
-        settings.state_dir.mkdir(parents=True, exist_ok=True)
-        settings.knowledge_dir.mkdir(parents=True, exist_ok=True)
-        self.store = Store(settings.database_path)
-        self.knowledge = KnowledgeRegistry(
-            settings.labels_path,
-            settings.floors_path,
-            bundled_labels_path=settings.bundled_data_dir / "block-labels.json",
-            bundled_floors_path=settings.bundled_data_dir / "floor-models.json",
+        # Runtime state is intentionally process-local.  Compatibility paths
+        # are accepted by Settings but never opened, created, or inspected.
+        self.store = Store()
+        self.knowledge = KnowledgeRegistry.from_bundled_read_only(
+            settings.bundled_data_dir / "block-labels.json",
+            settings.bundled_data_dir / "floor-models.json",
         )
-        self.logger = DecisionLogger(settings.log_path)
-        self.evidence = EvidenceWriter(settings.state_dir)
+        self.logger = None
+        self.evidence = None
         self.planner = Planner()
         self._engine_authority_cache: OrderedDict[tuple, Any] = OrderedDict()
 
@@ -223,35 +220,19 @@ class CycleCoordinator:
         action: Optional[Dict[str, Any]] = None,
     ) -> PauseResponse:
         entries = self.knowledge.registry_entries(request.observation)
-        path = self.evidence.write(
-            pause_kind=kind,
-            detail_code=detail_code,
-            reason=reason,
-            observation=request.observation,
-            details=details,
-            action=action,
-        )
         return PauseResponse(
             status="pause",
             pause_kind=kind,
             detail_code=detail_code,
             reason=reason,
             details=details or {},
-            evidence_path=str(path),
             registry_entries=entries,
         )
 
     def _log_response(self, request: CycleRequest, response: Dict[str, Any], event: str = "decision") -> None:
-        self.logger.write(
-            event,
-            request.observation,
-            status=response.get("status"),
-            action_id=response.get("action_id"),
-            supersedes_action_id=response.get("supersedes_action_id"),
-            pause_kind=response.get("pause_kind"),
-            detail_code=response.get("detail_code"),
-            reason=response.get("reason"),
-        )
+        # Diagnostics are returned to the browser on demand; no background
+        # JSONL audit log is written.
+        return None
 
     def _latest_replacement(self, action):
         seen = set()
@@ -299,6 +280,20 @@ class CycleCoordinator:
             expected,
             action_kind=record.response["action_kind"],
         )
+        menu_operations = [item for item in record.response.get("operations", [])
+                           if item.get("type") == "menu_choice"]
+        if validation.matches and menu_operations:
+            operation = menu_operations[0]
+            shop = next((item for item in request.observation.shops
+                         if item.shop_id == operation["shop_id"]), None)
+            choice = None if shop is None else next((item for item in shop.choices
+                if item.choice_id == operation["choice_id"]), None)
+            if choice is None or choice.purchase_count != operation["expected_purchase_count"] + 1:
+                validation = type(validation)(False, [{
+                    "field": "shop.purchase_count",
+                    "expected": operation["expected_purchase_count"] + 1,
+                    "actual": None if choice is None else choice.purchase_count,
+                }], validation.actual)
         if not validation.matches:
             self.store.mark_mismatch(action_id, observation_fp)
             return self._pause(
@@ -311,13 +306,6 @@ class CycleCoordinator:
             )
         self.store.confirm_action_and_transition(
             action_id, observation_fp, pre, request.observation
-        )
-        self.logger.write(
-            "action_completed",
-            request.observation,
-            status="completed",
-            action_id=action_id,
-            reason="浏览器回报的真实状态通过 expected_delta 校验。",
         )
         return None
 
@@ -416,6 +404,52 @@ class CycleCoordinator:
                 self._log_response(request, response, "reconnect_only_unresolved")
                 return with_ack(response)
             if recovery_request is not None and recovery_request.pending_action_id is not None:
+                try:
+                    completed_recovery = classify_recovery(
+                        self.store,
+                        recovery_request,
+                        observation_fp,
+                        request.completed_action_id,
+                    )
+                except LedgerError as exc:
+                    raise ServiceError(exc.code, str(exc)) from exc
+                completed_action = completed_recovery.action
+                if completed_recovery.kind == "completed" and completed_action is not None:
+                    pre = self.store.get_observation(completed_action.pre_fingerprint)
+                    if pre is None:
+                        raise ServiceError(
+                            "LEDGER_CORRUPT", "completed action pre-observation is missing", 500
+                        )
+                    if (
+                        completed_action.status != "completed"
+                        or completed_action.post_fingerprint != observation_fp
+                        or pre.session_id != observation.session_id
+                    ):
+                        paused = self._pause(
+                            request,
+                            kind=PauseKind.EXPECTED_DELTA_MISMATCH,
+                            detail_code="RECOVERY_JOURNAL_LEDGER_MISMATCH",
+                            reason="浏览器 completed pending 身份与服务端已完成行动不一致。",
+                            details={
+                                "journal_action_id": recovery_request.pending_action_id,
+                                "ledger_action_id": completed_action.action_id,
+                                "ledger_pre_fingerprint": completed_action.pre_fingerprint,
+                                "ledger_post_fingerprint": completed_action.post_fingerprint,
+                                "current_fingerprint": observation_fp,
+                            },
+                            action=completed_action.response,
+                        )
+                        response = self._response_payload(paused)
+                        self._log_response(request, response, "reconnect_only_completed_mismatch")
+                        return with_ack(response)
+                    idle = IdleResponse(
+                        status="idle",
+                        reason="localhost 已连接；已核对并确认浏览器 pending 行动完成。",
+                        registry_entries=self.knowledge.registry_entries(observation),
+                    )
+                    response = self._response_payload(idle)
+                    self._log_response(request, response, "reconnect_only_completed_ack")
+                    return with_ack(response)
                 paused = self._pause(
                     request,
                     kind=PauseKind.EXPECTED_DELTA_MISMATCH,
@@ -441,7 +475,7 @@ class CycleCoordinator:
         if unresolved is not None:
             if recovery_request is None or recovery_request.phase == "none":
                 if observation_fp == unresolved.pre_fingerprint:
-                    self._log_response(request, unresolved.response, "unresolved_action_replayed")
+                    self._log_response(request, unresolved.response, "inflight_action_reused")
                     return with_ack(unresolved.response)
                 pause = self._pause(
                     request,
@@ -512,7 +546,7 @@ class CycleCoordinator:
             return with_ack(response)
 
         if recovery.kind == "replay" and recovery.action is not None:
-            self._log_response(request, recovery.action.response, "unresolved_action_replayed")
+            self._log_response(request, recovery.action.response, "inflight_action_reused")
             return with_ack(recovery.action.response)
 
         authority = self._derive_engine_authority(observation)
