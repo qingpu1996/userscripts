@@ -1,0 +1,57 @@
+{
+  "run_id": "2026-07-14-fix-3-docs",
+  "scope": "documentation-only",
+  "issue": "P2-state-dir-persistence-and-recovery-documentation",
+  "real_game_accessed": false,
+  "real_runtime_accessed": false,
+  "real_save_read_or_written": false,
+  "external_network_accessed": false,
+  "localhost_service_started": false,
+  "image_input_used": false,
+  "code_or_protocol_modified": false,
+  "tests_modified_or_run": false,
+  "dist_rebuilt": false,
+  "checks": {
+    "before_gap_reproduced_by_grep_and_manual_review": "pass",
+    "persistent_state_root_documented": "pass",
+    "restart_upgrade_reconnect_same_absolute_path": "pass",
+    "pending_action_migration_and_clear_journal_gate": "pass",
+    "complete_stopped_atomic_migration_and_backup": "pass",
+    "health_ledger_read_only_verification": "pass",
+    "lost_corrupt_wrong_directory_recovery": "pass",
+    "unknown_action_id_manual_recovery": "pass",
+    "knowledge_state_directory_distinction": "pass",
+    "explicit_state_reset_boundary": "pass",
+    "readme_warning_and_document_cross_links": "pass",
+    "implementation_name_and_command_consistency": "pass",
+    "markdown_relative_links_and_fragments": "pass",
+    "json_parse": "pass",
+    "trailing_whitespace": "pass",
+    "git_diff_check": "pass"
+  },
+  "protected_artifacts": {
+    "source_service_tests_protocol_scripts_content_manifest_before": "d01027640915379d3e2ce3d83e2fd82fc7dc3350fd76f3e6b81f5b961cf30cdf",
+    "source_service_tests_protocol_scripts_content_manifest_after": "d01027640915379d3e2ce3d83e2fd82fc7dc3350fd76f3e6b81f5b961cf30cdf",
+    "source_service_tests_protocol_scripts_mtime_manifest_before": "f7ec7700537ef4ee91a069e52dc05e4fef2dec812a0a91d4c2a320d5a3e3144e",
+    "source_service_tests_protocol_scripts_mtime_manifest_after": "f7ec7700537ef4ee91a069e52dc05e4fef2dec812a0a91d4c2a320d5a3e3144e",
+    "dist": {
+      "path": "dist/mota-planning-lab.user.js",
+      "sha256_before": "c0b48cf3394114dd773500ff663b9d7046db77e3d081a138e66cbc76b8cd79ac",
+      "sha256_after": "c0b48cf3394114dd773500ff663b9d7046db77e3d081a138e66cbc76b8cd79ac",
+      "mtime_before": 1783962545,
+      "mtime_after": 1783962545,
+      "bytes_before": 101229,
+      "bytes_after": 101229
+    }
+  },
+  "git": {
+    "branch": "feature/mota-planning-lab/v0.1.0",
+    "head": "eee41c0af3caa1f39e9cc143b681594009bda9a4",
+    "index_clean": true,
+    "preexisting_untracked_project_tree": true
+  },
+  "real_page_qa": {
+    "T73_read_only_baseline": "not-run",
+    "T74_staged_actions": "not-run"
+  }
+}

@@ -1,0 +1,95 @@
+{
+  "suite": "remove-blind-data-boundary-fix8",
+  "status": "pass",
+  "assurance": "controlled-project-source-audit-not-a-javascript-sandbox",
+  "tests": {
+    "javascript": 135,
+    "python": 116,
+    "integration": 1,
+    "total": 252
+  },
+  "red_reproduction": {
+    "command": "node --test games/mota-planning-lab/tests/js/production-integrity-audit.test.js",
+    "tests": 10,
+    "passed": 9,
+    "failed": 1,
+    "named_snippets_returned_empty_failures": 3
+  },
+  "focused_green": {
+    "production_integrity_tests": "10/10",
+    "actual_source_injection": "pass",
+    "full_cycle_integration": "1/1"
+  },
+  "production_audit": {
+    "status_after_restore": "pass",
+    "browser_sources_recursive": 19,
+    "service_sources_recursive": 16,
+    "manifest_sources": 19,
+    "manifest_exact_match": true,
+    "dist_artifacts": 2,
+    "unclassified_engine_apis": 0,
+    "direct_authoritative_mutations": 0
+  },
+  "engine_api_inventory": {
+    "read": [
+      "canMoveDirectly",
+      "getDamage",
+      "getEnemyInfo",
+      "getMapBlocksObj",
+      "isMoving"
+    ],
+    "action": [
+      "moveDirectly",
+      "setAutomaticRoute",
+      "stopAutomaticRoute"
+    ],
+    "forms_tested": [
+      "direct member direct call",
+      "direct member call/apply/bind",
+      "static bracket member",
+      "dynamic bracket member",
+      "member alias direct call",
+      "member alias call/apply/bind",
+      "runtime/core simple alias",
+      "scope.core/globalThis.core",
+      "object destructure"
+    ]
+  },
+  "actual_source_injection": {
+    "actual_adapter_modified_temporarily": true,
+    "both_dist_artifacts_rebuilt_while_injected": true,
+    "full_audit_exit_nonzero": true,
+    "unknown_action_failures": 1,
+    "dynamic_engine_api_failures": 3,
+    "restored_in_finally": true,
+    "both_dist_artifacts_rebuilt_after_restore": true,
+    "restored_artifacts_byte_identical": true
+  },
+  "artifacts": {
+    "userscript_sha256": "c68d80acd0bc648ace9a6f3893d0d9e8a4758910bc589be1aa51d6fd594485f9",
+    "direct_mount_sha256": "fad256fe1f62da57421e0d822c08542204325dbeb474b36f7c7b2faba3f91ef3"
+  },
+  "workspace": {
+    "branch": "codex/mota-planning-lab-runtime-v2",
+    "worktree": "/Users/nihplod/.codex/worktrees/mota-planning-lab-runtime-v2",
+    "head": "9a61f85d72dd6423ed6e53ab54d26c83cdde2e26",
+    "staged": false,
+    "dirty": true,
+    "dirty_reason": "Fix 8 and preceding remove-blind-data-boundary task changes remain intentionally unstaged for main-session acceptance",
+    "tracked_modified_count": 27,
+    "untracked_porcelain_entry_count": 12,
+    "outside_allowed_root": []
+  },
+  "risks": {
+    "syntax_scope": "The inventory supports actual production syntax and explicitly covered nearby aliases; it is not a full JavaScript semantic interpreter.",
+    "dynamic_property": "Every engine-rooted dynamic MemberExpression in the supported AST is rejected at member access and dynamic aliases remain rejected on use.",
+    "planner": "Planner behavior was not changed in Fix 8; full existing suites pass but no real browser strategy run was performed."
+  },
+  "offline_qa": "pass",
+  "real_browser": "not-run",
+  "real_game": "not-run",
+  "real_save": "not-touched",
+  "real_state_or_knowledge": "not-touched",
+  "network_or_guides": "not-used",
+  "port_18724": "not-touched"
+}

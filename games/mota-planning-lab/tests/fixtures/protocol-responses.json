@@ -1,0 +1,97 @@
+{
+  "fixture_metadata": {
+    "kind": "synthetic-protocol-responses",
+    "synthetic": true,
+    "live_capture": false
+  },
+  "execute": {
+    "status": "execute",
+    "action_id": "AUTO-DEADBEEFDEADBEEF",
+    "action_kind": "MOVE_TO_KNOWN_BOUNDARY",
+    "reason": "Synthetic fixture: move to one known boundary.",
+    "operations": [
+      {
+        "type": "grid",
+        "x": 6,
+        "y": 3
+      }
+    ],
+    "guard": {
+      "session_id": "SESSION-SYNTHETIC-0001",
+      "floor_id": "synthetic-floor-4",
+      "floor": null,
+      "map_instance_id": "map:synthetic-floor-4:topology-a",
+      "dimensions": {"width": 11, "height": 11},
+      "topology_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "position": {
+        "x": 8,
+        "y": 3,
+        "direction": "down"
+      },
+      "hp": 208,
+      "attack": 23,
+      "defense": 21,
+      "gold": 16,
+      "experience": 63,
+      "keys": {
+        "yellow": 4,
+        "blue": 1,
+        "red": 0
+      }
+    },
+    "expected_delta": {
+      "hp": 200,
+      "removed_blocks": [
+        {
+          "x": 6,
+          "y": 3,
+          "id": "syntheticRedPotion"
+        }
+      ]
+    }
+  },
+  "pause": {
+    "status": "pause",
+    "pause_kind": "NEW_OBJECT_OR_MECHANISM",
+    "detail_code": "UNKNOWN_BLOCK",
+    "reason": "Synthetic fixture: block label is missing.",
+    "details": {
+      "block": {
+        "x": 9,
+        "y": 9,
+        "numeric_id": 9007,
+        "id": "syntheticUnknownMechanism",
+        "cls": "syntheticMechanism",
+        "trigger": "syntheticTrigger",
+        "damage": null
+      }
+    }
+  },
+  "idle": {
+    "status": "idle",
+    "reason": "Synthetic fixture: no safe candidate is currently needed.",
+    "registry_entries": [
+      {
+        "id": "syntheticWall",
+        "cls": "terrains",
+        "trigger": null,
+        "category": "wall",
+        "passable": false,
+        "boundary": false,
+        "fast_path": false,
+        "version": 1
+      }
+    ]
+  },
+  "recovery_ack": {
+    "status": "idle",
+    "reason": "Synthetic fixture: completed recovery was explicitly acknowledged.",
+    "acknowledged_action_id": "AUTO-DEADBEEFDEADBEEF"
+  },
+  "error": {
+    "status": "error",
+    "error_code": "SCHEMA_REJECTED",
+    "reason": "Synthetic fixture: the request was rejected.",
+    "errors": []
+  }
+}

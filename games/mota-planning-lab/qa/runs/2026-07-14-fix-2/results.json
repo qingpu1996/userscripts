@@ -1,0 +1,51 @@
+{
+  "run_id": "2026-07-14-fix-2",
+  "scope": "fake-core-and-synthetic-only",
+  "real_game_accessed": false,
+  "real_save_read_or_written": false,
+  "external_network_accessed": false,
+  "localhost_integration_used": true,
+  "image_input_used": false,
+  "environment": {
+    "node": "v24.16.0",
+    "python": "3.12.13"
+  },
+  "regression_baseline": {
+    "javascript": {"passed": 21, "failed": 0, "total": 21},
+    "python": {"passed": 30, "failed": 5, "errors": 1, "total": 36}
+  },
+  "targeted_after": {
+    "javascript": {"passed": 21, "failed": 0, "total": 21},
+    "python": {"passed": 38, "failed": 0, "errors": 0, "total": 38}
+  },
+  "tests": {
+    "javascript": {"passed": 56, "failed": 0},
+    "python": {"passed": 55, "failed": 0},
+    "integration": {"passed": 1, "failed": 0},
+    "total": {"passed": 112, "failed": 0}
+  },
+  "checks": {
+    "fixture_and_schema_provenance": "pass",
+    "shared_wire_protocol_models": "pass (Pydantic + JSON Schema; 1 observation + 4 responses)",
+    "required_nullable_wire_matrix": "pass (FastAPI raw JSON + Pydantic + JSON Schema + browser parser)",
+    "python_compileall": "pass",
+    "javascript_syntax": "pass",
+    "userscript_build": "pass",
+    "userscript_syntax": "pass",
+    "static_blind_play_compliance": "pass",
+    "markdown_links": "pass",
+    "json_parse": "pass",
+    "whitespace": "pass",
+    "git_diff_check": "pass"
+  },
+  "artifact": {
+    "path": "dist/mota-planning-lab.user.js",
+    "lines": 2657,
+    "bytes": 101229,
+    "sha256": "c0b48cf3394114dd773500ff663b9d7046db77e3d081a138e66cbc76b8cd79ac"
+  },
+  "real_page_qa": {
+    "T73_read_only_baseline": "not-run",
+    "T74_staged_actions": "not-run"
+  }
+}

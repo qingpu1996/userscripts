@@ -1,0 +1,39 @@
+{
+  "run_id": "2026-07-13-offline",
+  "scope": "fake-core-and-synthetic-only",
+  "real_game_accessed": false,
+  "real_save_read_or_written": false,
+  "image_input_used": false,
+  "environment": {
+    "node": "v24.16.0",
+    "python": "3.12.13",
+    "pytest_executed": false,
+    "pytest_reason": "Not installed locally; no network installation was permitted. unittest-compatible TestCase suite was executed directly."
+  },
+  "tests": {
+    "javascript": {"passed": 49, "failed": 0},
+    "python": {"passed": 44, "failed": 0},
+    "integration": {"passed": 1, "failed": 0},
+    "total": {"passed": 94, "failed": 0}
+  },
+  "checks": {
+    "fixture_and_schema_provenance": "pass",
+    "shared_wire_protocol_models": "pass (1 observation + 3 responses)",
+    "python_compileall": "pass",
+    "javascript_syntax": "pass",
+    "userscript_build": "pass",
+    "userscript_syntax": "pass",
+    "static_blind_play_compliance": "pass",
+    "git_diff_check": "pass"
+  },
+  "artifact": {
+    "path": "dist/mota-planning-lab.user.js",
+    "lines": 2330,
+    "bytes": 88206,
+    "sha256": "26e1db0edd71c856b0679172f7b564ac36266818eafb9271293e8bfe3c7c640c"
+  },
+  "real_page_qa": {
+    "T73_read_only_baseline": "not-run",
+    "T74_staged_actions": "not-run"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "protocol": 1,
+  "run": "2026-07-14-zero-key-omission-recovery",
+  "result": "pass",
+  "tests": {
+    "javascript": {"passed": 105, "failed": 0},
+    "python": {"passed": 97, "failed": 0},
+    "integration": {"passed": 1, "failed": 0},
+    "total": {"passed": 203, "failed": 0}
+  },
+  "checks": {
+    "targeted_red_before_fix": "pass",
+    "canonical_tools_missing_zero_key": "pass",
+    "canonical_tools_empty_and_multi_omission": "pass",
+    "same_container_alias_consistency": "pass",
+    "cross_layout_consistency": "pass",
+    "explicit_invalid_key_values_fail_closed": "pass",
+    "missing_or_invalid_key_container_fail_closed": "pass",
+    "yellow_door_post_delta_recovery": "pass",
+    "reconnect_reload_zero_replay": "pass",
+    "fixture_and_schema_provenance": "pass",
+    "protocol_wire": "pass",
+    "python_compile": "pass",
+    "javascript_syntax": "pass",
+    "userscript_build": "pass",
+    "direct_mount_build": "pass",
+    "deterministic_rebuild": "pass",
+    "static_blind_play": "pass",
+    "docs_and_json": "pass",
+    "git_diff_check": "pass",
+    "isolated_prospective_staged_check": "pass"
+  },
+  "artifacts": {
+    "dist/mota-planning-lab.user.js": "sha256:d572bbd91c19db3f38f2a7b7ab16e90732592a25c716b9123ff62d86aa366462",
+    "dist/mota-planning-lab.direct-mount.js": "sha256:f90b9e9778876721aa89e8d3f7fe8eeae8518ce872042532432e0a11162f88cf"
+  },
+  "real_browser": "not-run-by-fix-agent",
+  "live_state_directories": "not-read-or-written",
+  "stage_commit_push_pr_rebase_squash_merge": "not-run"
+}

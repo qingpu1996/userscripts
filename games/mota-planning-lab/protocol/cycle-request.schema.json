@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/mota-planning-lab/cycle-request.schema.json",
+  "title": "Mota Planning Lab cycle request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["source", "intent", "completed_action_id", "observation", "session"],
+  "properties": {
+    "source": {"const": "mota-planning-lab-userscript"},
+    "intent": {"enum": ["cycle", "reconnect_only"]},
+    "completed_action_id": {
+      "anyOf": [
+        {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"},
+        {"type": "null"}
+      ]
+    },
+    "observation": {"$ref": "observation.schema.json"},
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {"enum": ["new_game", "handoff_expected_guard", "resume_existing_ledger"]},
+        "command": {"enum": ["observe", "confirm"], "default": "observe"},
+        "expected_guard": {"$ref": "cycle-response.schema.json#/$defs/guard"}
+      },
+      "allOf": [
+        {"if": {"properties": {"mode": {"const": "handoff_expected_guard"}}}, "then": {"required": ["expected_guard"]}},
+        {"if": {"properties": {"mode": {"enum": ["new_game", "resume_existing_ledger"]}}}, "then": {"not": {"required": ["expected_guard"]}}}
+      ]
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "pending_action_id", "pre_fingerprint", "current_fingerprint"],
+      "properties": {
+        "phase": {
+          "enum": ["none", "pending", "not_executed", "completed", "mismatch"]
+        },
+        "pending_action_id": {
+          "anyOf": [
+            {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"},
+            {"type": "null"}
+          ]
+        },
+        "pre_fingerprint": {
+          "anyOf": [
+            {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+            {"type": "null"}
+          ]
+        },
+        "current_fingerprint": {
+          "anyOf": [
+            {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+            {"type": "null"}
+          ]
+        },
+        "detail_code": {
+          "anyOf": [
+            {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,95}$"},
+            {"type": "null"}
+          ]
+        }
+      }
+    }
+  }
+}

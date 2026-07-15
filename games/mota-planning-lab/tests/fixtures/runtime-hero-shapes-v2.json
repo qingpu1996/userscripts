@@ -1,0 +1,35 @@
+{
+  "protocol": 2,
+  "cases": [
+    {
+      "name": "h5mota-24-live-tools-layout",
+      "hero": {
+        "hp": 1000,
+        "atk": 10,
+        "def": 10,
+        "money": 0,
+        "exp": 0,
+        "loc": {"x": 6, "y": 10, "direction": "up"},
+        "items": {
+          "tools": {"yellowKey": 1, "blueKey": 1, "redKey": 1}
+        }
+      },
+      "expected_keys": {"yellow": 1, "blue": 1, "red": 1}
+    },
+    {
+      "name": "h5mota-24-canonical-tools-zero-omission",
+      "hero": {
+        "hp": 1000,
+        "atk": 10,
+        "def": 10,
+        "money": 0,
+        "exp": 0,
+        "loc": {"x": 6, "y": 9, "direction": "up"},
+        "items": {
+          "tools": {"blueKey": 1, "redKey": 1}
+        }
+      },
+      "expected_keys": {"yellow": 0, "blue": 1, "red": 1}
+    }
+  ]
+}

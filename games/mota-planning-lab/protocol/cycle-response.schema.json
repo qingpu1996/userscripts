@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/mota-planning-lab/cycle-response.schema.json",
+  "title": "Mota Planning Lab cycle response",
+  "oneOf": [
+    {"$ref": "#/$defs/execute"},
+    {"$ref": "#/$defs/pause"},
+    {"$ref": "#/$defs/idle"},
+    {"$ref": "#/$defs/error"}
+  ],
+  "$defs": {
+    "pauseKind": {
+      "enum": [
+        "NEW_OBJECT_OR_MECHANISM",
+        "UNKNOWN_DAMAGE",
+        "UNKNOWN_FLOOR",
+        "EXPECTED_DELTA_MISMATCH",
+        "GUARD_MISMATCH",
+        "UNSUPPORTED_INTERACTION",
+        "DECISION_SERVICE_UNAVAILABLE",
+        "ENGINE_API_INCOMPATIBLE",
+        "SESSION_CONFIRMATION_REQUIRED",
+        "PLANNING_BUDGET_EXHAUSTED"
+      ]
+    },
+    "position": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y"],
+      "properties": {
+        "x": {"type": "integer", "minimum": 0, "maximum": 255},
+        "y": {"type": "integer", "minimum": 0, "maximum": 255}
+      }
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "direction"],
+      "properties": {
+        "x": {"type": "integer", "minimum": 0, "maximum": 255},
+        "y": {"type": "integer", "minimum": 0, "maximum": 255},
+        "direction": {"enum": ["up", "down", "left", "right"]}
+      }
+    },
+    "keys": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["yellow", "blue", "red"],
+      "properties": {
+        "yellow": {"type": "integer", "minimum": 0},
+        "blue": {"type": "integer", "minimum": 0},
+        "red": {"type": "integer", "minimum": 0}
+      }
+    },
+    "guard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "map_instance_id", "dimensions", "topology_fingerprint", "floor_id", "floor", "position", "hp", "attack", "defense", "gold", "experience", "keys"],
+      "properties": {
+        "session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "map_instance_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "dimensions": {
+          "type": "object", "additionalProperties": false, "required": ["width", "height"],
+          "properties": {"width": {"type": "integer", "minimum": 1, "maximum": 256}, "height": {"type": "integer", "minimum": 1, "maximum": 256}}
+        },
+        "topology_fingerprint": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        "floor_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "floor": {"type": ["integer", "null"]},
+        "position": {"$ref": "#/$defs/location"},
+        "hp": {"type": "integer", "minimum": 0},
+        "attack": {"type": "integer", "minimum": 0},
+        "defense": {"type": "integer", "minimum": 0},
+        "gold": {"type": "integer", "minimum": 0},
+        "experience": {"type": "integer", "minimum": 0},
+        "keys": {"$ref": "#/$defs/keys"}
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "x", "y"],
+      "properties": {
+        "type": {"const": "grid"},
+        "x": {"type": "integer", "minimum": 0, "maximum": 255},
+        "y": {"type": "integer", "minimum": 0, "maximum": 255}
+      }
+    },
+    "blockRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "id"],
+      "properties": {
+        "x": {"type": "integer", "minimum": 0, "maximum": 255},
+        "y": {"type": "integer", "minimum": 0, "maximum": 255},
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "cls": {"type": "string", "minLength": 1, "maxLength": 256},
+        "trigger": {"type": ["string", "null"], "maxLength": 128},
+        "numeric_id": {"type": "integer", "minimum": 0}
+      }
+    },
+    "expectedDelta": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "allOf": [
+        {
+          "if": {"required": ["map_instance_id"]},
+          "then": {
+            "not": {
+              "anyOf": [
+                {"required": ["removed_blocks"]},
+                {"required": ["added_blocks"]}
+              ]
+            }
+          }
+        }
+      ],
+      "properties": {
+        "hp": {"type": "integer"},
+        "attack": {"type": "integer"},
+        "defense": {"type": "integer"},
+        "gold": {"type": "integer"},
+        "experience": {"type": "integer"},
+        "keys": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "yellow": {"type": "integer"},
+            "blue": {"type": "integer"},
+            "red": {"type": "integer"}
+          }
+        },
+        "inventory": {
+          "type": "object",
+          "maxProperties": 4096,
+          "propertyNames": {"type": "string", "minLength": 1, "maxLength": 256},
+          "additionalProperties": {"type": "integer"}
+        },
+        "position": {"$ref": "#/$defs/position"},
+        "floor_id": {
+          "anyOf": [
+            {"type": "string", "minLength": 1, "maxLength": 256},
+            {"type": "null"}
+          ]
+        },
+        "map_instance_id": {
+          "anyOf": [
+            {"type": "string", "minLength": 1, "maxLength": 256},
+            {"type": "null"}
+          ]
+        },
+        "removed_blocks": {"type": "array", "maxItems": 8192, "items": {"$ref": "#/$defs/blockRef"}},
+        "added_blocks": {"type": "array", "maxItems": 8192, "items": {"$ref": "#/$defs/blockRef"}}
+      }
+    },
+    "registryEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "cls", "trigger", "category", "passable", "boundary", "fast_path", "version"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "cls": {"type": "string", "minLength": 1, "maxLength": 256},
+        "trigger": {"type": ["string", "null"], "maxLength": 128},
+        "category": {"enum": ["terrain", "wall", "door", "resource", "enemy", "npc", "mechanism", "stair", "other"]},
+        "passable": {"type": "boolean"},
+        "boundary": {"type": "boolean"},
+        "fast_path": {"type": "boolean"},
+        "version": {"type": "integer", "minimum": 1}
+      }
+    },
+    "registryEntries": {
+      "type": "array",
+      "maxItems": 8192,
+      "items": {"$ref": "#/$defs/registryEntry"}
+    },
+    "scanState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase", "anchor_map_instance_id", "current_map_instance_id",
+        "scanned_map_instance_ids", "pending_transition_count",
+        "traversed_transition_count", "frontier_count", "reason"
+      ],
+      "properties": {
+        "phase": {"enum": ["anchor", "discover", "sweep", "complete", "paused"]},
+        "anchor_map_instance_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "current_map_instance_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "scanned_map_instance_ids": {
+          "type": "array", "maxItems": 65536, "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 256}
+        },
+        "pending_transition_count": {"type": "integer", "minimum": 0},
+        "traversed_transition_count": {"type": "integer", "minimum": 0},
+        "frontier_count": {"type": "integer", "minimum": 0},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 512}
+      }
+    },
+    "execute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "action_id", "action_kind", "reason", "operations", "guard", "expected_delta"],
+      "properties": {
+        "status": {"const": "execute"},
+        "action_id": {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"},
+        "action_kind": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,63}$"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 512},
+        "operations": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"$ref": "#/$defs/operation"}},
+        "guard": {"$ref": "#/$defs/guard"},
+        "expected_delta": {"$ref": "#/$defs/expectedDelta"},
+        "supersedes_action_id": {
+          "anyOf": [
+            {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"},
+            {"type": "null"}
+          ]
+        },
+        "registry_entries": {"$ref": "#/$defs/registryEntries"},
+        "scan_state": {"$ref": "#/$defs/scanState"},
+        "acknowledged_action_id": {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"}
+      }
+    },
+    "pause": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "pause_kind", "detail_code", "reason", "details"],
+      "properties": {
+        "status": {"const": "pause"},
+        "pause_kind": {"$ref": "#/$defs/pauseKind"},
+        "detail_code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,95}$"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 512},
+        "details": {"type": "object"},
+        "evidence_path": {"type": "string"},
+        "registry_entries": {"$ref": "#/$defs/registryEntries"},
+        "scan_state": {"$ref": "#/$defs/scanState"},
+        "acknowledged_action_id": {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"}
+      }
+    },
+    "idle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason"],
+      "properties": {
+        "status": {"const": "idle"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 512},
+        "registry_entries": {"$ref": "#/$defs/registryEntries"},
+        "scan_state": {"$ref": "#/$defs/scanState"},
+        "acknowledged_action_id": {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"}
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "error_code", "reason"],
+      "properties": {
+        "status": {"const": "error"},
+        "error_code": {"type": "string", "minLength": 1, "maxLength": 128},
+        "reason": {"type": "string", "maxLength": 1000},
+        "errors": {"type": "array", "items": {"type": "object"}},
+        "acknowledged_action_id": {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"}
+      }
+    }
+  }
+}

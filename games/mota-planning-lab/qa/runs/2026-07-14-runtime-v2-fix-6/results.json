@@ -1,0 +1,56 @@
+{
+  "run": "2026-07-14-runtime-v2-fix-6",
+  "status": "pass",
+  "delivery_gate": "fresh-read-only-acceptance-required",
+  "tests": {
+    "javascript": {"passed": 88, "failed": 0},
+    "python": {"passed": 90, "failed": 0},
+    "integration": {"passed": 1, "failed": 0},
+    "total": {"passed": 179, "failed": 0}
+  },
+  "validation": {
+    "active_json_fixtures": 7,
+    "protocol_requests": 1,
+    "protocol_observations": 1,
+    "protocol_responses": 5,
+    "browser_files_scanned": 19,
+    "service_files_scanned": 16,
+    "deterministic_build": true,
+    "prospective_staged_diff_check": "isolated-index-and-objects-pass"
+  },
+  "dist": {
+    "mota-planning-lab.user.js": {
+      "sha256": "848bea7a7eeb945e6ec380ed61a17e1a07a47a4467361a901dc564d9472c64fe",
+      "bytes": 166635,
+      "lines": 4114
+    },
+    "mota-planning-lab.direct-mount.js": {
+      "sha256": "6a852506dfc9f4c4b9b06acb66012cd82a36314fdb8ee6e5d82494213370e078",
+      "bytes": 157245,
+      "lines": 4057
+    }
+  },
+  "git": {
+    "branch": "codex/mota-planning-lab-runtime-v2",
+    "head": "fed28f7c6407e81ca65858ce91dda08858d7ad84",
+    "index_before_sha256": "f2e2321282b6086cd29edc4ed4c91c24f79a5fc2d27529ec3431369bb2ed3989",
+    "index_after_sha256": "f2e2321282b6086cd29edc4ed4c91c24f79a5fc2d27529ec3431369bb2ed3989",
+    "raw_index_before_sha256": "2add78eb6b7ee74c43de89114e97b262f6b36b2a8fa2a242e2879fd62c7515a9",
+    "raw_index_after_sha256": "2add78eb6b7ee74c43de89114e97b262f6b36b2a8fa2a242e2879fd62c7515a9",
+    "worktree_status_items": 75,
+    "ignored_generated_caches_present": false,
+    "main_checkout_clean": true,
+    "staged": false,
+    "committed": false,
+    "pushed": false
+  },
+  "not_run": [
+    "real-game-page",
+    "real-save",
+    "real-move-or-transition",
+    "in-app-browser-injection",
+    "screenshot",
+    "ocr",
+    "external-network"
+  ]
+}

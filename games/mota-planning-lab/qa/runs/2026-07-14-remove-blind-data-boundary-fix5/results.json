@@ -1,0 +1,51 @@
+{
+  "date": "2026-07-14",
+  "baseline_head": "9a61f85d72dd6423ed6e53ab54d26c83cdde2e26",
+  "suite": "remove-blind-data-boundary-fix5",
+  "status": "pass",
+  "tests": {
+    "javascript": 124,
+    "python": 116,
+    "integration": 1,
+    "total": 241
+  },
+  "targeted": {
+    "ast_tests": 15,
+    "closure_identity_missed_case_rejected": true,
+    "closure_identity_false_positive_case_legal": true,
+    "same_expression_same_structure_order_nested_and_bound_matrix": "pass",
+    "acceptance_1_through_4_regression_matrix": "pass",
+    "dag_depth_22_median_ms": 0.682,
+    "dag_depth_22_max_ms": 4.084,
+    "dag_depth_40_median_ms": 1.001,
+    "dag_depth_40_max_ms": 1.264,
+    "closure_container_2000_median_ms": 12.797,
+    "closure_container_2000_max_ms": 24.739,
+    "allocation_budget_fail_closed": "pass",
+    "production_cli_integration": "pass"
+  },
+  "checks": {
+    "protocol_pydantic_json_schema": "pass",
+    "python_compileall": "pass",
+    "javascript_syntax": "pass",
+    "userscript_deterministic": "pass",
+    "direct_mount_deterministic": "pass",
+    "runtime_mutation_static": "pass",
+    "docs_and_json": "pass",
+    "git_diff_check": "pass",
+    "isolated_prospective_staged_check": "pass",
+    "qa_readme_fix4_fix5_index": "pass"
+  },
+  "dist": {
+    "userscript_sha256": "c68d80acd0bc648ace9a6f3893d0d9e8a4758910bc589be1aa51d6fd594485f9",
+    "direct_mount_sha256": "fad256fe1f62da57421e0d822c08542204325dbeb474b36f7c7b2faba3f91ef3"
+  },
+  "production_port_18724": "not-connected-not-stopped",
+  "integration_transport": "production-cli-explicit-random-loopback-port",
+  "real_browser": "not-run",
+  "real_game_or_save": "not-read-or-written",
+  "real_state_or_knowledge_directory": "not-read-or-written",
+  "actual_h5mota_project": "not-read",
+  "external_solution_material": "not-used",
+  "version_control_writes": "none"
+}

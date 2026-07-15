@@ -1,0 +1,588 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const {
+  loadRuntime,
+  makeObservation,
+  makeGuard,
+} = require("./helpers/runtime");
+
+const lab = loadRuntime();
+
+function makeAction(observation, operations, expectedDelta = {}) {
+  return {
+    status: "execute",
+    action_id: "AUTO-DEADBEEFDEADBEEF",
+    action_kind: "TEST",
+    operations,
+    guard: makeGuard(observation),
+    expected_delta: expectedDelta,
+    reason: "synthetic test",
+  };
+}
+
+function makeAdapter(onMove = () => {}) {
+  const calls = { can: [], direct: [], route: [], stop: 0 };
+  return {
+    calls,
+    canMoveDirectly(x, y) { calls.can.push({ x, y }); return true; },
+    moveDirectly(x, y) { calls.direct.push({ x, y }); onMove(x, y, "direct"); },
+    setAutomaticRoute(x, y) { calls.route.push({ x, y }); onMove(x, y, "route"); },
+    stopAutomaticRoute() { calls.stop += 1; },
+    readBusy() { return { moving: false, lock_control: false, event_active: false }; },
+  };
+}
+
+function attachEngineModel(observation, suffix = "a") {
+  observation.engine_model = {
+    protocol: 1,
+    catalog_hash: `sha256:${suffix.repeat(64)}`,
+    model_hash: `sha256:${suffix.repeat(64)}`,
+    floors: [{
+      floor_id: observation.floor_id,
+      title: observation.floor_name,
+      width: observation.dimensions.width,
+      height: observation.dimensions.height,
+      topology: observation.topology,
+      map: [],
+      blocks: observation.blocks,
+    }],
+    blocks: [],
+    items: [],
+    enemies: [],
+    inventory: { classes: {}, key_slots: {} },
+  };
+  return observation;
+}
+
+const fastStability = {
+  pollMs: 0,
+  sleep: async () => {},
+  now: (() => { let tick = 0; return () => tick++; })(),
+  timeoutMs: 100,
+};
+
+test("纯空走廊经 canMoveDirectly 证明后使用 moveDirectly", async () => {
+  const before = makeObservation();
+  let current = before;
+  const adapter = makeAdapter((x, y) => {
+    current = makeObservation({ hero: { loc: { x, y } } });
+  });
+  const action = makeAction(before, [{ type: "grid", x: 10, y: 3 }], {
+    position: { x: 10, y: 3 },
+  });
+  const result = await lab.executeAction({
+    action,
+    initialObservation: before,
+    registry: lab.createBlockRegistry(),
+    adapter,
+    observe: () => current,
+    stabilityOptions: fastStability,
+  });
+  assert.deepEqual(adapter.calls.direct, [{ x: 10, y: 3 }]);
+  assert.deepEqual(adapter.calls.route, []);
+  assert.equal(result.observation.hero.loc.x, 10);
+});
+
+test("执行轮询只用 fast snapshot，稳定后只采集一次完整结果", async () => {
+  const before = makeObservation();
+  let current = before;
+  let fastReads = 0;
+  let fullReads = 0;
+  const adapter = makeAdapter((x, y) => {
+    current = makeObservation({ hero: { loc: { x, y } } });
+  });
+  const action = makeAction(before, [{ type: "grid", x: 10, y: 3 }], {
+    position: { x: 10, y: 3 },
+  });
+  const result = await lab.executeAction({
+    action,
+    initialObservation: before,
+    registry: lab.createBlockRegistry(),
+    adapter,
+    observeFast: () => { fastReads += 1; return current; },
+    observe: () => { fullReads += 1; return current; },
+    stabilityOptions: Object.assign({}, fastStability, {
+      now: (() => { let tick = 0; return () => tick++; })(),
+    }),
+  });
+  assert.equal(fastReads, 3);
+  assert.equal(fullReads, 1);
+  assert.equal(result.observation.hero.loc.x, 10);
+});
+
+test("多段纯走廊逐段稳定后执行且不逐格调用", async () => {
+  const before = makeObservation();
+  let current = before;
+  const adapter = makeAdapter((x, y) => {
+    current = makeObservation({ hero: { loc: { x, y } } });
+  });
+  const action = makeAction(before, [
+    { type: "grid", x: 9, y: 3 },
+    { type: "grid", x: 10, y: 3 },
+  ], { position: { x: 10, y: 3 } });
+  await lab.executeAction({
+    action,
+    initialObservation: before,
+    registry: lab.createBlockRegistry(),
+    adapter,
+    observe: () => current,
+    stabilityOptions: Object.assign({}, fastStability, {
+      now: (() => { let tick = 0; return () => tick++; })(),
+    }),
+  });
+  assert.deepEqual(adapter.calls.direct, [{ x: 9, y: 3 }, { x: 10, y: 3 }]);
+});
+
+test("门作为唯一末端边界使用 setAutomaticRoute 并在状态变化后停止", async () => {
+  const door = {
+    x: 9, y: 3, numeric_id: 21, id: "syntheticDoor", cls: "terrains",
+    trigger: "openDoor", no_pass: true, damage: null, enemy: null,
+  };
+  const before = makeObservation({ blocks: [door] });
+  let current = before;
+  const adapter = makeAdapter((x, y, method) => {
+    assert.equal(method, "route");
+    current = makeObservation({
+      hero: { loc: { x, y } },
+      keys: { yellow: 3 },
+      blocks: [],
+    });
+  });
+  const registry = lab.createBlockRegistry([{
+    id: door.id, cls: door.cls, trigger: door.trigger,
+    category: "door", passable: false, boundary: true, fast_path: false, version: 1,
+  }]);
+  const action = makeAction(before, [{ type: "grid", x: 9, y: 3 }], {
+    keys: { yellow: -1 },
+    position: { x: 9, y: 3 },
+    removed_blocks: [{
+      x: door.x,
+      y: door.y,
+      numeric_id: door.numeric_id,
+      id: door.id,
+      cls: door.cls,
+      trigger: door.trigger,
+    }],
+  });
+  const result = await lab.executeAction({
+    action,
+    initialObservation: before,
+    registry,
+    adapter,
+    observe: () => current,
+    stabilityOptions: Object.assign({}, fastStability, {
+      now: (() => { let tick = 0; return () => tick++; })(),
+    }),
+  });
+  assert.deepEqual(adapter.calls.direct, []);
+  assert.deepEqual(adapter.calls.route, [{ x: 9, y: 3 }]);
+  assert.equal(adapter.calls.stop, 1);
+  assert.equal(result.boundary_reached, true);
+});
+
+test("自动寻路经过门前一格的步间空隙时不会提前结算边界", async () => {
+  const door = {
+    x: 10, y: 3, numeric_id: 21, id: "syntheticDoor", cls: "terrains",
+    trigger: "openDoor", no_pass: true, damage: null, enemy: null,
+  };
+  const before = makeObservation({ blocks: [door] });
+  let current = before;
+  const adapter = makeAdapter((x, y, method) => {
+    if (method === "direct") {
+      current = makeObservation({ hero: { loc: { x, y } }, blocks: [door] });
+      return;
+    }
+    // The final boundary cell still uses the normal route API.  Mirrors the
+    // real engine's brief gap before that trigger finishes.
+    current = makeObservation({ hero: { loc: { x: 9, y: 3 } }, blocks: [door], busy: true });
+  });
+  const registry = lab.createBlockRegistry([{
+    id: door.id, cls: door.cls, trigger: door.trigger,
+    category: "door", passable: false, boundary: true, fast_path: false, version: 1,
+  }]);
+  const action = makeAction(before, [{ type: "grid", x: 10, y: 3 }], {
+    keys: { yellow: -1 },
+    position: { x: 10, y: 3 },
+    removed_blocks: [{
+      x: door.x, y: door.y, numeric_id: door.numeric_id,
+      id: door.id, cls: door.cls, trigger: door.trigger,
+    }],
+  });
+  let sleeps = 0;
+  const result = await lab.executeAction({
+    action,
+    initialObservation: before,
+    registry,
+    adapter,
+    observe: () => current,
+    stabilityOptions: {
+      pollMs: 0,
+      timeoutMs: 100,
+      now: (() => { let tick = 0; return () => tick++; })(),
+      sleep: async () => {
+        sleeps += 1;
+        if (current.busy && sleeps >= 2) {
+          current = makeObservation({
+            hero: { loc: { x: 10, y: 3 } },
+            keys: { yellow: 3 },
+            blocks: [],
+            busy: false,
+          });
+        }
+      },
+    },
+  });
+  assert.equal(result.observation.hero.loc.x, 10);
+  assert.equal(result.observation.keys.yellow, 3);
+  assert.deepEqual(result.observation.blocks, []);
+  assert.equal(result.boundary_reached, true);
+  assert.deepEqual(adapter.calls.direct, [{ x: 9, y: 3 }]);
+  assert.deepEqual(adapter.calls.route, [{ x: 10, y: 3 }]);
+});
+
+test("完整观察到 fast snapshot 的 direct 前缀只忽略位置与引擎目录差异", async () => {
+  const door = {
+    x: 10, y: 3, numeric_id: 21, id: "syntheticDoor", cls: "terrains",
+    trigger: "openDoor", no_pass: true, damage: null, enemy: null,
+  };
+  const before = attachEngineModel(makeObservation({ blocks: [door] }));
+  let currentFast = makeObservation({ blocks: [door] });
+  let currentFull = before;
+  const adapter = makeAdapter((x, y, method) => {
+    if (method === "direct") {
+      currentFast = makeObservation({ hero: { loc: { x, y } }, blocks: [door] });
+      return;
+    }
+    currentFast = makeObservation({
+      hero: { loc: { x, y } }, keys: { yellow: 3 }, blocks: [],
+    });
+    currentFull = attachEngineModel(makeObservation({
+      hero: { loc: { x, y } }, keys: { yellow: 3 }, blocks: [],
+    }));
+  });
+  const registry = lab.createBlockRegistry([{
+    id: door.id, cls: door.cls, trigger: door.trigger,
+    category: "door", passable: false, boundary: true, fast_path: false, version: 1,
+  }]);
+  const action = makeAction(before, [{ type: "grid", x: 10, y: 3 }], {
+    keys: { yellow: -1 }, position: { x: 10, y: 3 },
+    removed_blocks: [{ x: 10, y: 3, numeric_id: 21, id: door.id,
+      cls: door.cls, trigger: door.trigger }],
+  });
+  const result = await lab.executeAction({
+    action,
+    initialObservation: before,
+    registry,
+    adapter,
+    observeFast: () => currentFast,
+    observe: () => currentFull,
+    stabilityOptions: Object.assign({}, fastStability, {
+      now: (() => { let tick = 0; return () => tick++; })(),
+    }),
+  });
+  assert.deepEqual(adapter.calls.direct, [{ x: 9, y: 3 }]);
+  assert.deepEqual(adapter.calls.route, [{ x: 10, y: 3 }]);
+  assert.equal(result.boundary_reached, true);
+});
+
+test("runtime-only 非位置投影对 full/fast 对称且保留安全字段", () => {
+  const block = {
+    x: 10, y: 3, numeric_id: 21, id: "syntheticDoor", cls: "terrains",
+    trigger: "openDoor", no_pass: true, damage: null, enemy: null,
+  };
+  const full = attachEngineModel(makeObservation({ blocks: [block] }));
+  const movedFast = makeObservation({ hero: { loc: { x: 9, y: 3 } }, blocks: [block] });
+  assert.equal(lab.runtimeStateChangedBeyondPosition(full, movedFast), false);
+  assert.equal(lab.runtimeStateChangedBeyondPosition(movedFast, full), false);
+
+  const changes = [
+    makeObservation({ hero: { loc: { x: 9, y: 3 }, hp: 207 }, blocks: [block] }),
+    makeObservation({ hero: { loc: { x: 9, y: 3 }, attack: 24 }, blocks: [block] }),
+    makeObservation({ hero: { loc: { x: 9, y: 3 }, defense: 22 }, blocks: [block] }),
+    makeObservation({ hero: { loc: { x: 9, y: 3 }, gold: 17 }, blocks: [block] }),
+    makeObservation({ hero: { loc: { x: 9, y: 3 }, experience: 64 }, blocks: [block] }),
+    makeObservation({ hero: { loc: { x: 9, y: 3 } }, keys: { yellow: 3 }, blocks: [block] }),
+    makeObservation({ hero: { loc: { x: 9, y: 3 } }, floor_id: "other-floor", blocks: [block] }),
+    makeObservation({ hero: { loc: { x: 9, y: 3 } }, map_instance_id: "map:other", blocks: [block] }),
+    makeObservation({ hero: { loc: { x: 9, y: 3 } }, dimensions: { width: 12, height: 11 }, blocks: [block] }),
+    makeObservation({ hero: { loc: { x: 9, y: 3 } }, topology_fingerprint: `sha256:${"c".repeat(64)}`, blocks: [block] }),
+    makeObservation({ hero: { loc: { x: 9, y: 3 } }, blocks: [] }),
+    makeObservation({ hero: { loc: { x: 9, y: 3 } }, blocks: [Object.assign({}, block, { damage: 9 })] }),
+  ];
+  for (const changed of changes) {
+    assert.equal(lab.runtimeStateChangedBeyondPosition(full, changed), true);
+    assert.equal(lab.runtimeStateChangedBeyondPosition(changed, full), true);
+  }
+  const catalogChanged = attachEngineModel(makeObservation({ blocks: [block] }), "b");
+  assert.equal(lab.runtimeStateChangedBeyondPosition(full, catalogChanged), false);
+  assert.equal(lab.stateChangedBeyondPosition(full, catalogChanged), true);
+});
+
+test("direct 前缀期间出现资源或楼层变化会安全暂停且不触发边界", async () => {
+  const door = {
+    x: 10, y: 3, numeric_id: 21, id: "syntheticDoor", cls: "terrains",
+    trigger: "openDoor", no_pass: true, damage: null, enemy: null,
+  };
+  for (const mutation of [
+    { hero: { loc: { x: 9, y: 3 }, hp: 207 }, blocks: [door] },
+    { hero: { loc: { x: 9, y: 3 } }, blocks: [] },
+    { hero: { loc: { x: 9, y: 3 } }, floor_id: "unexpected-floor", blocks: [door] },
+  ]) {
+    const before = attachEngineModel(makeObservation({ blocks: [door] }));
+    let current = makeObservation({ blocks: [door] });
+    const adapter = makeAdapter((x, y, method) => {
+      assert.equal(method, "direct");
+      current = makeObservation(mutation);
+    });
+    const registry = lab.createBlockRegistry([{
+      id: door.id, cls: door.cls, trigger: door.trigger,
+      category: "door", passable: false, boundary: true, fast_path: false, version: 1,
+    }]);
+    await assert.rejects(
+      lab.executeAction({
+        action: makeAction(before, [{ type: "grid", x: 10, y: 3 }], {
+          keys: { yellow: -1 }, removed_blocks: [{ x: 10, y: 3, id: door.id }],
+        }),
+        initialObservation: before,
+        registry,
+        adapter,
+        observeFast: () => current,
+        observe: () => attachEngineModel(current),
+        stabilityOptions: Object.assign({}, fastStability, {
+          now: (() => { let tick = 0; return () => tick++; })(),
+        }),
+      }),
+      (error) => error.detail_code === "FAST_PREFIX_STATE_CHANGED",
+    );
+    assert.deepEqual(adapter.calls.direct, [{ x: 9, y: 3 }]);
+    assert.deepEqual(adapter.calls.route, []);
+    assert.equal(adapter.calls.stop, 1);
+  }
+});
+
+test("长走廊 direct 不可用时安全回退完整 setAutomaticRoute", async () => {
+  const door = {
+    x: 10, y: 3, numeric_id: 21, id: "syntheticDoor", cls: "terrains",
+    trigger: "openDoor", no_pass: true, damage: null, enemy: null,
+  };
+  const before = makeObservation({ blocks: [door] });
+  let current = before;
+  const adapter = makeAdapter((x, y) => {
+    current = makeObservation({ hero: { loc: { x, y } }, keys: { yellow: 3 }, blocks: [] });
+  });
+  adapter.canMoveDirectly = (x, y) => { adapter.calls.can.push({ x, y }); return false; };
+  const registry = lab.createBlockRegistry([{
+    id: door.id, cls: door.cls, trigger: door.trigger,
+    category: "door", passable: false, boundary: true, fast_path: false, version: 1,
+  }]);
+  const action = makeAction(before, [{ type: "grid", x: 10, y: 3 }], {
+    keys: { yellow: -1 }, position: { x: 10, y: 3 },
+    removed_blocks: [{ x: 10, y: 3, id: door.id }],
+  });
+  await lab.executeAction({
+    action, initialObservation: before, registry, adapter, observe: () => current,
+    stabilityOptions: Object.assign({}, fastStability, {
+      now: (() => { let tick = 0; return () => tick++; })(),
+    }),
+  });
+  assert.deepEqual(adapter.calls.direct, []);
+  assert.deepEqual(adapter.calls.route, [{ x: 10, y: 3 }]);
+});
+
+test("非 fast_path 地块即使可通行也不用 moveDirectly", () => {
+  const tile = {
+    x: 9, y: 3, numeric_id: 7, id: "syntheticTile", cls: "terrains",
+    trigger: null, no_pass: false, damage: null, enemy: null,
+  };
+  const observation = makeObservation({ blocks: [tile] });
+  const registry = lab.createBlockRegistry([{
+    id: tile.id, cls: tile.cls, trigger: tile.trigger,
+    category: "terrain", passable: true, boundary: false, fast_path: false,
+  }]);
+  const adapter = makeAdapter();
+  const plan = lab.planOperations(
+    makeAction(observation, [{ type: "grid", x: 9, y: 3 }]),
+    observation,
+    registry,
+    adapter,
+  );
+  assert.equal(plan[0].pure, false);
+});
+
+test("观察到 no_pass 的普通地块不能被空走廊证明穿越", () => {
+  const blocked = {
+    x: 9, y: 3, numeric_id: 7, id: "syntheticBlocked", cls: "terrains",
+    trigger: null, no_pass: true, damage: null, enemy: null,
+  };
+  const observation = makeObservation({ blocks: [blocked] });
+  const registry = lab.createBlockRegistry([{
+    id: blocked.id, cls: blocked.cls, trigger: blocked.trigger,
+    category: "terrain", passable: true, boundary: false, fast_path: true,
+  }]);
+  assert.throws(
+    () => lab.planOperations(
+      makeAction(observation, [{ type: "grid", x: 9, y: 3 }]),
+      observation,
+      registry,
+      makeAdapter(),
+    ),
+    (error) => error.detail_code === "UNSAFE_ROUTE_RESPONSE",
+  );
+});
+
+test("非末段边界和未知 block 的计划在行动 API 前被拒绝", () => {
+  const door = {
+    x: 9, y: 3, numeric_id: 21, id: "syntheticDoor", cls: "terrains",
+    trigger: "openDoor", no_pass: true, damage: null, enemy: null,
+  };
+  const observation = makeObservation({ blocks: [door] });
+  const registry = lab.createBlockRegistry([{
+    id: door.id, cls: door.cls, trigger: door.trigger,
+    category: "door", passable: false, boundary: true, fast_path: false,
+  }]);
+  const adapter = makeAdapter();
+  assert.throws(
+    () => lab.planOperations(makeAction(observation, [
+      { type: "grid", x: 9, y: 3 },
+      { type: "grid", x: 10, y: 3 },
+    ]), observation, registry, adapter),
+    (error) => error.detail_code === "UNSAFE_MULTI_BOUNDARY_RESPONSE",
+  );
+  assert.throws(
+    () => lab.planOperations(makeAction(observation, [
+      { type: "grid", x: 9, y: 3 },
+    ]), observation, lab.createBlockRegistry(), adapter),
+    (error) => error.pause_kind === "NEW_OBJECT_OR_MECHANISM",
+  );
+  assert.equal(adapter.calls.direct.length + adapter.calls.route.length, 0);
+});
+
+test("guard 不符时所有行动 API 调用数为零", async () => {
+  const observation = makeObservation();
+  const action = makeAction(observation, [{ type: "grid", x: 9, y: 3 }]);
+  action.guard.hp += 1;
+  const adapter = makeAdapter();
+  await assert.rejects(
+    lab.executeAction({
+      action,
+      initialObservation: observation,
+      registry: lab.createBlockRegistry(),
+      adapter,
+      observe: () => observation,
+      stabilityOptions: fastStability,
+    }),
+    (error) => error.pause_kind === "GUARD_MISMATCH",
+  );
+  assert.equal(adapter.calls.direct.length + adapter.calls.route.length, 0);
+});
+
+test("pending 落盘后行动 API 前再次读取现场，变化即零执行", async () => {
+  const before = makeObservation();
+  const changed = makeObservation({ hero: { hp: before.hero.hp - 1 } });
+  const adapter = makeAdapter();
+  await assert.rejects(
+    lab.executeAction({
+      action: makeAction(before, [{ type: "grid", x: 10, y: 3 }], {
+        position: { x: 10, y: 3 },
+      }),
+      initialObservation: before,
+      registry: lab.createBlockRegistry(),
+      adapter,
+      observe: () => changed,
+      stabilityOptions: fastStability,
+    }),
+    (error) => error.pause_kind === "GUARD_MISMATCH"
+      && ["PRE_ACTION_GUARD_MISMATCH", "PRE_ACTION_RUNTIME_CHANGED"].includes(error.detail_code),
+  );
+  assert.equal(adapter.calls.direct.length + adapter.calls.route.length, 0);
+});
+
+test("稳定判定要求 fingerprint 改变、非 busy 且连续两次一致", async () => {
+  const before = makeObservation();
+  const changedBusy = makeObservation({ hero: { loc: { x: 9, y: 3 } }, busy: true });
+  const changed = makeObservation({ hero: { loc: { x: 9, y: 3 } }, busy: false });
+  const sequence = [changedBusy, changed, changed];
+  let index = 0;
+  const result = await lab.waitForStability({
+    adapter: { readBusy: () => ({ moving: false, lock_control: false, event_active: false }) },
+    observe: () => sequence[Math.min(index++, sequence.length - 1)],
+    preFingerprint: lab.fingerprintObservation(before),
+    pollMs: 0,
+    stablePolls: 2,
+    timeoutMs: 100,
+    now: (() => { let tick = 0; return () => tick++; })(),
+    sleep: async () => {},
+  });
+  assert.equal(index, 3);
+  assert.equal(result.observation.busy, false);
+});
+
+test("稳定超时按交互态或引擎态归入允许的 pause_kind", async () => {
+  const before = makeObservation();
+  async function timeoutWith(busyState) {
+    return lab.waitForStability({
+      adapter: { readBusy: () => busyState },
+      observe: () => makeObservation({ busy: true }),
+      preFingerprint: lab.fingerprintObservation(before),
+      pollMs: 0,
+      timeoutMs: 2,
+      now: (() => { let tick = 0; return () => tick++; })(),
+      sleep: async () => {},
+    });
+  }
+  await assert.rejects(
+    timeoutWith({ moving: false, lock_control: true, event_active: true }),
+    (error) => error.pause_kind === "UNSUPPORTED_INTERACTION",
+  );
+  await assert.rejects(
+    timeoutWith({ moving: true, lock_control: false, event_active: false }),
+    (error) => error.pause_kind === "ENGINE_API_INCOMPATIBLE",
+  );
+});
+
+test("只有已登记 stair 可用 floor_id=null 执行未知目的换层", async () => {
+  const stair = {
+    x: 9, y: 3, numeric_id: 90, id: "syntheticStair", cls: "terrains",
+    trigger: "changeFloor", no_pass: false, damage: null, enemy: null,
+  };
+  const before = makeObservation({ blocks: [stair] });
+  let current = before;
+  const adapter = makeAdapter((x, y, method) => {
+    assert.equal(method, "route");
+    current = makeObservation({
+      floor_id: "synthetic-floor-new",
+      map_instance_id: "map:synthetic-floor-new:topology-a",
+      floor_name: null,
+      floor_number: null,
+      hero: { loc: { x, y } },
+      blocks: [],
+    });
+  });
+  const registry = lab.createBlockRegistry([{
+    id: stair.id, cls: stair.cls, trigger: stair.trigger,
+    category: "stair", passable: true, boundary: true, fast_path: false,
+  }]);
+  const action = makeAction(before, [{ type: "grid", x: 9, y: 3 }], {
+    floor_id: null,
+    position: { x: 9, y: 3 },
+  });
+  const result = await lab.executeAction({
+    action,
+    initialObservation: before,
+    registry,
+    adapter,
+    observe: () => current,
+    stabilityOptions: {
+      pollMs: 0,
+      timeoutMs: 100,
+      sleep: async () => {},
+      now: (() => { let tick = 0; return () => tick++; })(),
+    },
+  });
+  assert.equal(result.observation.floor_id, "synthetic-floor-new");
+  assert.equal(lab.compareExpectedDelta(before, result.observation, action.expected_delta, {
+    allowPositionChange: true,
+    allowUnknownFloor: true,
+    allowUnknownMapInstance: true,
+  }).ok, true);
+});
