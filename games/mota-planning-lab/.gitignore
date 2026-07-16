@@ -8,4 +8,4 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 service/var/
-qa/runs/local-*/
+rust/stage0-ir/target/

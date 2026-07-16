@@ -1,5 +1,7 @@
 # 安装与运行
 
+> 本页只描述当前 Python + Protocol v2 `/cycle` 实现。目标 Rust `/bootstrap + /step + /run-events` 单步循环与旁路日志尚未实现，不能使用本页命令验证目标架构；目标见 [求解器架构与实施方案](solver-architecture.md)。
+
 ```bash
 cd games/mota-planning-lab/service
 python -m venv .venv
