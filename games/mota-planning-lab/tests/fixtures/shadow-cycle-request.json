@@ -27,7 +27,25 @@
     },
     "keys": {"yellow": 4, "blue": 1, "red": 0},
     "busy": false,
-    "blocks": [],
+    "blocks": [
+      {
+        "x": 9, "y": 3, "numeric_id": 9003, "id": "syntheticEnemy", "cls": "enemy48",
+        "trigger": "battle", "no_pass": true, "damage": 24,
+        "enemy": {"hp": 100, "attack": 30, "defense": 10, "gold": 5, "experience": 4, "special": []}
+      },
+      {
+        "x": 8, "y": 2, "numeric_id": 9002, "id": "syntheticRedDoor", "cls": "animates",
+        "trigger": "openDoor", "no_pass": true, "damage": null, "enemy": null
+      },
+      {
+        "x": 8, "y": 4, "numeric_id": 9004, "id": "syntheticRedPotion", "cls": "items",
+        "trigger": "getItem", "no_pass": false, "damage": null, "enemy": null
+      },
+      {
+        "x": 7, "y": 3, "numeric_id": 9005, "id": "syntheticUpFloor", "cls": "terrains",
+        "trigger": "changeFloor", "no_pass": false, "damage": null, "enemy": null
+      }
+    ],
     "captured_at": 1234567890
   },
   "recovery": {

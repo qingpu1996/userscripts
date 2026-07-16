@@ -136,7 +136,7 @@ async function startRuntime() {
   };
 }
 
-test("Rust Stage1 shadow runtime satisfies the JS wire contract without executable fields", async (t) => {
+test("Rust Stage2B shadow runtime returns current-floor candidates without executable fields", async (t) => {
   const runtime = await startRuntime();
   t.after(() => runtime.stop());
   const fixture = JSON.parse(fs.readFileSync(
@@ -151,8 +151,41 @@ test("Rust Stage1 shadow runtime satisfies the JS wire contract without executab
   assert.equal(response.status, "idle");
   assert.deepEqual(JSON.parse(JSON.stringify(response.shadow)), {
     mode: "read_only",
-    reason: "Stage1 Rust shadow runtime observed the current state; execution remains disabled.",
+    reason: "Stage2B Rust shadow runtime analyzed current-floor boundaries; execution remains disabled.",
     cycle: 1,
+    analysis: {
+      scope: "current_floor_immediate",
+      reachable_cell_count: 1,
+      candidate_limit: 256,
+      total_candidate_count: 4,
+      truncated: false,
+      candidates: [
+        {
+          candidate_id: "synthetic-floor-4:door:8,2:9002:syntheticRedDoor",
+          kind: "door", block_id: "syntheticRedDoor", numeric_id: 9002,
+          x: 8, y: 2, distance: 1, feasibility: "missing_key", hp_loss: 0,
+          key_cost: { yellow: 0, blue: 0, red: 1 },
+        },
+        {
+          candidate_id: "synthetic-floor-4:stair:7,3:9005:syntheticUpFloor",
+          kind: "stair", block_id: "syntheticUpFloor", numeric_id: 9005,
+          x: 7, y: 3, distance: 1, feasibility: "known_feasible", hp_loss: 0,
+          key_cost: { yellow: 0, blue: 0, red: 0 },
+        },
+        {
+          candidate_id: "synthetic-floor-4:enemy:9,3:9003:syntheticEnemy",
+          kind: "enemy", block_id: "syntheticEnemy", numeric_id: 9003,
+          x: 9, y: 3, distance: 1, feasibility: "known_feasible", hp_loss: 24,
+          key_cost: { yellow: 0, blue: 0, red: 0 },
+        },
+        {
+          candidate_id: "synthetic-floor-4:resource:8,4:9004:syntheticRedPotion",
+          kind: "resource", block_id: "syntheticRedPotion", numeric_id: 9004,
+          x: 8, y: 4, distance: 1, feasibility: "known_feasible", hp_loss: 0,
+          key_cost: { yellow: 0, blue: 0, red: 0 },
+        },
+      ],
+    },
     observation: {
       session_id: "SESSION-SYNTHETIC-0001",
       floor_id: "synthetic-floor-4",
@@ -166,7 +199,7 @@ test("Rust Stage1 shadow runtime satisfies the JS wire contract without executab
   assert.equal(client.isConnected(), true);
 });
 
-test("Rust Stage1 runtime accepts the direct-mount CORS preflight and CORS POST", async (t) => {
+test("Rust shadow runtime accepts the direct-mount CORS preflight and CORS POST", async (t) => {
   const runtime = await startRuntime();
   t.after(() => runtime.stop());
   const origin = "https://h5mota.com";
@@ -219,7 +252,7 @@ test("Rust Stage1 runtime accepts the direct-mount CORS preflight and CORS POST"
   assert.match(rejectedMethod.headers.vary, /origin/i);
 });
 
-test("Rust Stage1 runtime rejects invalid actual POSTs before they advance the shadow cycle", async (t) => {
+test("Rust shadow runtime rejects invalid actual POSTs before they advance the shadow cycle", async (t) => {
   const runtime = await startRuntime();
   t.after(() => runtime.stop());
   const fixture = fs.readFileSync(
@@ -281,7 +314,7 @@ test("Rust Stage1 runtime rejects invalid actual POSTs before they advance the s
   assert.equal(JSON.parse(gmCompatible.responseText).shadow.cycle, 2);
 });
 
-test("Rust Stage1 runtime accepts bounded multi-megabyte contract requests and rejects larger bodies", async (t) => {
+test("Rust shadow runtime accepts bounded multi-megabyte contract requests and rejects larger bodies", async (t) => {
   const runtime = await startRuntime();
   t.after(() => runtime.stop());
   const largeRequest = largeContractRequest();

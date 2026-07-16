@@ -152,6 +152,25 @@ test("browser protocol parser accepts fixtures and rejects nested shape drift", 
     reason: "synthetic",
     shadow: { mode: "read_only", reason: "synthetic", cycle: 1, action_id: "AUTO-DEADBEEFDEADBEEF" },
   }));
+  const shadowAnalysis = {
+    status: "idle",
+    reason: "synthetic",
+    shadow: {
+      mode: "read_only", reason: "synthetic", cycle: 1,
+      analysis: {
+        scope: "current_floor_immediate", reachable_cell_count: 1,
+        candidate_limit: 256, total_candidate_count: 1, truncated: false,
+        candidates: [{
+          candidate_id: "F:enemy:1,0:1:slime", kind: "enemy", block_id: "slime",
+          numeric_id: 1, x: 1, y: 0, distance: 1, feasibility: "unknown_cost",
+          hp_loss: null, key_cost: { yellow: 0, blue: 0, red: 0 },
+        }],
+      },
+    },
+  };
+  assert.doesNotThrow(() => lab.validateCycleResponse(shadowAnalysis));
+  shadowAnalysis.shadow.analysis.candidates[0].operation = { type: "grid", x: 1, y: 0 };
+  assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
 });
 
 test("controller requires explicit baseline, start, and stop in the current page instance", async () => {

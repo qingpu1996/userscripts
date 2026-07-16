@@ -2,7 +2,7 @@
 
 本目录保留浏览器侧采集、单步执行和内存契约，以及 Rust Stage 0 spike。旧 Python 决策后端、其数据、测试和历史 QA 记录已移除。
 
-Stage1 已提供可运行的 Rust shadow runtime：它只接收当前 observation，并返回只读 `idle + shadow` 建议。浏览器产物以 `shadowOnly` 启动，即使服务异常返回 `execute` 也会在调用任何游戏动作 API 前暂停；不得用于真实存档自动驾驶。
+Stage2B Rust shadow runtime 只基于单次 observation 分析当前楼层：它返回可达边界中的怪物、三色门、资源和楼梯，以及即时距离、战损/钥匙成本与可行性。响应仍为只读 `idle + shadow`，不选择或执行动作，也不代表全局最优或可通关。
 
 ## 保留内容
 
@@ -11,7 +11,7 @@ Stage1 已提供可运行的 Rust shadow runtime：它只接收当前 observatio
 - `dist/mota-planning-lab.direct-mount.js`：受控直接注入产物。
 - `tests/js/`：浏览器采集、执行、控制器、协议和纯内存契约测试。
 - `rust/stage0-ir/`、`benchmarks/stage0.py` 和 `tests/fixtures/stage0/`：固定的 Stage 0 合成 spike。
-- `rust/shadow-runtime/`：仅绑定 `127.0.0.1` 的 Stage1 只读 Rust runtime；状态仅在进程内存中。
+- `rust/shadow-runtime/`：仅绑定 `127.0.0.1` 的 Stage2B 只读 Rust runtime；浏览器仍强制 `shadowOnly`。
 
 ## 构建与测试
 

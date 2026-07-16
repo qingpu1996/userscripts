@@ -202,6 +202,48 @@
         "mode": {"const": "read_only"},
         "reason": {"type": "string", "minLength": 1, "maxLength": 512},
         "cycle": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "analysis": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scope", "reachable_cell_count", "candidate_limit", "total_candidate_count", "truncated", "candidates"],
+          "properties": {
+            "scope": {"const": "current_floor_immediate"},
+            "reachable_cell_count": {"type": "integer", "minimum": 1, "maximum": 65536},
+            "candidate_limit": {"type": "integer", "minimum": 1, "maximum": 256},
+            "total_candidate_count": {"type": "integer", "minimum": 0, "maximum": 65536},
+            "truncated": {"type": "boolean"},
+            "candidates": {
+              "type": "array",
+              "maxItems": 256,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["candidate_id", "kind", "block_id", "numeric_id", "x", "y", "distance", "feasibility", "hp_loss", "key_cost"],
+                "properties": {
+                  "candidate_id": {"type": "string", "minLength": 1, "maxLength": 768},
+                  "kind": {"enum": ["enemy", "door", "resource", "stair"]},
+                  "block_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                  "numeric_id": {"type": "integer", "minimum": 0},
+                  "x": {"type": "integer", "minimum": 0, "maximum": 255},
+                  "y": {"type": "integer", "minimum": 0, "maximum": 255},
+                  "distance": {"type": "integer", "minimum": 1},
+                  "feasibility": {"enum": ["known_feasible", "known_lethal", "missing_key", "unknown_cost"]},
+                  "hp_loss": {"type": ["integer", "null"], "minimum": 0},
+                  "key_cost": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["yellow", "blue", "red"],
+                    "properties": {
+                      "yellow": {"type": "integer", "minimum": 0, "maximum": 1},
+                      "blue": {"type": "integer", "minimum": 0, "maximum": 1},
+                      "red": {"type": "integer", "minimum": 0, "maximum": 1}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
         "observation": {
           "type": "object",
           "additionalProperties": false,

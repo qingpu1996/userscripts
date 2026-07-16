@@ -14,7 +14,7 @@ Stage 0 的唯一入口：
 games/mota-planning-lab/scripts/run-stage0-bench.sh
 ```
 
-Stage1 还会由 `tests/js/shadow-runtime-contract.test.js` 启动一个临时端口上的 Rust runtime，并用受控合成 observation 走真实 HTTP 请求。该测试使用临时 Cargo target，结束后会清理子进程和临时目录；不访问浏览器或真实游戏。
+Stage2B 由 `tests/js/shadow-runtime-contract.test.js` 启动临时 Rust runtime，并用合成 observation 验证当前楼层候选及 JS/Schema 合同。测试使用临时 Cargo target，结束后清理；不访问浏览器或真实游戏。
 
 该入口校验固定 24/100/600 层 fixture 和小塔 oracle，运行 Python baseline 与 Rust 紧凑 IR，并把结果打印到 stdout。临时结果和 Rust target 在退出时清理；不要把运行产物提交到 `qa/`。
 

@@ -2118,7 +2118,7 @@ MotaLab.validateScanState = function validateScanState(value) {
 };
 
 MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
-  MotaLab.assertProtocolShape(value, ["mode", "reason", "cycle"], ["observation"], "shadow");
+  MotaLab.assertProtocolShape(value, ["mode", "reason", "cycle"], ["observation", "analysis"], "shadow");
   if (value.mode !== "read_only"
     || typeof value.reason !== "string" || value.reason.length < 1 || value.reason.length > 512
     || !MotaLab.isFiniteInteger(value.cycle) || value.cycle < 1
@@ -2129,6 +2129,51 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
     MotaLab.assertProtocolShape(value.observation, ["session_id", "floor_id", "map_instance_id"], [], "shadow.observation");
     for (const field of ["session_id", "floor_id", "map_instance_id"]) {
       MotaLab.validateProtocolString(value.observation[field], `shadow.observation.${field}`, 1, 256);
+    }
+  }
+  if (value.analysis !== undefined) {
+    MotaLab.assertProtocolShape(value.analysis, [
+      "scope", "reachable_cell_count", "candidate_limit", "total_candidate_count", "truncated", "candidates",
+    ], [], "shadow.analysis");
+    if (value.analysis.scope !== "current_floor_immediate"
+      || !MotaLab.isFiniteInteger(value.analysis.reachable_cell_count)
+      || value.analysis.reachable_cell_count < 1
+      || !MotaLab.isFiniteInteger(value.analysis.candidate_limit)
+      || value.analysis.candidate_limit < 1 || value.analysis.candidate_limit > 256
+      || !MotaLab.isFiniteInteger(value.analysis.total_candidate_count)
+      || value.analysis.total_candidate_count < 0
+      || typeof value.analysis.truncated !== "boolean"
+      || !Array.isArray(value.analysis.candidates)
+      || value.analysis.candidates.length > value.analysis.candidate_limit
+      || value.analysis.total_candidate_count < value.analysis.candidates.length
+      || value.analysis.truncated !== (value.analysis.total_candidate_count > value.analysis.candidate_limit)) {
+      throw new TypeError("Invalid shadow analysis");
+    }
+    const candidateIds = new Set();
+    const kinds = new Set(["enemy", "door", "resource", "stair"]);
+    const feasibilities = new Set(["known_feasible", "known_lethal", "missing_key", "unknown_cost"]);
+    for (const candidate of value.analysis.candidates) {
+      MotaLab.assertProtocolShape(candidate, [
+        "candidate_id", "kind", "block_id", "numeric_id", "x", "y", "distance",
+        "feasibility", "hp_loss", "key_cost",
+      ], [], "shadow candidate");
+      MotaLab.validateProtocolString(candidate.candidate_id, "shadow candidate_id", 1, 768);
+      MotaLab.validateProtocolString(candidate.block_id, "shadow candidate block_id", 1, 256);
+      if (candidateIds.has(candidate.candidate_id)) throw new TypeError("Duplicate shadow candidate_id");
+      candidateIds.add(candidate.candidate_id);
+      if (!kinds.has(candidate.kind) || !feasibilities.has(candidate.feasibility)
+        || !MotaLab.isFiniteInteger(candidate.numeric_id) || candidate.numeric_id < 0
+        || !MotaLab.isFiniteInteger(candidate.x) || candidate.x < 0 || candidate.x > 255
+        || !MotaLab.isFiniteInteger(candidate.y) || candidate.y < 0 || candidate.y > 255
+        || !MotaLab.isFiniteInteger(candidate.distance) || candidate.distance < 1
+        || !(candidate.hp_loss === null
+          || (MotaLab.isFiniteInteger(candidate.hp_loss) && candidate.hp_loss >= 0))) {
+        throw new TypeError("Invalid shadow candidate");
+      }
+      const keyCost = MotaLab.validateResponseKeys(candidate.key_cost, "shadow candidate key_cost");
+      if ([keyCost.yellow, keyCost.blue, keyCost.red].some((cost) => cost > 1)) {
+        throw new TypeError("Invalid shadow candidate key_cost");
+      }
     }
   }
   return MotaLab.cloneJsonValue(value);
