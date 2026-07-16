@@ -1,5 +1,9 @@
+MotaLab.getEnginePageScope = function getEnginePageScope() {
+  return typeof unsafeWindow !== "undefined" && unsafeWindow ? unsafeWindow : globalThis;
+};
+
 MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
-  const scope = pageScope || (typeof unsafeWindow !== "undefined" ? unsafeWindow : globalThis);
+  const scope = pageScope || MotaLab.getEnginePageScope();
   const engineModelCache = { invalidated: true };
 
   function currentCore() {
@@ -650,4 +654,10 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
     closeShopMenu,
     physicalSaveLoad,
   });
+};
+
+MotaLab.isEngineRuntimeReady = function isEngineRuntimeReady(pageScope) {
+  const scope = pageScope || MotaLab.getEnginePageScope();
+  return Boolean(scope && scope.core && scope.core.status
+    && typeof scope.core.status === "object");
 };
