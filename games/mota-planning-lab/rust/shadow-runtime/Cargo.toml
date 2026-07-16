@@ -1,0 +1,15 @@
+[package]
+name = "mota-shadow-runtime"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+serde_json = "1.0.145"
+
+[dev-dependencies]
+jsonschema = { version = "0.30.0", default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

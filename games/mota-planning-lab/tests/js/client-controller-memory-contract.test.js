@@ -57,25 +57,27 @@ function makeExecuteResponse(observation, actionId = "AUTO-0123456789ABCDEF") {
   };
 }
 
-function makeController(current, journal, client, adapter = makeControllerAdapter(current)) {
+function makeController(current, journal, client, adapter = makeControllerAdapter(current), options = {}) {
+  const panel = makePanel();
   return {
     adapter,
+    panel,
     controller: lab.createController({
       adapter,
       journal,
       registry: lab.createBlockRegistry(),
       client,
-      panel: makePanel(),
+      panel,
       observe: () => current.value,
       logger: { error() {} },
-    }, {
+    }, Object.assign({
       stabilityOptions: {
         pollMs: 0,
         timeoutMs: 100,
         sleep: async () => {},
         now: (() => { let tick = 0; return () => tick++; })(),
       },
-    }),
+    }, options)),
   };
 }
 
@@ -144,6 +146,11 @@ test("browser protocol parser accepts fixtures and rejects nested shape drift", 
   assert.throws(() => lab.validateCycleResponse(invalid));
   assert.throws(() => lab.validateCycleResponse({
     status: "idle", reason: "synthetic", extra: true,
+  }));
+  assert.throws(() => lab.validateCycleResponse({
+    status: "idle",
+    reason: "synthetic",
+    shadow: { mode: "read_only", reason: "synthetic", cycle: 1, action_id: "AUTO-DEADBEEFDEADBEEF" },
   }));
 });
 
@@ -225,6 +232,117 @@ test("controller guard mismatch reaches no engine action API", async () => {
   assert.equal(result.detail_code, "PRE_ACTION_GUARD_MISMATCH");
   assert.equal(adapter.calls.direct + adapter.calls.route, 0);
   assert.equal(journal.snapshot().pending_action, null);
+});
+
+test("shadowOnly rejects execute without touching any game adapter API", async () => {
+  const current = { value: makeObservation() };
+  const journal = lab.createJournal();
+  establishTestSession(journal, current.value);
+  journal.setAutopilot(true);
+  const { adapter, controller } = makeController(current, journal, {
+    isConnected: () => true,
+    async postCycle() { return makeExecuteResponse(current.value); },
+  }, undefined, { shadowOnly: true });
+
+  const result = await controller.runSingleCycle();
+
+  assert.equal(result.pause_kind, "UNSUPPORTED_INTERACTION");
+  assert.equal(result.detail_code, "SHADOW_EXECUTION_FORBIDDEN");
+  assert.deepEqual(adapter.calls, { direct: 0, route: 0, stop: 0 });
+  assert.equal(controller.getState(), "PAUSED");
+  assert.equal(journal.snapshot().autopilot_enabled, false);
+  assert.equal(journal.snapshot().pending_action, null);
+});
+
+test("shadowOnly rejects execute before an unexpected ACK can touch an adapter", async () => {
+  const current = { value: makeObservation() };
+  const journal = lab.createJournal();
+  establishTestSession(journal, current.value);
+  journal.setAutopilot(true);
+  const response = makeExecuteResponse(current.value);
+  response.acknowledged_action_id = "AUTO-AAAAAAAAAAAAAAAA";
+  const { adapter, controller } = makeController(current, journal, {
+    isConnected: () => true,
+    async postCycle() { return response; },
+  }, undefined, { shadowOnly: true });
+
+  const result = await controller.runSingleCycle();
+
+  assert.equal(result.pause_kind, "UNSUPPORTED_INTERACTION");
+  assert.equal(result.detail_code, "SHADOW_EXECUTION_FORBIDDEN");
+  assert.deepEqual(adapter.calls, { direct: 0, route: 0, stop: 0 });
+  assert.equal(controller.getState(), "PAUSED");
+  assert.equal(journal.snapshot().autopilot_enabled, false);
+  assert.equal(journal.snapshot().pending_action, null);
+});
+
+test("shadowOnly rejects execute before a missing completed-action ACK can touch an adapter", async () => {
+  const current = { value: makeObservation() };
+  const journal = lab.createJournal();
+  establishTestSession(journal, current.value);
+  journal.setAutopilot(true);
+  journal.markCompleted({
+    action_id: "AUTO-AAAAAAAAAAAAAAAA",
+    fingerprint: "sha256:synthetic-completed-action",
+  });
+  const { adapter, controller } = makeController(current, journal, {
+    isConnected: () => true,
+    async postCycle(request) {
+      assert.equal(request.completed_action_id, "AUTO-AAAAAAAAAAAAAAAA");
+      return makeExecuteResponse(current.value);
+    },
+  }, undefined, { shadowOnly: true });
+
+  const result = await controller.runSingleCycle();
+
+  assert.equal(result.pause_kind, "UNSUPPORTED_INTERACTION");
+  assert.equal(result.detail_code, "SHADOW_EXECUTION_FORBIDDEN");
+  assert.deepEqual(adapter.calls, { direct: 0, route: 0, stop: 0 });
+  assert.equal(controller.getState(), "PAUSED");
+  assert.equal(journal.snapshot().autopilot_enabled, false);
+  assert.equal(journal.snapshot().pending_action, null);
+});
+
+test("shadowOnly reconnect rejects execute without touching any game adapter API", async () => {
+  const current = { value: makeObservation() };
+  const journal = lab.createJournal();
+  establishTestSession(journal, current.value);
+  const { adapter, controller } = makeController(current, journal, {
+    isConnected: () => true,
+    async postCycle() { return makeExecuteResponse(current.value); },
+  }, undefined, { shadowOnly: true });
+
+  const result = await controller.reconnectOnly();
+
+  assert.equal(result.pause_kind, "UNSUPPORTED_INTERACTION");
+  assert.equal(result.detail_code, "SHADOW_EXECUTION_FORBIDDEN");
+  assert.deepEqual(adapter.calls, { direct: 0, route: 0, stop: 0 });
+  assert.equal(controller.getState(), "PAUSED");
+  assert.equal(journal.snapshot().autopilot_enabled, false);
+  assert.equal(journal.snapshot().pending_action, null);
+});
+
+test("shadow advice is shown as the controller's visible reason", async () => {
+  const current = { value: makeObservation() };
+  const journal = lab.createJournal();
+  establishTestSession(journal, current.value);
+  journal.setAutopilot(true);
+  const shadowReason = "synthetic Rust observation only";
+  const { controller, panel } = makeController(current, journal, {
+    isConnected: () => true,
+    async postCycle() {
+      return {
+        status: "idle",
+        reason: shadowReason,
+        shadow: { mode: "read_only", reason: shadowReason, cycle: 1 },
+      };
+    },
+  }, undefined, { shadowOnly: true });
+
+  const result = await controller.runSingleCycle();
+
+  assert.equal(result.idle, true);
+  assert.equal(panel.states.at(-1).reason, `Shadow（只读）：${shadowReason}`);
 });
 
 test("completed delta is reported, ACKed, and followed by at most one new action", async () => {

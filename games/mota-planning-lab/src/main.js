@@ -34,7 +34,7 @@ MotaLab.main = async function main() {
   const client = MotaLab.createLocalhostClient(environment.request);
   const controller = MotaLab.createController(
     { adapter, journal, registry, client, panel },
-    { autoSchedule: true },
+    { autoSchedule: true, shadowOnly: true },
   );
   const exportCurrent = () => {
     const observation = controller.getCurrentObservation();

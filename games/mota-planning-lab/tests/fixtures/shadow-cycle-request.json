@@ -1,0 +1,40 @@
+{
+  "source": "mota-planning-lab-userscript",
+  "intent": "cycle",
+  "completed_action_id": null,
+  "session": {
+    "mode": "new_game",
+    "command": "observe"
+  },
+  "observation": {
+    "protocol": 2,
+    "page": "/games/24/",
+    "session_id": "SESSION-SYNTHETIC-0001",
+    "floor_id": "synthetic-floor-4",
+    "floor_name": "4F",
+    "floor_number": 4,
+    "dimensions": {"width": 11, "height": 11},
+    "topology": {"kind": "rectangle", "source": "engine_current_map", "confidence": "confirmed"},
+    "topology_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "map_instance_id": "map:synthetic-floor-4:topology-a",
+    "hero": {
+      "hp": 208,
+      "attack": 23,
+      "defense": 21,
+      "gold": 16,
+      "experience": 63,
+      "loc": {"x": 8, "y": 3, "direction": "down"}
+    },
+    "keys": {"yellow": 4, "blue": 1, "red": 0},
+    "busy": false,
+    "blocks": [],
+    "captured_at": 1234567890
+  },
+  "recovery": {
+    "phase": "none",
+    "pending_action_id": null,
+    "pre_fingerprint": null,
+    "current_fingerprint": null,
+    "detail_code": null
+  }
+}

@@ -339,6 +339,23 @@ MotaLab.validateScanState = function validateScanState(value) {
   return MotaLab.cloneJsonValue(value);
 };
 
+MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
+  MotaLab.assertProtocolShape(value, ["mode", "reason", "cycle"], ["observation"], "shadow");
+  if (value.mode !== "read_only"
+    || typeof value.reason !== "string" || value.reason.length < 1 || value.reason.length > 512
+    || !MotaLab.isFiniteInteger(value.cycle) || value.cycle < 1
+    || value.cycle > Number.MAX_SAFE_INTEGER) {
+    throw new TypeError("Invalid shadow advice");
+  }
+  if (value.observation !== undefined) {
+    MotaLab.assertProtocolShape(value.observation, ["session_id", "floor_id", "map_instance_id"], [], "shadow.observation");
+    for (const field of ["session_id", "floor_id", "map_instance_id"]) {
+      MotaLab.validateProtocolString(value.observation[field], `shadow.observation.${field}`, 1, 256);
+    }
+  }
+  return MotaLab.cloneJsonValue(value);
+};
+
 MotaLab.validateCycleResponse = function validateCycleResponse(value) {
   if (!MotaLab.isProtocolObject(value)) {
     throw new TypeError("Response must be an object");
@@ -377,7 +394,7 @@ MotaLab.validateCycleResponse = function validateCycleResponse(value) {
   }
   if (value.status === "idle") {
     MotaLab.assertProtocolShape(value, ["status", "reason"],
-      ["registry_entries", "scan_state", "acknowledged_action_id"], "idle response");
+      ["registry_entries", "scan_state", "acknowledged_action_id", "shadow"], "idle response");
     if (typeof value.reason !== "string" || value.reason.length < 1 || value.reason.length > 512) {
       throw new TypeError("Invalid idle response");
     }
@@ -386,6 +403,7 @@ MotaLab.validateCycleResponse = function validateCycleResponse(value) {
       reason: value.reason,
       registry_entries: MotaLab.validateRegistryEntries(value.registry_entries),
       scan_state: MotaLab.validateScanState(value.scan_state),
+      shadow: value.shadow === undefined ? undefined : MotaLab.validateShadowAdvice(value.shadow),
     }, acknowledgment());
   }
   if (value.status === "error") {

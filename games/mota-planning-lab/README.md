@@ -2,7 +2,7 @@
 
 本目录保留浏览器侧采集、单步执行和内存契约，以及 Rust Stage 0 spike。旧 Python 决策后端、其数据、测试和历史 QA 记录已移除。
 
-当前没有可运行的 solver runtime。两个浏览器产物保留为后续接入 Rust shadow runtime 的前端基础；在 shadow runtime 实现并单独验收前，禁止用于真实存档自动驾驶。
+Stage1 已提供可运行的 Rust shadow runtime：它只接收当前 observation，并返回只读 `idle + shadow` 建议。浏览器产物以 `shadowOnly` 启动，即使服务异常返回 `execute` 也会在调用任何游戏动作 API 前暂停；不得用于真实存档自动驾驶。
 
 ## 保留内容
 
@@ -11,6 +11,7 @@
 - `dist/mota-planning-lab.direct-mount.js`：受控直接注入产物。
 - `tests/js/`：浏览器采集、执行、控制器、协议和纯内存契约测试。
 - `rust/stage0-ir/`、`benchmarks/stage0.py` 和 `tests/fixtures/stage0/`：固定的 Stage 0 合成 spike。
+- `rust/shadow-runtime/`：仅绑定 `127.0.0.1` 的 Stage1 只读 Rust runtime；状态仅在进程内存中。
 
 ## 构建与测试
 
@@ -18,7 +19,10 @@
 node scripts/build-userscript.js mota-planning-lab
 node games/mota-planning-lab/scripts/build-direct-mount.mjs
 node --test games/mota-planning-lab/tests/js/*.test.js
+cargo run --manifest-path games/mota-planning-lab/rust/shadow-runtime/Cargo.toml -- --port 18724
 ```
+
+Rust runtime 的业务入口仅为 `POST /cycle`；为 direct-mount 的 `https://h5mota.com` 请求提供严格的 `OPTIONS /cycle` CORS 预检。请求体上限为 9 MiB：前端公开的 engine model 上限为 8 MiB，额外保留 1 MiB 给 cycle envelope，仍拒绝无界读取。没有日志、数据库、恢复或动作持久化。合同测试会使用合成 observation 启动临时 runtime 并自动清理。
 
 Stage 0 使用唯一入口，所有输出与 Rust target 都在临时目录中，退出时清理：
 

@@ -194,6 +194,26 @@
         "reason": {"type": "string", "minLength": 1, "maxLength": 512}
       }
     },
+    "shadow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "reason", "cycle"],
+      "properties": {
+        "mode": {"const": "read_only"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 512},
+        "cycle": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "observation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["session_id", "floor_id", "map_instance_id"],
+          "properties": {
+            "session_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "floor_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "map_instance_id": {"type": "string", "minLength": 1, "maxLength": 256}
+          }
+        }
+      }
+    },
     "execute": {
       "type": "object",
       "additionalProperties": false,
@@ -242,6 +262,7 @@
         "reason": {"type": "string", "minLength": 1, "maxLength": 512},
         "registry_entries": {"$ref": "#/$defs/registryEntries"},
         "scan_state": {"$ref": "#/$defs/scanState"},
+        "shadow": {"$ref": "#/$defs/shadow"},
         "acknowledged_action_id": {"type": "string", "pattern": "^AUTO-[A-F0-9]{16}$"}
       }
     },

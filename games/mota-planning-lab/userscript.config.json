@@ -5,7 +5,7 @@
     "name": "魔塔规划实验室运行态代理",
     "namespace": "local.mota-planning-lab.userscripts",
     "version": "0.2.0",
-    "description": "读取游戏权威数据进行本地规划，并通过正常引擎接口执行的 H5 魔塔代理。",
+    "description": "读取游戏权威数据并向本地 Rust shadow runtime 发送只读建议请求；Stage1 不执行游戏动作。",
     "match": [
       "https://h5mota.com/games/24/*"
     ],

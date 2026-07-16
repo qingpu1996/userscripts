@@ -2107,6 +2107,23 @@ MotaLab.validateScanState = function validateScanState(value) {
   return MotaLab.cloneJsonValue(value);
 };
 
+MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
+  MotaLab.assertProtocolShape(value, ["mode", "reason", "cycle"], ["observation"], "shadow");
+  if (value.mode !== "read_only"
+    || typeof value.reason !== "string" || value.reason.length < 1 || value.reason.length > 512
+    || !MotaLab.isFiniteInteger(value.cycle) || value.cycle < 1
+    || value.cycle > Number.MAX_SAFE_INTEGER) {
+    throw new TypeError("Invalid shadow advice");
+  }
+  if (value.observation !== undefined) {
+    MotaLab.assertProtocolShape(value.observation, ["session_id", "floor_id", "map_instance_id"], [], "shadow.observation");
+    for (const field of ["session_id", "floor_id", "map_instance_id"]) {
+      MotaLab.validateProtocolString(value.observation[field], `shadow.observation.${field}`, 1, 256);
+    }
+  }
+  return MotaLab.cloneJsonValue(value);
+};
+
 MotaLab.validateCycleResponse = function validateCycleResponse(value) {
   if (!MotaLab.isProtocolObject(value)) {
     throw new TypeError("Response must be an object");
@@ -2145,7 +2162,7 @@ MotaLab.validateCycleResponse = function validateCycleResponse(value) {
   }
   if (value.status === "idle") {
     MotaLab.assertProtocolShape(value, ["status", "reason"],
-      ["registry_entries", "scan_state", "acknowledged_action_id"], "idle response");
+      ["registry_entries", "scan_state", "acknowledged_action_id", "shadow"], "idle response");
     if (typeof value.reason !== "string" || value.reason.length < 1 || value.reason.length > 512) {
       throw new TypeError("Invalid idle response");
     }
@@ -2154,6 +2171,7 @@ MotaLab.validateCycleResponse = function validateCycleResponse(value) {
       reason: value.reason,
       registry_entries: MotaLab.validateRegistryEntries(value.registry_entries),
       scan_state: MotaLab.validateScanState(value.scan_state),
+      shadow: value.shadow === undefined ? undefined : MotaLab.validateShadowAdvice(value.shadow),
     }, acknowledgment());
   }
   if (value.status === "error") {
@@ -3692,6 +3710,7 @@ MotaLab.createController = function createController(dependencies, options = {})
   const observeFast = () => attachSession(observeFastRaw());
   const logger = dependencies.logger || console;
   const autoSchedule = options.autoSchedule === true;
+  const shadowOnly = options.shadowOnly === true;
   const cycleDelayMs = MotaLab.isFiniteInteger(options.cycleDelayMs) ? options.cycleDelayMs : 300;
   const idleMaxDelayMs = MotaLab.isFiniteInteger(options.idleMaxDelayMs)
     ? Math.max(cycleDelayMs, options.idleMaxDelayMs) : 5000;
@@ -3759,8 +3778,16 @@ MotaLab.createController = function createController(dependencies, options = {})
     }
   }
 
-  function pause(pauseKind, detailCode, details = {}, observation = currentObservation) {
-    try { adapter.stopAutomaticRoute(); } catch (_) { /* best-effort stop while the runtime is unavailable */ }
+  function pause(
+    pauseKind,
+    detailCode,
+    details = {},
+    observation = currentObservation,
+    pauseOptions = {},
+  ) {
+    if (!pauseOptions.skipAdapterStop) {
+      try { adapter.stopAutomaticRoute(); } catch (_) { /* best-effort stop while the runtime is unavailable */ }
+    }
     const evidenceBlocks = [];
     if (details.block) evidenceBlocks.push(details.block);
     if (Array.isArray(details.blocks)) evidenceBlocks.push(...details.blocks);
@@ -4176,6 +4203,19 @@ MotaLab.createController = function createController(dependencies, options = {})
         observation,
       );
     }
+    if (shadowOnly && response.status === "execute") {
+      return pause(
+        "UNSUPPORTED_INTERACTION",
+        "SHADOW_EXECUTION_FORBIDDEN",
+        {
+          response_status: response.status,
+          action_id: response.action_id,
+          reason: "Stage1 shadowOnly explicitly rejects executable service responses.",
+        },
+        observation,
+        { skipAdapterStop: true },
+      );
+    }
     if (completedActionId) {
       if (response.acknowledged_action_id !== completedActionId) {
         return pause(
@@ -4214,7 +4254,8 @@ MotaLab.createController = function createController(dependencies, options = {})
 
     if (response.status === "idle") {
       state = "OBSERVING";
-      lastReason = response.reason;
+      lastReason = response.shadow
+        ? `Shadow（只读）：${response.shadow.reason}` : response.reason;
       refreshPanel({ connected: true });
       if (journal.snapshot().pending_action || completedActionId) {
         resetIdleBackoff();
@@ -4529,7 +4570,8 @@ MotaLab.createController = function createController(dependencies, options = {})
       const response = await client.postCycle(request);
       if (response.status === "execute") {
         const record = pause(
-          "DECISION_SERVICE_UNAVAILABLE", "RECONNECT_UNEXPECTED_EXECUTE",
+          shadowOnly ? "UNSUPPORTED_INTERACTION" : "DECISION_SERVICE_UNAVAILABLE",
+          shadowOnly ? "SHADOW_EXECUTION_FORBIDDEN" : "RECONNECT_UNEXPECTED_EXECUTE",
           {
             response_status: response.status,
             action_id: response.action_id,
@@ -4537,6 +4579,7 @@ MotaLab.createController = function createController(dependencies, options = {})
             guard: MotaLab.cloneJsonValue(response.guard),
           },
           observation,
+          shadowOnly ? { skipAdapterStop: true } : {},
         );
         return Object.assign(record, {
           connected: false, response_status: "execute", executed: false,
@@ -4672,7 +4715,7 @@ MotaLab.main = async function main() {
   const client = MotaLab.createLocalhostClient(environment.request);
   const controller = MotaLab.createController(
     { adapter, journal, registry, client, panel },
-    { autoSchedule: true },
+    { autoSchedule: true, shadowOnly: true },
   );
   const exportCurrent = () => {
     const observation = controller.getCurrentObservation();
