@@ -3,9 +3,7 @@
 !docs/**
 
 .venv/
-service/.venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-service/var/
 rust/stage0-ir/target/

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Run the ordinary Stage 0 spike in a disposable temporary directory.
+# Run the Stage 0 spike in a disposable temporary directory.
 set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_DIR=$(dirname "$SCRIPT_DIR")
 FIXTURE_DIR="$PROJECT_DIR/tests/fixtures/stage0"
-PYTHON_BIN=${MOTA_LAB_PYTHON:-python3}
+PYTHON_BIN=${PYTHON_BIN:-python3}
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mota-stage0.XXXXXX")
 export CARGO_TARGET_DIR="$TMP_DIR/cargo-target"
 export PYTHONDONTWRITEBYTECODE=1
