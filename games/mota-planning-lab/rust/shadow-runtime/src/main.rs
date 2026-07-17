@@ -660,6 +660,33 @@ struct SolverState {
     flags: Vec<(String, u64)>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct StructuralKey {
+    floor: String,
+    x: u64,
+    y: u64,
+    inventory: Vec<(String, u64)>,
+    consumed: Vec<bool>,
+    shop_counts: Vec<u64>,
+    level: u64,
+    flags: Vec<(String, u64)>,
+}
+
+impl From<&SolverState> for StructuralKey {
+    fn from(state: &SolverState) -> Self {
+        Self {
+            floor: state.floor.clone(),
+            x: state.x,
+            y: state.y,
+            inventory: state.inventory.clone(),
+            consumed: state.consumed.clone(),
+            shop_counts: state.shop_counts.clone(),
+            level: state.level,
+            flags: state.flags.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct F64Bits(u64);
 
@@ -1375,7 +1402,7 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
     }]);
     let mut route_arena = Vec::new();
     let mut seen = HashSet::new();
-    let mut dominance: HashMap<String, Vec<[f64; 8]>> = HashMap::new();
+    let mut dominance: HashMap<StructuralKey, Vec<[f64; 8]>> = HashMap::new();
     let mut explored = 0usize;
     let mut best: Option<TerminalRoute> = None;
     let mut budget_exhausted = false;
@@ -1387,9 +1414,7 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         if !seen.insert(node.state.clone()) {
             continue;
         }
-        let structural=json!({"floor":node.state.floor,"x":node.state.x,"y":node.state.y,
-            "inventory":node.state.inventory,"consumed":node.state.consumed,"shops":node.state.shop_counts,
-            "level":node.state.level,"flags":node.state.flags}).to_string();
+        let structural = StructuralKey::from(&node.state);
         let resources = [
             node.state.hp.get(),
             node.state.attack.get(),
@@ -1969,6 +1994,61 @@ mod tests {
                     "block_id":"redGem","details":blocks[1].data["delta"]}),
             ]
         );
+    }
+
+    #[test]
+    fn typed_structural_key_matches_legacy_json_fields_and_distinguishes_each_field() {
+        let mut state = terminal_node(10, 11, 100, "x").state;
+        state.floor = "F1".into();
+        state.x = 2;
+        state.y = 3;
+        state.inventory = vec![("book".into(), 1)];
+        state.consumed = vec![false, true];
+        state.shop_counts = vec![2];
+        state.level = 4;
+        state.flags = vec![("quest".into(), 1)];
+        let key = StructuralKey::from(&state);
+        let legacy = json!({"floor":state.floor,"x":state.x,"y":state.y,
+            "inventory":state.inventory,"consumed":state.consumed,"shops":state.shop_counts,
+            "level":state.level,"flags":state.flags});
+        assert_eq!(legacy.as_object().unwrap().len(), 8);
+        assert_eq!(legacy["floor"], key.floor);
+        assert_eq!(legacy["x"], key.x);
+        assert_eq!(legacy["y"], key.y);
+        assert_eq!(legacy["inventory"], json!(key.inventory));
+        assert_eq!(legacy["consumed"], json!(key.consumed));
+        assert_eq!(legacy["shops"], json!(key.shop_counts));
+        assert_eq!(legacy["level"], key.level);
+        assert_eq!(legacy["flags"], json!(key.flags));
+
+        let mut variants = Vec::new();
+        let mut changed = state.clone();
+        changed.floor = "F2".into();
+        variants.push(changed);
+        let mut changed = state.clone();
+        changed.x += 1;
+        variants.push(changed);
+        let mut changed = state.clone();
+        changed.y += 1;
+        variants.push(changed);
+        let mut changed = state.clone();
+        changed.inventory.push(("cross".into(), 1));
+        variants.push(changed);
+        let mut changed = state.clone();
+        changed.consumed[0] = true;
+        variants.push(changed);
+        let mut changed = state.clone();
+        changed.shop_counts[0] += 1;
+        variants.push(changed);
+        let mut changed = state.clone();
+        changed.level += 1;
+        variants.push(changed);
+        let mut changed = state.clone();
+        changed.flags[0].1 += 1;
+        variants.push(changed);
+        for changed in variants {
+            assert_ne!(StructuralKey::from(&changed), key);
+        }
     }
 
     #[test]
