@@ -22,6 +22,8 @@ const ALLOWED_REQUEST_HEADERS: [&str; 2] = ["content-type", "x-mota-lab"];
 #[cfg(test)]
 thread_local! {
     static PHASE2_CALLS: Cell<usize> = const { Cell::new(0) };
+    static PHASE_A_DROPPED: Cell<bool> = const { Cell::new(false) };
+    static PHASE2_SAW_PHASE_A_DROPPED: Cell<bool> = const { Cell::new(false) };
 }
 
 #[derive(Default)]
@@ -885,21 +887,254 @@ impl NumericObjective {
     }
 }
 
-fn route_action_json(action: &RouteAction, blocks: &[SolverBlock]) -> Value {
+#[derive(Clone)]
+enum RouteStepSemantic {
+    Door {
+        floor_id: String,
+        x: u64,
+        y: u64,
+        block_id: String,
+        yellow: u64,
+        blue: u64,
+        red: u64,
+    },
+    Resource {
+        floor_id: String,
+        x: u64,
+        y: u64,
+        block_id: String,
+        delta: Value,
+    },
+    Enemy {
+        floor_id: String,
+        x: u64,
+        y: u64,
+        block_id: String,
+        hp_loss: F64Bits,
+    },
+    Transition {
+        floor_id: String,
+        x: u64,
+        y: u64,
+        block_id: String,
+    },
+    Event {
+        floor_id: String,
+        x: u64,
+        y: u64,
+        block_id: String,
+        event_id: String,
+    },
+    Shop {
+        floor_id: String,
+        shop_id: String,
+        choice_id: String,
+        currency: String,
+        cost: u64,
+        purchase_count_before: u64,
+        effects: Vec<ShopRouteEffect>,
+    },
+    Terminal {
+        floor_id: String,
+        x: u64,
+        y: u64,
+    },
+}
+
+impl RouteStepSemantic {
+    // This is the protocol's stable route-step encoding. Object keys are later
+    // sorted explicitly by `canonical_json_bytes`, rather than relying on the
+    // insertion order of a serde_json map.
+    fn json_value(&self) -> Value {
+        match self {
+            Self::Door {
+                floor_id,
+                x,
+                y,
+                block_id,
+                yellow,
+                blue,
+                red,
+            } => json!({"step_kind":"door","floor_id":floor_id,"x":x,"y":y,
+                "block_id":block_id,"details":{"key_cost":{"yellow":yellow,"blue":blue,"red":red}}}),
+            Self::Resource {
+                floor_id,
+                x,
+                y,
+                block_id,
+                delta,
+            } => json!({"step_kind":"resource","floor_id":floor_id,"x":x,"y":y,
+                "block_id":block_id,"details":delta}),
+            Self::Enemy {
+                floor_id,
+                x,
+                y,
+                block_id,
+                hp_loss,
+            } => json!({"step_kind":"enemy","floor_id":floor_id,"x":x,"y":y,
+                "block_id":block_id,"details":{"hp_loss":hp_loss.get()}}),
+            Self::Transition {
+                floor_id,
+                x,
+                y,
+                block_id,
+            } => json!({"step_kind":"transition","floor_id":floor_id,"x":x,"y":y,
+                "block_id":block_id,"details":{}}),
+            Self::Event {
+                floor_id,
+                x,
+                y,
+                block_id,
+                event_id,
+            } => json!({"step_kind":"event","floor_id":floor_id,"x":x,"y":y,
+                "block_id":block_id,"details":{"event_id":event_id}}),
+            Self::Shop {
+                floor_id,
+                shop_id,
+                choice_id,
+                currency,
+                cost,
+                purchase_count_before,
+                effects,
+            } => json!({"step_kind":"shop","floor_id":floor_id,"shop_id":shop_id,
+                "choice_id":choice_id,"details":{"currency":currency,"cost":cost,
+                "purchase_count_before":purchase_count_before,"effects":effects.iter()
+                    .map(|effect| json!({"field":effect.field,"amount":effect.amount})).collect::<Vec<_>>()}}),
+            Self::Terminal { floor_id, x, y } => json!({"step_kind":"terminal","floor_id":floor_id,
+                "x":x,"y":y,"details":{}}),
+        }
+    }
+}
+
+fn canonical_json_bytes(value: &Value, output: &mut Vec<u8>) {
+    match value {
+        Value::Array(items) => {
+            output.push(b'[');
+            for (index, item) in items.iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                canonical_json_bytes(item, output);
+            }
+            output.push(b']');
+        }
+        Value::Object(object) => {
+            output.push(b'{');
+            let mut fields: Vec<_> = object.iter().collect();
+            fields.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            for (index, (name, item)) in fields.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                serde_json::to_writer(&mut *output, name)
+                    .expect("route field names are serializable");
+                output.push(b':');
+                canonical_json_bytes(item, output);
+            }
+            output.push(b'}');
+        }
+        scalar => serde_json::to_writer(&mut *output, scalar)
+            .expect("route scalar values are serializable"),
+    }
+}
+
+#[derive(Clone)]
+struct RouteStepKey {
+    // Keep the typed protocol payload with the key so every currently supported
+    // route step has an explicit, reviewable variant. `canonical` is an
+    // independently generated stable encoding used only for ordering.
+    _semantic: RouteStepSemantic,
+    canonical: Arc<[u8]>,
+}
+
+impl RouteStepKey {
+    fn new(semantic: RouteStepSemantic) -> Self {
+        let mut canonical = Vec::new();
+        canonical_json_bytes(&semantic.json_value(), &mut canonical);
+        Self {
+            _semantic: semantic,
+            canonical: Arc::from(canonical),
+        }
+    }
+}
+
+impl PartialEq for RouteStepKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical == other.canonical
+    }
+}
+
+impl Eq for RouteStepKey {}
+
+impl Ord for RouteStepKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.canonical.cmp(&other.canonical)
+    }
+}
+
+impl PartialOrd for RouteStepKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone)]
+struct RouteStep {
+    value: Value,
+    key: RouteStepKey,
+}
+
+impl RouteStep {
+    fn new(semantic: RouteStepSemantic) -> Self {
+        let value = semantic.json_value();
+        let key = RouteStepKey::new(semantic);
+        Self { value, key }
+    }
+}
+
+fn route_action_step(action: &RouteAction, blocks: &[SolverBlock]) -> RouteStep {
     match action {
         RouteAction::Block { index, action } => {
             let block = &blocks[*index];
-            let (kind, details) = match action {
-                BlockRouteAction::Door { yellow, blue, red } => (
-                    "door",
-                    json!({"key_cost":{"yellow":yellow,"blue":blue,"red":red}}),
-                ),
-                BlockRouteAction::Resource => ("resource", block.data["delta"].clone()),
-                BlockRouteAction::Enemy { hp_loss } => ("enemy", json!({"hp_loss":hp_loss.get()})),
-                BlockRouteAction::Transition => ("transition", json!({})),
-                BlockRouteAction::Event { event_id } => ("event", json!({"event_id":event_id})),
+            let semantic = match action {
+                BlockRouteAction::Door { yellow, blue, red } => RouteStepSemantic::Door {
+                    floor_id: block.floor.clone(),
+                    x: block.x,
+                    y: block.y,
+                    block_id: block.id.clone(),
+                    yellow: *yellow,
+                    blue: *blue,
+                    red: *red,
+                },
+                BlockRouteAction::Resource => RouteStepSemantic::Resource {
+                    floor_id: block.floor.clone(),
+                    x: block.x,
+                    y: block.y,
+                    block_id: block.id.clone(),
+                    delta: block.data["delta"].clone(),
+                },
+                BlockRouteAction::Enemy { hp_loss } => RouteStepSemantic::Enemy {
+                    floor_id: block.floor.clone(),
+                    x: block.x,
+                    y: block.y,
+                    block_id: block.id.clone(),
+                    hp_loss: *hp_loss,
+                },
+                BlockRouteAction::Transition => RouteStepSemantic::Transition {
+                    floor_id: block.floor.clone(),
+                    x: block.x,
+                    y: block.y,
+                    block_id: block.id.clone(),
+                },
+                BlockRouteAction::Event { event_id } => RouteStepSemantic::Event {
+                    floor_id: block.floor.clone(),
+                    x: block.x,
+                    y: block.y,
+                    block_id: block.id.clone(),
+                    event_id: event_id.clone(),
+                },
             };
-            step_json(kind, block, details)
+            RouteStep::new(semantic)
         }
         RouteAction::Shop {
             floor,
@@ -909,11 +1144,21 @@ fn route_action_json(action: &RouteAction, blocks: &[SolverBlock]) -> Value {
             cost,
             purchase_count_before,
             effects,
-        } => json!({"step_kind":"shop","floor_id":floor,"shop_id":shop_id,
-            "choice_id":choice_id,"details":{"currency":currency,"cost":cost,
-            "purchase_count_before":purchase_count_before,"effects":effects.iter()
-                .map(|effect| json!({"field":effect.field,"amount":effect.amount})).collect::<Vec<_>>()}}),
+        } => RouteStep::new(RouteStepSemantic::Shop {
+            floor_id: floor.clone(),
+            shop_id: shop_id.clone(),
+            choice_id: choice_id.clone(),
+            currency: currency.clone(),
+            cost: *cost,
+            purchase_count_before: *purchase_count_before,
+            effects: effects.clone(),
+        }),
     }
+}
+
+#[cfg(test)]
+fn route_action_json(action: &RouteAction, blocks: &[SolverBlock]) -> Value {
+    route_action_step(action, blocks).value
 }
 
 #[derive(Clone)]
@@ -1446,11 +1691,6 @@ fn enemy_loss(state: &SolverState, enemy: &Value) -> Option<f64> {
     Some((rounds - 1.0).max(0.0) * (attack as f64 - state.defense.get()).max(0.0))
 }
 
-fn step_json(kind: &str, block: &SolverBlock, details: Value) -> Value {
-    json!({"step_kind":kind,"floor_id":block.floor,"x":block.x,"y":block.y,
-        "block_id":block.id,"details":details})
-}
-
 fn state_count(entries: &[(String, u64)], id: &str) -> u64 {
     entries
         .iter()
@@ -1941,7 +2181,7 @@ struct RouteSegment {
 }
 
 struct Phase2Node {
-    route_key: String,
+    route_keys: Vec<RouteStepKey>,
     serial: usize,
     state: SolverState,
     steps: Vec<Value>,
@@ -1954,7 +2194,8 @@ struct Phase2Node {
 
 impl PartialEq for Phase2Node {
     fn eq(&self, other: &Self) -> bool {
-        self.route_key == other.route_key && self.serial == other.serial
+        cmp_route_sequences(&self.route_keys, &other.route_keys).is_eq()
+            && self.serial == other.serial
     }
 }
 
@@ -1963,8 +2204,9 @@ impl Eq for Phase2Node {}
 impl Ord for Phase2Node {
     fn cmp(&self, other: &Self) -> Ordering {
         other
-            .route_key
-            .cmp(&self.route_key)
+            .route_keys
+            .as_slice()
+            .cmp_route_order(&self.route_keys)
             .then_with(|| other.serial.cmp(&self.serial))
     }
 }
@@ -1984,30 +2226,58 @@ struct Phase2Route {
     terminal_navigation: Vec<usize>,
 }
 
-fn append_navigation_steps(steps: &mut Vec<Value>, navigation: &[usize], blocks: &[SolverBlock]) {
-    steps.extend(navigation.iter().map(|index| {
-        route_action_json(
+trait RouteSequenceOrder {
+    fn cmp_route_order(&self, other: &[RouteStepKey]) -> Ordering;
+}
+
+impl RouteSequenceOrder for [RouteStepKey] {
+    fn cmp_route_order(&self, other: &[RouteStepKey]) -> Ordering {
+        cmp_route_sequences(self, other)
+    }
+}
+
+// The public tie-break historically compared the JSON text for the complete
+// array. Equal prefixes therefore have the intentionally unusual rule that a
+// longer sequence sorts first: its next byte is ',' while the shorter array's
+// next byte is ']'. Keep that protocol behavior explicit rather than silently
+// replacing it with Rust's ordinary Vec lexicographic order.
+fn cmp_route_sequences(left: &[RouteStepKey], right: &[RouteStepKey]) -> Ordering {
+    for (left_step, right_step) in left.iter().zip(right) {
+        let order = left_step.cmp(right_step);
+        if !order.is_eq() {
+            return order;
+        }
+    }
+    right.len().cmp(&left.len())
+}
+
+fn append_navigation_steps(
+    steps: &mut Vec<Value>,
+    keys: &mut Vec<RouteStepKey>,
+    navigation: &[usize],
+    blocks: &[SolverBlock],
+) {
+    for index in navigation {
+        let step = route_action_step(
             &RouteAction::Block {
                 index: *index,
                 action: BlockRouteAction::Transition,
             },
             blocks,
-        )
-    }));
-}
-
-fn route_steps_key(steps: &[Value]) -> String {
-    serde_json::to_string(steps).expect("route steps are serializable")
+        );
+        steps.push(step.value);
+        keys.push(step.key);
+    }
 }
 
 fn phase2_prefix_is_better(
-    seen_prefix: &HashMap<SolverState, String>,
+    seen_prefix: &HashMap<SolverState, Vec<RouteStepKey>>,
     state: &SolverState,
-    route_key: &str,
+    route_keys: &[RouteStepKey],
 ) -> bool {
     seen_prefix
         .get(state)
-        .is_none_or(|existing| route_key < existing.as_str())
+        .is_none_or(|existing| cmp_route_sequences(route_keys, existing).is_lt())
 }
 
 fn enqueue_phase2_action(
@@ -2028,13 +2298,16 @@ fn enqueue_phase2_action(
         return;
     };
     let mut steps = source.steps.clone();
-    append_navigation_steps(&mut steps, &navigation, blocks);
-    steps.push(route_action_json(&route_action, blocks));
+    let mut route_keys = source.route_keys.clone();
+    append_navigation_steps(&mut steps, &mut route_keys, &navigation, blocks);
+    let route_step = route_action_step(&route_action, blocks);
+    steps.push(route_step.value);
+    route_keys.push(route_step.key);
     let mut segments = source.segments.clone();
     segments.push(RouteSegment { navigation, action });
     *serial = serial.saturating_add(1);
     queue.push(Phase2Node {
-        route_key: route_steps_key(&steps),
+        route_keys,
         serial: *serial,
         state: materialized.state,
         steps,
@@ -2082,9 +2355,9 @@ fn replay_phase2_route(
 }
 
 enum Phase2Outcome {
-    Found(Phase2Route),
-    BudgetExhausted,
-    NoWitness,
+    Found { route: Phase2Route, explored: usize },
+    BudgetExhausted { explored: usize },
+    NoWitness { explored: usize },
 }
 
 fn extract_route_witness(
@@ -2098,10 +2371,14 @@ fn extract_route_witness(
     shops: &[Value],
 ) -> Phase2Outcome {
     #[cfg(test)]
-    PHASE2_CALLS.with(|calls| calls.set(calls.get() + 1));
+    {
+        PHASE2_CALLS.with(|calls| calls.set(calls.get() + 1));
+        PHASE2_SAW_PHASE_A_DROPPED
+            .with(|seen| PHASE_A_DROPPED.with(|dropped| seen.set(dropped.get())));
+    }
     let mut queue = BinaryHeap::new();
     queue.push(Phase2Node {
-        route_key: route_steps_key(&[]),
+        route_keys: Vec::new(),
         serial: 0,
         state: initial.clone(),
         steps: Vec::new(),
@@ -2109,29 +2386,36 @@ fn extract_route_witness(
         visited_states: Vec::new(),
     });
     let mut serial = 0usize;
-    let mut seen_prefix = HashMap::<SolverState, String>::new();
+    let mut seen_prefix = HashMap::<SolverState, Vec<RouteStepKey>>::new();
     let mut explored = 0usize;
-    let mut best: Option<(String, Phase2Route)> = None;
+    let mut best: Option<(Vec<RouteStepKey>, Phase2Route)> = None;
     while let Some(mut node) = queue.pop() {
         if explored >= max_states {
-            return Phase2Outcome::BudgetExhausted;
+            return Phase2Outcome::BudgetExhausted { explored };
         }
         let view = connectivity.view(&node.state, floors, blocks, terminals, true);
         (node.state.floor, node.state.x, node.state.y) = view.representative.clone();
         if node.visited_states.iter().any(|old| old == &node.state) {
             continue;
         }
-        if !phase2_prefix_is_better(&seen_prefix, &node.state, &node.route_key) {
+        if !phase2_prefix_is_better(&seen_prefix, &node.state, &node.route_keys) {
             continue;
         }
-        seen_prefix.insert(node.state.clone(), node.route_key.clone());
+        seen_prefix.insert(node.state.clone(), node.route_keys.clone());
         node.visited_states.push(node.state.clone());
         explored += 1;
         for terminal in &view.terminals {
             if NumericObjective::from_state(&node.state).matches(target) {
                 let mut steps = node.steps.clone();
-                append_navigation_steps(&mut steps, &terminal.navigation, blocks);
-                steps.push(json!({"step_kind":"terminal","floor_id":terminal.floor,"x":terminal.position.0,"y":terminal.position.1,"details":{}}));
+                let mut route_keys = node.route_keys.clone();
+                append_navigation_steps(&mut steps, &mut route_keys, &terminal.navigation, blocks);
+                let terminal_step = RouteStep::new(RouteStepSemantic::Terminal {
+                    floor_id: terminal.floor.clone(),
+                    x: terminal.position.0,
+                    y: terminal.position.1,
+                });
+                steps.push(terminal_step.value);
+                route_keys.push(terminal_step.key);
                 let candidate = Phase2Route {
                     state: node.state.clone(),
                     steps,
@@ -2140,12 +2424,13 @@ fn extract_route_witness(
                     terminal_pos: terminal.position,
                     terminal_navigation: terminal.navigation.clone(),
                 };
-                let key = route_steps_key(&candidate.steps);
                 if replay_phase2_route(initial, &candidate, blocks, shops)
                     .is_some_and(|replayed| NumericObjective::from_state(&replayed).matches(target))
-                    && best.as_ref().is_none_or(|(old, _)| key < *old)
+                    && best
+                        .as_ref()
+                        .is_none_or(|(old, _)| cmp_route_sequences(&route_keys, old).is_lt())
                 {
-                    best = Some((key, candidate));
+                    best = Some((route_keys, candidate));
                 }
             }
         }
@@ -2196,12 +2481,172 @@ fn extract_route_witness(
             choice_offset += choices.len();
         }
     }
-    best.map_or(Phase2Outcome::NoWitness, |(_, route)| {
-        Phase2Outcome::Found(route)
+    best.map_or(Phase2Outcome::NoWitness { explored }, |(_, route)| {
+        Phase2Outcome::Found { route, explored }
     })
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TwoPhaseStats {
+    phase_a_explored: usize,
+    phase_b_explored: usize,
+}
+
+enum PhaseAOutcome {
+    BudgetExhausted,
+    Complete(Option<NumericObjective>),
+}
+
+struct PhaseAResult {
+    outcome: PhaseAOutcome,
+    explored: usize,
+}
+
+#[cfg(test)]
+struct PhaseADropProbe;
+
+#[cfg(test)]
+impl Drop for PhaseADropProbe {
+    fn drop(&mut self) {
+        PHASE_A_DROPPED.with(|dropped| dropped.set(true));
+    }
+}
+
+// Keep the proof search in a separate function rather than merely relying on
+// non-lexical lifetimes. Its queue, state arena, exact seen set, dominance
+// frontier, and all connectivity views are unconditionally dropped before a
+// caller can enter Phase 2. The result deliberately carries only a scalar
+// objective/status and count; it cannot retain a Phase A arena through Arc.
+fn run_numeric_proof(
+    initial: &SolverState,
+    max_states: usize,
+    connectivity: &ConnectivityIndex,
+    floors: &HashMap<String, SolverFloor>,
+    blocks: &[SolverBlock],
+    terminals: &[(&str, (u64, u64))],
+    shops: &[Value],
+) -> PhaseAResult {
+    #[cfg(test)]
+    let _drop_probe = PhaseADropProbe;
+    let mut initial_node = Some(initial.clone());
+    let mut queue: VecDeque<PendingCandidate> = VecDeque::new();
+    let mut state_arena = Vec::new();
+    let mut seen = HashSet::new();
+    let mut dominance: HashMap<StructuralKey, Vec<[f64; 8]>> = HashMap::new();
+    let mut explored = 0usize;
+    let mut best: Option<NumericObjective> = None;
+    loop {
+        let mut next_node = initial_node.take();
+        while next_node.is_none() {
+            let Some(candidate) = queue.pop_front() else {
+                break;
+            };
+            let source = state_arena
+                .get(candidate.source)
+                .expect("pending candidate source must be an accepted state");
+            next_node = materialize_pending_action(source, candidate.action, blocks, shops, false)
+                .map(|candidate| candidate.state);
+        }
+        let Some(mut node) = next_node else {
+            break;
+        };
+        if explored >= max_states {
+            return PhaseAResult {
+                outcome: PhaseAOutcome::BudgetExhausted,
+                explored,
+            };
+        }
+        let view = connectivity.view(&node, floors, blocks, terminals, false);
+        (node.floor, node.x, node.y) = view.representative.clone();
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        let structural = StructuralKey::from(&node);
+        let resources = [
+            node.hp.get(),
+            node.attack.get(),
+            node.defense.get(),
+            node.gold as f64,
+            node.experience as f64,
+            node.yellow as f64,
+            node.blue as f64,
+            node.red as f64,
+        ];
+        let frontier = dominance.entry(structural).or_default();
+        if frontier.iter().any(|old| {
+            old.iter()
+                .zip(resources)
+                .all(|(left, right)| *left >= right)
+        }) {
+            continue;
+        }
+        frontier.retain(|old| {
+            !resources
+                .iter()
+                .zip(old)
+                .all(|(left, right)| *left >= *right)
+        });
+        frontier.push(resources);
+        explored += 1;
+        let state_index = state_arena.len();
+        state_arena.push(node.clone());
+        if !view.terminals.is_empty() {
+            let objective = NumericObjective::from_state(&node);
+            if best.is_none_or(|old| objective.cmp(old).is_gt()) {
+                best = Some(objective);
+            }
+        }
+        for boundary in view.boundaries {
+            queue.push_back(PendingCandidate {
+                source: state_index,
+                action: PendingAction::Block {
+                    index: boundary.index,
+                    adjacent: boundary.adjacent,
+                },
+            });
+        }
+        let mut choice_offset = 0usize;
+        for (shop_index, shop) in shops.iter().enumerate() {
+            let shop_id = shop
+                .get("shop_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let accessible = view.shops.get(shop_id);
+            let choices = shop
+                .get("choices")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some((shop_floor, adjacent, _navigation)) = accessible {
+                for local in 0..choices.len() {
+                    queue.push_back(PendingCandidate {
+                        source: state_index,
+                        action: PendingAction::Shop {
+                            shop_index,
+                            choice_index: local,
+                            choice_offset,
+                            floor: shop_floor.clone(),
+                            adjacent: *adjacent,
+                        },
+                    });
+                }
+            }
+            choice_offset += choices.len();
+        }
+    }
+    PhaseAResult {
+        outcome: PhaseAOutcome::Complete(best),
+        explored,
+    }
+}
+
 fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
+    global_analysis_with_stats(observation).0
+}
+
+fn global_analysis_with_stats(
+    observation: &serde_json::Map<String, Value>,
+) -> (Value, TwoPhaseStats) {
     let source_blockers = observation
         .get("engine_model")
         .and_then(Value::as_object)
@@ -2213,12 +2658,18 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         .unwrap_or_default();
     let parsed = parse_solver_world(observation);
     let Ok((floors, blocks, state_slot_count, terminal, shops, blockers)) = parsed else {
-        return json!({"scope":"global_terminal_route","proof":"unsupported","reason":parsed.unwrap_err(),
-            "truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null});
+        return (
+            json!({"scope":"global_terminal_route","proof":"unsupported","reason":parsed.unwrap_err(),
+            "truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null}),
+            TwoPhaseStats::default(),
+        );
     };
     if !blockers.is_empty() {
-        return json!({"scope":"global_terminal_route","proof":"unsupported","reason":"unsupported_solver_blocker",
-            "truncated":false,"explored_states":0,"blockers":blockers,"route":null,"first_suggestion":null});
+        return (
+            json!({"scope":"global_terminal_route","proof":"unsupported","reason":"unsupported_solver_blocker",
+            "truncated":false,"explored_states":0,"blockers":blockers,"route":null,"first_suggestion":null}),
+            TwoPhaseStats::default(),
+        );
     }
     let connectivity = ConnectivityIndex::new(&floors, &blocks);
     let hero = observation.get("hero").and_then(Value::as_object).unwrap();
@@ -2270,9 +2721,12 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         consumed: match initial_consumed_bits(&blocks, state_slot_count) {
             Ok(consumed) => consumed,
             Err(()) => {
-                return json!({"scope":"global_terminal_route","proof":"unsupported",
+                return (
+                    json!({"scope":"global_terminal_route","proof":"unsupported",
                 "reason":"state_slot_invalid","truncated":false,"explored_states":0,
-                "blockers":source_blockers,"route":null,"first_suggestion":null});
+                "blockers":source_blockers,"route":null,"first_suggestion":null}),
+                    TwoPhaseStats::default(),
+                );
             }
         },
         shop_counts: Arc::new(
@@ -2345,145 +2799,82 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         .and_then(Value::as_u64)
         .map(|value| value.clamp(1, MAX_GLOBAL_STATES as u64) as usize)
         .unwrap_or(MAX_GLOBAL_STATES);
-    let mut initial_node = Some(initial.clone());
-    let mut queue: VecDeque<PendingCandidate> = VecDeque::new();
-    let mut state_arena = Vec::new();
-    let mut seen = HashSet::new();
-    let mut dominance: HashMap<StructuralKey, Vec<[f64; 8]>> = HashMap::new();
-    let mut explored = 0usize;
-    let mut best: Option<NumericObjective> = None;
-    let mut budget_exhausted = false;
-    loop {
-        let mut next_node = initial_node.take();
-        while next_node.is_none() {
-            let Some(candidate) = queue.pop_front() else {
-                break;
-            };
-            let source = state_arena
-                .get(candidate.source)
-                .expect("pending candidate source must be an accepted state");
-            next_node =
-                materialize_pending_action(source, candidate.action, &blocks, &shops, false)
-                    .map(|candidate| candidate.state);
-        }
-        let Some(mut node) = next_node else {
-            break;
-        };
-        if explored >= max_states {
-            budget_exhausted = true;
-            break;
-        }
-        let view = connectivity.view(&node, &floors, &blocks, &terminals, false);
-        (node.floor, node.x, node.y) = view.representative.clone();
-        if !seen.insert(node.clone()) {
-            continue;
-        }
-        let structural = StructuralKey::from(&node);
-        let resources = [
-            node.hp.get(),
-            node.attack.get(),
-            node.defense.get(),
-            node.gold as f64,
-            node.experience as f64,
-            node.yellow as f64,
-            node.blue as f64,
-            node.red as f64,
-        ];
-        let frontier = dominance.entry(structural).or_default();
-        if frontier.iter().any(|old| {
-            old.iter()
-                .zip(resources)
-                .all(|(left, right)| *left >= right)
-        }) {
-            continue;
-        }
-        frontier.retain(|old| {
-            !resources
-                .iter()
-                .zip(old)
-                .all(|(left, right)| *left >= *right)
-        });
-        frontier.push(resources);
-        explored += 1;
-        let state_index = state_arena.len();
-        state_arena.push(node.clone());
-        if !view.terminals.is_empty() {
-            let objective = NumericObjective::from_state(&node);
-            if best.is_none_or(|old| objective.cmp(old).is_gt()) {
-                best = Some(objective);
-            }
-        }
-        for boundary in view.boundaries {
-            queue.push_back(PendingCandidate {
-                source: state_index,
-                action: PendingAction::Block {
-                    index: boundary.index,
-                    adjacent: boundary.adjacent,
-                },
-            });
-        }
-        // A restricted shop can be used whenever its bound block is adjacent. Each purchase is a separate state.
-        let mut choice_offset = 0usize;
-        for (shop_index, shop) in shops.iter().enumerate() {
-            let shop_id = shop
-                .get("shop_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let accessible = view.shops.get(shop_id);
-            let choices = shop
-                .get("choices")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if let Some((shop_floor, adjacent, _navigation)) = accessible {
-                for local in 0..choices.len() {
-                    queue.push_back(PendingCandidate {
-                        source: state_index,
-                        action: PendingAction::Shop {
-                            shop_index,
-                            choice_index: local,
-                            choice_offset,
-                            floor: shop_floor.clone(),
-                            adjacent: *adjacent,
-                        },
-                    });
+    #[cfg(test)]
+    {
+        PHASE_A_DROPPED.with(|dropped| dropped.set(false));
+        PHASE2_SAW_PHASE_A_DROPPED.with(|seen| seen.set(false));
+    }
+    let proof = run_numeric_proof(
+        &initial,
+        max_states,
+        &connectivity,
+        &floors,
+        &blocks,
+        &terminals,
+        &shops,
+    );
+    let mut stats = TwoPhaseStats {
+        phase_a_explored: proof.explored,
+        phase_b_explored: 0,
+    };
+    let explored = proof.explored;
+    match proof.outcome {
+        PhaseAOutcome::BudgetExhausted => (
+            json!({"scope":"global_terminal_route","proof":"unproven","reason":"search_budget_exhausted",
+        "truncated":true,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null}),
+            stats,
+        ),
+        PhaseAOutcome::Complete(Some(target)) => {
+            match extract_route_witness(
+                &initial,
+                target,
+                max_states,
+                &connectivity,
+                &floors,
+                &blocks,
+                &terminals,
+                &shops,
+            ) {
+                Phase2Outcome::Found {
+                    route: best,
+                    explored: phase_b_explored,
+                } => {
+                    stats.phase_b_explored = phase_b_explored;
+                    let first = best.steps.first().cloned();
+                    (
+                        json!({"scope":"global_terminal_route","proof":"proven","reason":"complete terminal route found","truncated":false,
+                "explored_states":explored,"terminal_hp":best.state.hp.get(),"terminal_attack":best.state.attack.get(),
+                "terminal_defense":best.state.defense.get(),"blockers":blockers,"route":{"step_count":best.steps.len(),"steps":best.steps},"first_suggestion":first}),
+                        stats,
+                    )
+                }
+                Phase2Outcome::BudgetExhausted {
+                    explored: phase_b_explored,
+                } => {
+                    stats.phase_b_explored = phase_b_explored;
+                    (
+                        json!({"scope":"global_terminal_route","proof":"unproven","reason":"search_budget_exhausted",
+                "truncated":true,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null}),
+                        stats,
+                    )
+                }
+                Phase2Outcome::NoWitness {
+                    explored: phase_b_explored,
+                } => {
+                    stats.phase_b_explored = phase_b_explored;
+                    (
+                        json!({"scope":"global_terminal_route","proof":"unproven","reason":"route_witness_unavailable",
+                "truncated":false,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null}),
+                        stats,
+                    )
                 }
             }
-            choice_offset += choices.len();
         }
-    }
-    if budget_exhausted {
-        json!({"scope":"global_terminal_route","proof":"unproven","reason":"search_budget_exhausted",
-        "truncated":true,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null})
-    } else if let Some(target) = best {
-        match extract_route_witness(
-            &initial,
-            target,
-            max_states,
-            &connectivity,
-            &floors,
-            &blocks,
-            &terminals,
-            &shops,
-        ) {
-            Phase2Outcome::Found(best) => {
-                let first = best.steps.first().cloned();
-                json!({"scope":"global_terminal_route","proof":"proven","reason":"complete terminal route found","truncated":false,
-                "explored_states":explored,"terminal_hp":best.state.hp.get(),"terminal_attack":best.state.attack.get(),
-                "terminal_defense":best.state.defense.get(),"blockers":blockers,"route":{"step_count":best.steps.len(),"steps":best.steps},"first_suggestion":first})
-            }
-            Phase2Outcome::BudgetExhausted => {
-                json!({"scope":"global_terminal_route","proof":"unproven","reason":"search_budget_exhausted",
-                "truncated":true,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null})
-            }
-            Phase2Outcome::NoWitness => {
-                json!({"scope":"global_terminal_route","proof":"unproven","reason":"route_witness_unavailable",
-                "truncated":false,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null})
-            }
-        }
-    } else {
-        json!({"scope":"global_terminal_route","proof":if blockers.is_empty(){"unproven"}else{"unsupported"},"reason":"no_complete_supported_route",
-        "truncated":false,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null})
+        PhaseAOutcome::Complete(None) => (
+            json!({"scope":"global_terminal_route","proof":if blockers.is_empty(){"unproven"}else{"unsupported"},"reason":"no_complete_supported_route",
+        "truncated":false,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null}),
+            stats,
+        ),
     }
 }
 
@@ -2697,8 +3088,16 @@ mod tests {
         let high_hp = NumericObjective::from_state(&terminal_node(10, 10, 6, "z"));
         assert!(high_hp.cmp(low_hp).is_gt());
 
-        let earlier = route_steps_key(&[json!({"route":"a"})]);
-        let later = route_steps_key(&[json!({"route":"z"})]);
+        let earlier = RouteStepKey::new(RouteStepSemantic::Terminal {
+            floor_id: "a".into(),
+            x: 0,
+            y: 0,
+        });
+        let later = RouteStepKey::new(RouteStepSemantic::Terminal {
+            floor_id: "z".into(),
+            x: 0,
+            y: 0,
+        });
         assert!(earlier < later);
 
         let overflow_safe =
@@ -2709,18 +3108,124 @@ mod tests {
     #[test]
     fn phase2_replaces_a_shorter_route_with_a_lexically_smaller_longer_route_to_same_state() {
         let state = terminal_node(10, 10, 100, "same");
-        let shorter = route_steps_key(&[json!({"step_kind":"z_action"})]);
-        let longer = route_steps_key(&[
-            json!({"step_kind":"a_action"}),
-            json!({"step_kind":"z_action"}),
-        ]);
+        let shorter = vec![RouteStepKey::new(RouteStepSemantic::Terminal {
+            floor_id: "z".into(),
+            x: 0,
+            y: 0,
+        })];
+        let longer = vec![
+            RouteStepKey::new(RouteStepSemantic::Terminal {
+                floor_id: "a".into(),
+                x: 0,
+                y: 0,
+            }),
+            RouteStepKey::new(RouteStepSemantic::Terminal {
+                floor_id: "z".into(),
+                x: 0,
+                y: 0,
+            }),
+        ];
         assert!(
-            longer < shorter,
+            cmp_route_sequences(&longer, &shorter).is_lt(),
             "the longer route is deliberately lexically first"
         );
         let mut seen = HashMap::new();
         seen.insert(state.clone(), shorter);
         assert!(phase2_prefix_is_better(&seen, &state, &longer));
+    }
+
+    #[test]
+    fn route_step_keys_match_legacy_canonical_json_for_all_supported_step_types() {
+        let steps = vec![
+            RouteStep::new(RouteStepSemantic::Door {
+                floor_id: "F".into(),
+                x: 1,
+                y: 2,
+                block_id: "door".into(),
+                yellow: 1,
+                blue: 2,
+                red: 3,
+            }),
+            RouteStep::new(RouteStepSemantic::Resource {
+                floor_id: "F".into(),
+                x: 2,
+                y: 2,
+                block_id: "gem".into(),
+                delta: json!({"attack":3,"keys":{"yellow":1,"blue":0,"red":0},"inventory":{"wand":1}}),
+            }),
+            RouteStep::new(RouteStepSemantic::Enemy {
+                floor_id: "F".into(),
+                x: 3,
+                y: 2,
+                block_id: "enemy".into(),
+                hp_loss: F64Bits::new(1.5).unwrap(),
+            }),
+            RouteStep::new(RouteStepSemantic::Transition {
+                floor_id: "F".into(),
+                x: 4,
+                y: 2,
+                block_id: "stairs".into(),
+            }),
+            RouteStep::new(RouteStepSemantic::Event {
+                floor_id: "F".into(),
+                x: 5,
+                y: 2,
+                block_id: "event".into(),
+                event_id: "fairy_mt0".into(),
+            }),
+            RouteStep::new(RouteStepSemantic::Shop {
+                floor_id: "F".into(),
+                shop_id: "shop".into(),
+                choice_id: "shop:0".into(),
+                currency: "gold".into(),
+                cost: 10,
+                purchase_count_before: 2,
+                effects: vec![ShopRouteEffect {
+                    field: "attack".into(),
+                    amount: 3,
+                }],
+            }),
+            RouteStep::new(RouteStepSemantic::Terminal {
+                floor_id: "F".into(),
+                x: 6,
+                y: 2,
+            }),
+        ];
+        let routes: Vec<Vec<usize>> = (0..steps.len())
+            .map(|index| vec![index])
+            .chain([(0..2).collect(), vec![0], vec![0, 1, 2]])
+            .collect();
+        for left in &routes {
+            for right in &routes {
+                let old_left = serde_json::to_vec(
+                    &left
+                        .iter()
+                        .map(|index| steps[*index].value.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                let old_right = serde_json::to_vec(
+                    &right
+                        .iter()
+                        .map(|index| steps[*index].value.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                let new_left = left
+                    .iter()
+                    .map(|index| steps[*index].key.clone())
+                    .collect::<Vec<_>>();
+                let new_right = right
+                    .iter()
+                    .map(|index| steps[*index].key.clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    cmp_route_sequences(&new_left, &new_right),
+                    old_left.cmp(&old_right),
+                    "left={left:?}, right={right:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2739,19 +3244,19 @@ mod tests {
         }];
         let floors = HashMap::from([("F".to_owned(), indexed_floor(2, vec![0]))]);
         let connectivity = ConnectivityIndex::new(&floors, &blocks);
-        assert!(matches!(
-            extract_route_witness(
-                &initial,
-                NumericObjective::from_state(&initial),
-                1,
-                &connectivity,
-                &floors,
-                &blocks,
-                &[("F", (0, 0))],
-                &[],
-            ),
-            Phase2Outcome::BudgetExhausted
-        ));
+        match extract_route_witness(
+            &initial,
+            NumericObjective::from_state(&initial),
+            1,
+            &connectivity,
+            &floors,
+            &blocks,
+            &[("F", (0, 0))],
+            &[],
+        ) {
+            Phase2Outcome::BudgetExhausted { explored } => assert_eq!(explored, 1),
+            _ => panic!("one explored witness node must then report its finite budget"),
+        }
     }
 
     #[test]
@@ -3703,6 +4208,37 @@ mod tests {
         .unwrap()
     }
 
+    // Both strategic transitions reach exactly the same SolverState. Their
+    // declaration order makes Phase A FIFO accept `z_first` before `a_later`,
+    // so an implementation that retains only the Phase A predecessor would
+    // leak a lexically larger witness. Phase B must recover `a_later`.
+    fn fifo_same_state_tie_observation(include_cycle: bool) -> Value {
+        let mut blocks = vec![
+            json!({"floor_id":"A","x":1,"y":0,"block_id":"z_first","numeric_id":1,"kind":"transition",
+                "target":{"floor_id":"B","x":0,"y":0}}),
+            json!({"floor_id":"A","x":0,"y":1,"block_id":"a_later","numeric_id":2,"kind":"transition",
+                "target":{"floor_id":"B","x":0,"y":0}}),
+        ];
+        if include_cycle {
+            blocks.push(json!({"floor_id":"A","x":1,"y":1,"block_id":"loop","numeric_id":3,"kind":"transition",
+                "target":{"floor_id":"A","x":0,"y":0}}));
+        }
+        json!({
+            "session_id":"S","floor_id":"A","map_instance_id":"M",
+            "dimensions":{"width":2,"height":2},"topology":{"kind":"rectangle"},
+            "hero":{"hp":10,"attack":1,"defense":1,"gold":0,"experience":0,"loc":{"x":0,"y":0}},
+            "keys":{"yellow":0,"blue":0,"red":0},"blocks":[],
+            "engine_model":{"inventory":{"classes":{}},"solver_model":{
+                "protocol":1,"search_budget":16,"terminal":{"kind":"location","floor_id":"B","x":0,"y":0},
+                "blockers":[],"shops":[],
+                "floors":[
+                    {"floor_id":"A","width":2,"height":2,"topology":{"kind":"rectangle"},"blocks":blocks},
+                    {"floor_id":"B","width":1,"height":1,"topology":{"kind":"rectangle"},"blocks":[]}
+                ]
+            }}
+        })
+    }
+
     #[test]
     fn valid_cycle_is_idle_and_read_only() {
         let state = Mutex::new(ShadowState::default());
@@ -3768,6 +4304,47 @@ mod tests {
         ] {
             assert!(!serialized.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn phase2_recovers_lexically_smallest_witness_after_phase1_fifo_same_state_tie() {
+        let observation = fifo_same_state_tie_observation(false);
+        let (global, stats) = global_analysis_with_stats(observation.as_object().unwrap());
+        assert_eq!(global["proof"], "proven");
+        assert_eq!(global["route"]["steps"][0]["block_id"], "a_later");
+        assert!(stats.phase_a_explored > 0);
+        assert!(stats.phase_b_explored > 0);
+        PHASE2_SAW_PHASE_A_DROPPED.with(|seen| assert!(seen.get()));
+    }
+
+    #[test]
+    fn state_simple_witness_rejects_a_strategic_cycle_without_changing_canonical_route() {
+        let observation = fifo_same_state_tie_observation(true);
+        let (global, stats) = global_analysis_with_stats(observation.as_object().unwrap());
+        assert_eq!(global["proof"], "proven");
+        let ids: Vec<_> = global["route"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|step| step["block_id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["a_later"]);
+        assert_eq!(
+            stats.phase_b_explored, 2,
+            "the root and canonical target only"
+        );
+    }
+
+    #[test]
+    fn two_phase_stats_keep_protocol_count_at_phase_a_and_record_phase_b_privately() {
+        let exhausted = two_terminal_routes(2);
+        let (global, stats) = global_analysis_with_stats(exhausted.as_object().unwrap());
+        assert_eq!(global["proof"], "unproven");
+        assert_eq!(
+            global["explored_states"].as_u64().unwrap() as usize,
+            stats.phase_a_explored
+        );
+        assert_eq!(stats.phase_b_explored, 0);
     }
 
     #[test]
