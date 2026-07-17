@@ -899,10 +899,19 @@ fn step_json(kind: &str, block: &SolverBlock, details: Value) -> Value {
 }
 
 fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
+    let source_blockers = observation
+        .get("engine_model")
+        .and_then(Value::as_object)
+        .and_then(|model| model.get("solver_model"))
+        .and_then(Value::as_object)
+        .and_then(|model| model.get("blockers"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let parsed = parse_solver_world(observation);
     let Ok((floors, blocks, terminal, shops, blockers)) = parsed else {
         return json!({"scope":"global_terminal_route","proof":"unsupported","reason":parsed.unwrap_err(),
-            "truncated":false,"explored_states":0,"blockers":[],"route":null,"first_suggestion":null});
+            "truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null});
     };
     if !blockers.is_empty() {
         return json!({"scope":"global_terminal_route","proof":"unsupported","reason":"unsupported_solver_blocker",
@@ -962,20 +971,26 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
             .collect(),
     };
     let terminal_object = terminal.as_object().unwrap();
-    let terminal_floor = terminal_object
-        .get("floor_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let terminal_pos = (
-        terminal_object
-            .get("x")
-            .and_then(Value::as_u64)
-            .unwrap_or(u64::MAX),
-        terminal_object
-            .get("y")
-            .and_then(Value::as_u64)
-            .unwrap_or(u64::MAX),
-    );
+    let terminal_values: Vec<&Value> =
+        if terminal_object.get("kind").and_then(Value::as_str) == Some("any_location") {
+            terminal_object
+                .get("locations")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().collect())
+                .unwrap_or_default()
+        } else {
+            vec![&terminal]
+        };
+    let terminals: Vec<(&str, (u64, u64))> = terminal_values
+        .iter()
+        .filter_map(|value| {
+            let object = value.as_object()?;
+            Some((
+                object.get("floor_id")?.as_str()?,
+                (object.get("x")?.as_u64()?, object.get("y")?.as_u64()?),
+            ))
+        })
+        .collect();
     let max_states = observation
         .get("engine_model")
         .and_then(Value::as_object)
@@ -1031,7 +1046,10 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         frontier.push(resources);
         explored += 1;
         let reachable = reachable_cells(&node.state, &floors, &blocks);
-        if node.state.floor == terminal_floor && reachable.contains(&terminal_pos) {
+        if let Some((terminal_floor, terminal_pos)) = terminals
+            .iter()
+            .find(|(floor, position)| node.state.floor == *floor && reachable.contains(position))
+        {
             if best
                 .as_ref()
                 .is_none_or(|old| terminal_route_is_better(&node, old))
@@ -1123,11 +1141,15 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
             if accessible {
                 for (local, choice) in choices.iter().enumerate() {
                     let purchase_count = node.state.shop_counts[choice_offset + local];
-                    let Some(cost) = choice["base_cost"]
-                        .as_u64()
-                        .and_then(|base| choice["increment_per_purchase"].as_u64()
-                            .and_then(|increment| increment.checked_mul(purchase_count)
-                                .and_then(|extra| base.checked_add(extra)))) else {
+                    let Some(cost) = choice["base_cost"].as_u64().and_then(|base| {
+                        choice["increment_per_purchase"]
+                            .as_u64()
+                            .and_then(|increment| {
+                                increment
+                                    .checked_mul(purchase_count)
+                                    .and_then(|extra| base.checked_add(extra))
+                            })
+                    }) else {
                         continue;
                     };
                     if node.state.gold < cost {
@@ -1569,11 +1591,8 @@ mod tests {
                 "numeric_id":99,"kind":"opaque","reason":"event_unsupported"}));
         unknown["engine_model"]["solver_model"]["blockers"] =
             json!([{"code":"EVENT_UNSUPPORTED","detail":"F1:0,0"}]);
-        let response = shadow_response(
-            &request_with(unknown),
-            &Mutex::new(ShadowState::default()),
-        )
-        .unwrap();
+        let response =
+            shadow_response(&request_with(unknown), &Mutex::new(ShadowState::default())).unwrap();
         let global = &response["shadow"]["analysis"]["global"];
         assert_eq!(global["proof"], "unsupported");
         assert_eq!(global["truncated"], false);
@@ -1583,6 +1602,47 @@ mod tests {
         assert!(global.get("terminal_attack").is_none());
         assert!(global.get("terminal_defense").is_none());
         assert_eq!(global["blockers"][0]["code"], "EVENT_UNSUPPORTED");
+    }
+
+    #[test]
+    fn terminal_parse_failure_preserves_source_blockers() {
+        let mut observation = global_observation(None);
+        observation["engine_model"]["solver_model"]["terminal"] = Value::Null;
+        observation["engine_model"]["solver_model"]["blockers"] = json!([{"code":"TERMINAL_UNSUPPORTED","detail":"expected_one_goal:0"},
+                {"code":"RESOURCE_UNSUPPORTED","detail":"wand"}]);
+        let response = shadow_response(
+            &request_with(observation),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        let global = &response["shadow"]["analysis"]["global"];
+        assert_eq!(global["proof"], "unsupported");
+        assert_eq!(global["reason"], "terminal_unsupported");
+        assert_eq!(global["explored_states"], 0);
+        assert_eq!(global["blockers"].as_array().unwrap().len(), 2);
+        assert_eq!(global["blockers"][0]["code"], "TERMINAL_UNSUPPORTED");
+    }
+
+    #[test]
+    fn any_explicit_terminal_location_can_complete_the_route() {
+        let mut observation = global_observation(None);
+        observation["engine_model"]["solver_model"]["terminal"] = json!({
+            "kind":"any_location","locations":[
+                {"kind":"location","floor_id":"unreachable","x":0,"y":0},
+                {"kind":"location","floor_id":"F2","x":4,"y":0}
+            ]
+        });
+        let response = shadow_response(
+            &request_with(observation),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        let global = &response["shadow"]["analysis"]["global"];
+        assert_eq!(global["proof"], "proven");
+        assert_eq!(
+            global["route"]["steps"].as_array().unwrap().last().unwrap()["floor_id"],
+            "F2"
+        );
     }
 
     #[test]

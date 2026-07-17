@@ -314,6 +314,11 @@ test("非面板 inventory 资源差分可由浏览器执行层校验", () => {
 
 test("solver 投影只接受可证明的资源增量并保留未知脚本 blocker", () => {
   const keySlots = { yellow: "yellowKey", blue: "blueKey", red: "redKey" };
+  for (const [id, color] of [["yellowKey", "yellow"], ["blueKey", "blue"], ["redKey", "red"]]) {
+    const parsed = lab.parseSolverItemDelta({ id, item_effect: null, complex: false }, {}, keySlots);
+    assert.equal(parsed.supported, true);
+    assert.equal(parsed.delta.keys[color], 1);
+  }
   assert.deepEqual(JSON.parse(JSON.stringify(lab.parseSolverItemDelta({
     item_effect: "core.status.hero.atk += core.values.redGem; core.status.hero.items.tools.yellowKey++",
     complex: false,
@@ -352,6 +357,21 @@ test("solver 投影结构化终局、资源、换层和门，未知 special fail
   assert.deepEqual(JSON.parse(JSON.stringify(solver.floors[0].blocks[1].target)), { floor_id: "F2", x: 0, y: 0 });
   assert.equal(solver.floors[1].blocks[0].reason, "wall");
   assert.equal(solver.floors[1].blocks[1].key_cost.yellow, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(solver.blockers)), []);
+});
+
+test("solver 投影保留多个明确 win 终局供全局路线择优", () => {
+  const floor = (floor_id, x) => ({ floor_id, width: 2, height: 1,
+    topology: { kind: "rectangle" }, blocks: [], opaque_events: [], change_floor: [],
+    terminal_goals: [{ kind: "location", floor_id, x, y: 0 }] });
+  const solver = lab.buildSolverModel({ floors: [floor("F1", 0), floor("F2", 1)],
+    blocks: [], items: [], enemies: [], values: {}, inventory: { key_slots: {} } }, []);
+  assert.deepEqual(JSON.parse(JSON.stringify(solver.terminal)), {
+    kind: "any_location", locations: [
+      { kind: "location", floor_id: "F1", x: 0, y: 0 },
+      { kind: "location", floor_id: "F2", x: 1, y: 0 },
+    ],
+  });
   assert.deepEqual(JSON.parse(JSON.stringify(solver.blockers)), []);
 });
 
@@ -399,4 +419,34 @@ test("普通静态历史事件不会重建 blocker，当前运行态事件仍阻
   assert.deepEqual(JSON.parse(JSON.stringify(floor.terminal_goals)), [{
     kind: "location", floor_id: "F", x: 2, y: 0,
   }]);
+});
+
+test("嵌套 afterBattle 明确 win 规范化为终局，任意元数据不冒充终局", () => {
+  const definition = { width: 4, height: 1, map: [[0, 0, 0, 0]], events: {},
+    afterBattle: {
+      "1,0": [{ type: "if", condition: "flag:x", true: [{ type: "win" }], false: [] }],
+      "2,0": [{ type: "function", function: "return;", metadata: { type: "win" } }],
+      "3,0": [{ type: "text", text: "not terminal", payload: { type: "win" } }],
+    } };
+  const floor = lab.collectEngineFloor({ getMapBlocksObj: () => [] }, "F", definition,
+    { width: 4, height: 1, map: [[0, 0, 0, 0]], events: {} },
+    (code) => { throw new Error(code); });
+  assert.deepEqual(JSON.parse(JSON.stringify(floor.terminal_goals)), [
+    { kind: "location", floor_id: "F", x: 1, y: 0 },
+  ]);
+});
+
+test("core.floorIds 展开 :next/:before 并使用目标层 stair 落点", () => {
+  const core = fakeCore();
+  core.floorIds = ["MT0", "MT1B", "MT1A", "MT2"];
+  core.floors.MT0.changeFloor = { "10,10": { floorId: ":next", stair: "upFloor" } };
+  core.floors.MT1B.upFloor = [2, 1];
+  core.floors.MT1B.changeFloor = { "1,1": { floorId: ":before", stair: "downFloor" } };
+  core.floors.MT0.downFloor = [9, 8];
+  const model = lab.collectEngineModel(core, {});
+  assert.deepEqual(JSON.parse(JSON.stringify(model.floors[0].change_floor[0])), {
+    x: 10, y: 10, floor_id: "MT1B", loc: { x: 2, y: 1 }, direction: null,
+    stair: "upFloor", time: null, ignore_change_floor: false, opaque: false,
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(model.floors[1].change_floor[0].loc)), { x: 9, y: 8 });
 });

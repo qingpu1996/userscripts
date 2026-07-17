@@ -307,11 +307,52 @@ MotaLab.collectEngineFloor = function collectEngineFloor(
   const eventActions = (rawEvent) => (Array.isArray(rawEvent) ? rawEvent
     : rawEvent && Array.isArray(rawEvent.data) ? rawEvent.data : [rawEvent])
     .filter((action) => action && typeof action === "object");
+  const containsWin = (action, seen = new Set()) => {
+    if (Array.isArray(action)) return action.some((child) => containsWin(child, seen));
+    if (!action || typeof action !== "object" || seen.has(action)) return false;
+    seen.add(action);
+    if (action.type === "win") return true;
+    if (action.type === "if") {
+      return containsWin(action.true, seen) || containsWin(action.false, seen);
+    }
+    if (["while", "dowhile", "for", "forEach"].includes(action.type)) {
+      return containsWin(action.data, seen);
+    }
+    if (action.type === "choices") {
+      return Array.isArray(action.choices)
+        && action.choices.some((choice) => containsWin(choice && choice.action, seen));
+    }
+    if (action.type === "confirm") {
+      return containsWin(action.yes, seen) || containsWin(action.no, seen);
+    }
+    if (action.type === "switch") {
+      return Array.isArray(action.caseList)
+        && action.caseList.some((item) => containsWin(item && item.action, seen));
+    }
+    if (action.type === "wait") {
+      return Array.isArray(action.data)
+        && action.data.some((item) => containsWin(item && item.action, seen));
+    }
+    return false;
+  };
   const goalCoordinates = new Set();
   for (const [coordinate, rawEvent] of Object.entries({ ...staticEvents, ...runtimeEvents })) {
     const match = coordinate.match(/^(\d+)\s*,\s*(\d+)$/u);
     if (!match) continue;
     if (eventActions(rawEvent).some((action) => action.type === "win")) {
+      goalCoordinates.add(coordinate);
+      terminal_goals.push({
+        kind: "location", floor_id: floorId, x: Number(match[1]), y: Number(match[2]),
+      });
+    }
+  }
+  for (const source of [definition.afterBattle, definition.afterGetItem,
+    definition.afterOpenDoor, dynamic.afterBattle, dynamic.afterGetItem, dynamic.afterOpenDoor]) {
+    if (!source || typeof source !== "object") continue;
+    for (const [coordinate, rawEvent] of Object.entries(source)) {
+      const match = coordinate.match(/^(\d+)\s*,\s*(\d+)$/u);
+      if (!match || goalCoordinates.has(coordinate)
+        || !eventActions(rawEvent).some((action) => containsWin(action))) continue;
       goalCoordinates.add(coordinate);
       terminal_goals.push({
         kind: "location", floor_id: floorId, x: Number(match[1]), y: Number(match[2]),
@@ -345,7 +386,16 @@ MotaLab.collectEngineFloor = function collectEngineFloor(
 MotaLab.parseSolverItemDelta = function parseSolverItemDelta(item, values, keySlots) {
   const zero = { hp: 0, attack: 0, defense: 0, gold: 0, experience: 0,
     keys: { yellow: 0, blue: 0, red: 0 }, inventory: {} };
-  if (!item || typeof item.item_effect !== "string" || item.complex === true) {
+  if (!item) {
+    return { supported: false, reason: "resource_effect_opaque" };
+  }
+  const keyColor = Object.entries(keySlots || {}).find(([, id]) => id === item.id)?.[0];
+  if (keyColor && Object.hasOwn(zero.keys, keyColor)) {
+    const result = MotaLab.cloneJsonValue(zero);
+    result.keys[keyColor] = 1;
+    return { supported: true, delta: result };
+  }
+  if (typeof item.item_effect !== "string" || item.complex === true) {
     return { supported: false, reason: "resource_effect_opaque" };
   }
   const statements = item.item_effect.split(";").map((value) => value.trim()).filter(Boolean);
@@ -393,7 +443,9 @@ MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = []) {
   }
   const goals = (engineModel.floors || []).flatMap((floor) => floor.terminal_goals || []);
   const floorById = new Map((engineModel.floors || []).map((floor) => [floor.floor_id, floor]));
-  if (goals.length !== 1) blockers.push({ code: "TERMINAL_UNSUPPORTED", detail: `expected_one_goal:${goals.length}` });
+  if (!goals.length || goals.length > 32) blockers.push({
+    code: "TERMINAL_UNSUPPORTED", detail: `expected_1_to_32_goals:${goals.length}`,
+  });
   const floors = (engineModel.floors || []).map((floor) => {
     const transitions = new Map((floor.change_floor || []).map((item) => [`${item.x},${item.y}`, item]));
     const blocks = (floor.blocks || []).map((block) => {
@@ -468,7 +520,10 @@ MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = []) {
     return { floor_id: floor.floor_id, width: floor.width, height: floor.height,
       topology: MotaLab.cloneJsonValue(floor.topology), blocks };
   });
-  return { protocol: 1, terminal: goals.length === 1 ? goals[0] : null, floors,
+  const terminal = goals.length === 1 ? goals[0]
+    : goals.length > 1 && goals.length <= 32
+      ? { kind: "any_location", locations: MotaLab.cloneJsonValue(goals) } : null;
+  return { protocol: 1, terminal, floors,
     shops: MotaLab.cloneJsonValue(shops.filter((shop) => shop && shop.supported === true)), blockers };
 };
 
@@ -511,13 +566,33 @@ MotaLab.collectEngineModel = function collectEngineModel(engine, keySlotIds = {}
   const floorDefinitions = detach(engine.floors);
   const statusMaps = engine.status && engine.status.maps && typeof engine.status.maps === "object"
     ? detach(engine.status.maps) : {};
-  const floorIds = [...new Set([...Object.keys(floorDefinitions), ...Object.keys(statusMaps)])].sort();
+  const availableFloorIds = new Set([...Object.keys(floorDefinitions), ...Object.keys(statusMaps)]);
+  const runtimeFloorIds = Array.isArray(engine.floorIds)
+    ? engine.floorIds.filter((id) => typeof id === "string") : [];
+  const hasAuthoritativeOrder = runtimeFloorIds.length === availableFloorIds.size
+    && new Set(runtimeFloorIds).size === runtimeFloorIds.length
+    && runtimeFloorIds.every((id) => availableFloorIds.has(id));
+  const floorIds = hasAuthoritativeOrder ? runtimeFloorIds.slice() : [...availableFloorIds].sort();
   if (!floorIds.length || floorIds.length > MotaLab.MAX_ENGINE_FLOORS) {
     fail("ENGINE_MODEL_FLOOR_LIMIT_EXCEEDED", { count: floorIds.length });
   }
-  const floors = floorIds.map((floorId) => MotaLab.collectEngineFloor(
+  let floors = floorIds.map((floorId) => MotaLab.collectEngineFloor(
     engine, floorId, floorDefinitions[floorId] || {}, statusMaps[floorId] || {}, fail,
   ));
+  const floorIndex = new Map(floorIds.map((id, index) => [id, index]));
+  floors = floors.map((floor) => ({ ...floor, change_floor: floor.change_floor.map((change) => {
+    let targetId = change.floor_id;
+    const index = floorIndex.get(floor.floor_id);
+    if (targetId === ":next") targetId = index === undefined ? null : floorIds[index + 1] || null;
+    if (targetId === ":before") targetId = index === undefined ? null : floorIds[index - 1] || null;
+    const targetDefinition = targetId && floorDefinitions[targetId];
+    const rawLanding = targetDefinition && change.stair && targetDefinition[change.stair];
+    const definedLanding = Array.isArray(rawLanding) && rawLanding.length >= 2
+      && MotaLab.isFiniteInteger(rawLanding[0]) && MotaLab.isFiniteInteger(rawLanding[1])
+      ? { x: rawLanding[0], y: rawLanding[1] } : null;
+    return { ...change, floor_id: targetId, loc: change.loc || definedLanding,
+      opaque: !targetId || !(change.loc || definedLanding) };
+  }) }));
 
   const blockSource = detach(engine.maps && engine.maps.blocksInfo || {});
   const blockPairs = Array.isArray(blockSource)
