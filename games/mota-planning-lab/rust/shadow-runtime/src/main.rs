@@ -663,6 +663,74 @@ struct SolverFloor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ConsumedBits {
+    bit_len: usize,
+    words: Arc<Vec<u64>>,
+}
+
+impl ConsumedBits {
+    fn new(bit_len: usize) -> Self {
+        Self {
+            bit_len,
+            words: Arc::new(vec![0; bit_len / 64 + usize::from(bit_len % 64 != 0)]),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_bools(values: &[bool]) -> Self {
+        let mut bits = Self::new(values.len());
+        let changes: Vec<_> = values
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, value)| value.then_some((slot, true)))
+            .collect();
+        bits.set_many(&changes)
+            .expect("slots from the bitset length are valid");
+        bits
+    }
+
+    fn read(&self, slot: usize) -> Option<bool> {
+        (slot < self.bit_len)
+            .then(|| {
+                self.words
+                    .get(slot / 64)
+                    .map(|word| word & (1u64 << (slot % 64)) != 0)
+            })
+            .flatten()
+    }
+
+    fn set(&mut self, slot: usize, value: bool) -> Result<(), ()> {
+        self.set_many(&[(slot, value)])
+    }
+
+    fn set_many(&mut self, changes: &[(usize, bool)]) -> Result<(), ()> {
+        if changes
+            .iter()
+            .any(|(slot, _)| *slot >= self.bit_len || self.words.get(*slot / 64).is_none())
+        {
+            return Err(());
+        }
+        let words = Arc::make_mut(&mut self.words);
+        for (slot, value) in changes {
+            let word = &mut words[*slot / 64];
+            let mask = 1u64 << (*slot % 64);
+            if *value {
+                *word |= mask;
+            } else {
+                *word &= !mask;
+            }
+        }
+        if let Some(last) = words.last_mut() {
+            let remainder = self.bit_len % 64;
+            if remainder != 0 {
+                *last &= (1u64 << remainder) - 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SolverState {
     floor: String,
     x: u64,
@@ -677,7 +745,7 @@ struct SolverState {
     blue: u64,
     red: u64,
     inventory: Arc<Vec<(String, u64)>>,
-    consumed: Arc<Vec<bool>>,
+    consumed: ConsumedBits,
     shop_counts: Arc<Vec<u64>>,
     flags: Arc<Vec<(String, u64)>>,
 }
@@ -688,7 +756,7 @@ struct StructuralKey {
     x: u64,
     y: u64,
     inventory: Arc<Vec<(String, u64)>>,
-    consumed: Arc<Vec<bool>>,
+    consumed: ConsumedBits,
     shop_counts: Arc<Vec<u64>>,
     level: u64,
     flags: Arc<Vec<(String, u64)>>,
@@ -918,6 +986,7 @@ fn parse_solver_world(
     (
         HashMap<String, SolverFloor>,
         Vec<SolverBlock>,
+        usize,
         Value,
         Vec<Value>,
         Vec<Value>,
@@ -1024,7 +1093,7 @@ fn parse_solver_world(
             next_slot += 1;
         }
     }
-    Ok((floors, blocks, terminal, shops, blockers))
+    Ok((floors, blocks, next_slot, terminal, shops, blockers))
 }
 
 fn transition_target(block: &SolverBlock) -> Option<(&str, u64, u64)> {
@@ -1409,20 +1478,26 @@ fn state_set(entries: &mut Arc<Vec<(String, u64)>>, id: &str, value: u64) {
 fn block_is_consumed(state: &SolverState, block: &SolverBlock) -> bool {
     block
         .state_slot
-        .and_then(|slot| state.consumed.get(slot))
-        .copied()
+        .and_then(|slot| state.consumed.read(slot))
         .unwrap_or(false)
+}
+
+fn initial_consumed_bits(blocks: &[SolverBlock], bit_len: usize) -> Result<ConsumedBits, ()> {
+    let mut consumed = ConsumedBits::new(bit_len);
+    let changes: Option<Vec<_>> = blocks
+        .iter()
+        .filter(|block| block.data.get("initial_active").and_then(Value::as_bool) == Some(false))
+        .map(|block| block.state_slot.map(|slot| (slot, true)))
+        .collect();
+    consumed.set_many(&changes.ok_or(())?)?;
+    Ok(consumed)
 }
 
 fn set_block_consumed(state: &mut SolverState, block: &SolverBlock, value: bool) -> bool {
     let Some(slot) = block.state_slot else {
         return false;
     };
-    let Some(current) = Arc::make_mut(&mut state.consumed).get_mut(slot) else {
-        return false;
-    };
-    *current = value;
-    true
+    state.consumed.set(slot, value).is_ok()
 }
 
 fn set_at(
@@ -1437,18 +1512,14 @@ fn set_at(
         .iter()
         .filter(|block| block.floor == floor && block.x == x && block.y == y)
         .collect();
-    if targets.is_empty()
-        || targets.iter().any(|block| {
-            block
-                .state_slot
-                .is_none_or(|slot| slot >= state.consumed.len())
-        })
-    {
+    let changes: Option<Vec<_>> = targets
+        .iter()
+        .map(|block| block.state_slot.map(|slot| (slot, value)))
+        .collect();
+    let Some(changes) = changes else {
         return false;
-    }
-    targets
-        .into_iter()
-        .all(|block| set_block_consumed(state, block, value))
+    };
+    !targets.is_empty() && state.consumed.set_many(&changes).is_ok()
 }
 
 fn consume_at(
@@ -1486,23 +1557,17 @@ fn replace_at(
     let replacement = targets
         .iter()
         .find(|block| block.data.get("numeric_id").and_then(Value::as_u64) == Some(numeric_id));
-    if targets.is_empty()
-        || replacement.is_none()
-        || targets.iter().any(|block| {
-            block
-                .state_slot
-                .is_none_or(|slot| slot >= state.consumed.len())
-        })
-    {
-        false
-    } else {
-        for block in &targets {
-            if !set_block_consumed(state, block, true) {
-                return false;
-            }
-        }
-        set_block_consumed(state, replacement.unwrap(), false)
-    }
+    let changes: Option<Vec<_>> = targets
+        .iter()
+        .map(|block| block.state_slot.map(|slot| (slot, true)))
+        .chain(std::iter::once(
+            replacement.and_then(|block| block.state_slot.map(|slot| (slot, false))),
+        ))
+        .collect();
+    !targets.is_empty()
+        && changes
+            .as_deref()
+            .is_some_and(|changes| state.consumed.set_many(changes).is_ok())
 }
 
 fn apply_audited_event(
@@ -1870,7 +1935,7 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         .cloned()
         .unwrap_or_default();
     let parsed = parse_solver_world(observation);
-    let Ok((floors, blocks, terminal, shops, blockers)) = parsed else {
+    let Ok((floors, blocks, state_slot_count, terminal, shops, blockers)) = parsed else {
         return json!({"scope":"global_terminal_route","proof":"unsupported","reason":parsed.unwrap_err(),
             "truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null});
     };
@@ -1925,16 +1990,14 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         blue: keys.get("blue").and_then(Value::as_u64).unwrap_or(0),
         red: keys.get("red").and_then(Value::as_u64).unwrap_or(0),
         inventory: Arc::new(inventory),
-        consumed: Arc::new(
-            blocks
-                .iter()
-                .filter_map(|block| {
-                    block.state_slot.map(|_| {
-                        block.data.get("initial_active").and_then(Value::as_bool) == Some(false)
-                    })
-                })
-                .collect(),
-        ),
+        consumed: match initial_consumed_bits(&blocks, state_slot_count) {
+            Ok(consumed) => consumed,
+            Err(()) => {
+                return json!({"scope":"global_terminal_route","proof":"unsupported",
+                "reason":"state_slot_invalid","truncated":false,"explored_states":0,
+                "blockers":source_blockers,"route":null,"first_suggestion":null});
+            }
+        },
         shop_counts: Arc::new(
             shops
                 .iter()
@@ -2343,7 +2406,7 @@ mod tests {
                 blue: 0,
                 red: 0,
                 inventory: Arc::new(Vec::new()),
-                consumed: Arc::new(Vec::new()),
+                consumed: ConsumedBits::new(0),
                 shop_counts: Arc::new(Vec::new()),
                 flags: Arc::new(Vec::new()),
             },
@@ -2449,7 +2512,7 @@ mod tests {
         }];
         let mut source = terminal_node(10, 10, 100, "root").state;
         source.yellow = 1;
-        source.consumed = Arc::new(vec![false]);
+        source.consumed = ConsumedBits::from_bools(&[false]);
         let candidate = PendingCandidate {
             source: 0,
             navigation: Arc::new(Vec::new()),
@@ -2499,20 +2562,20 @@ mod tests {
         state.x = 2;
         state.y = 3;
         state.inventory = Arc::new(vec![("book".into(), 1)]);
-        state.consumed = Arc::new(vec![false, true]);
+        state.consumed = ConsumedBits::from_bools(&[false, true]);
         state.shop_counts = Arc::new(vec![2]);
         state.level = 4;
         state.flags = Arc::new(vec![("quest".into(), 1)]);
         let key = StructuralKey::from(&state);
         let legacy = json!({"floor":state.floor,"x":state.x,"y":state.y,
-            "inventory":&*state.inventory,"consumed":&*state.consumed,
+            "inventory":&*state.inventory,"consumed":&*state.consumed.words,
             "shops":&*state.shop_counts,"level":state.level,"flags":&*state.flags});
         assert_eq!(legacy.as_object().unwrap().len(), 8);
         assert_eq!(legacy["floor"], key.floor);
         assert_eq!(legacy["x"], key.x);
         assert_eq!(legacy["y"], key.y);
         assert_eq!(legacy["inventory"], json!(&*key.inventory));
-        assert_eq!(legacy["consumed"], json!(&*key.consumed));
+        assert_eq!(legacy["consumed"], json!(&*key.consumed.words));
         assert_eq!(legacy["shops"], json!(&*key.shop_counts));
         assert_eq!(legacy["level"], key.level);
         assert_eq!(legacy["flags"], json!(&*key.flags));
@@ -2531,7 +2594,7 @@ mod tests {
         Arc::make_mut(&mut changed.inventory).push(("cross".into(), 1));
         variants.push(changed);
         let mut changed = state.clone();
-        Arc::make_mut(&mut changed.consumed)[0] = true;
+        changed.consumed.set(0, true).unwrap();
         variants.push(changed);
         let mut changed = state.clone();
         Arc::make_mut(&mut changed.shop_counts)[0] += 1;
@@ -2551,29 +2614,30 @@ mod tests {
     fn solver_state_large_collections_share_until_branch_mutation() {
         let mut parent = terminal_node(10, 10, 100, "x").state;
         parent.inventory = Arc::new(vec![("book".into(), 1)]);
-        parent.consumed = Arc::new(vec![false, false]);
+        parent.consumed = ConsumedBits::from_bools(&[false, false]);
         parent.shop_counts = Arc::new(vec![0]);
         parent.flags = Arc::new(vec![("quest".into(), 1)]);
         let mut child = parent.clone();
         assert!(Arc::ptr_eq(&parent.inventory, &child.inventory));
-        assert!(Arc::ptr_eq(&parent.consumed, &child.consumed));
+        assert!(Arc::ptr_eq(&parent.consumed.words, &child.consumed.words));
         assert!(Arc::ptr_eq(&parent.shop_counts, &child.shop_counts));
         assert!(Arc::ptr_eq(&parent.flags, &child.flags));
 
         state_set(&mut child.inventory, "cross", 1);
-        Arc::make_mut(&mut child.consumed)[0] = true;
+        child.consumed.set(0, true).unwrap();
         Arc::make_mut(&mut child.shop_counts)[0] = 1;
         state_set(&mut child.flags, "quest", 2);
         assert!(!Arc::ptr_eq(&parent.inventory, &child.inventory));
-        assert!(!Arc::ptr_eq(&parent.consumed, &child.consumed));
+        assert!(!Arc::ptr_eq(&parent.consumed.words, &child.consumed.words));
         assert!(!Arc::ptr_eq(&parent.shop_counts, &child.shop_counts));
         assert!(!Arc::ptr_eq(&parent.flags, &child.flags));
         assert_eq!(&*parent.inventory, &[("book".into(), 1)]);
-        assert_eq!(&*parent.consumed, &[false, false]);
+        assert_eq!(parent.consumed.read(0), Some(false));
+        assert_eq!(parent.consumed.read(1), Some(false));
         assert_eq!(&*parent.shop_counts, &[0]);
         assert_eq!(&*parent.flags, &[("quest".into(), 1)]);
         assert_eq!(state_count(&child.inventory, "cross"), 1);
-        assert!(child.consumed[0]);
+        assert_eq!(child.consumed.read(0), Some(true));
         assert_eq!(child.shop_counts[0], 1);
         assert_eq!(state_count(&child.flags, "quest"), 2);
     }
@@ -2665,16 +2729,53 @@ mod tests {
         ];
         let legacy = [false, true, false, false];
         let mut state = terminal_node(10, 10, 100, "x").state;
-        state.consumed = Arc::new(vec![legacy[1], legacy[2]]);
+        state.consumed = ConsumedBits::from_bools(&[legacy[1], legacy[2]]);
         for (index, block) in blocks.iter().enumerate() {
             assert_eq!(block_is_consumed(&state, block), legacy[index]);
         }
         assert!(!set_block_consumed(&mut state, &blocks[0], true));
-        assert_eq!(&*state.consumed, &[true, false]);
+        assert_eq!(state.consumed.read(0), Some(true));
+        assert_eq!(state.consumed.read(1), Some(false));
         assert!(set_block_consumed(&mut state, &blocks[2], true));
         assert!(block_is_consumed(&state, &blocks[2]));
         blocks[2].state_slot = None;
         assert!(!set_block_consumed(&mut state, &blocks[2], false));
+    }
+
+    #[test]
+    fn consumed_bits_cross_word_boundaries_and_clear_tail_bits() {
+        assert_eq!(ConsumedBits::new(754).words.len(), 12);
+        let mut bits = ConsumedBits::new(66);
+        assert_eq!(bits.words.len(), 2);
+        bits.set_many(&[(63, true), (64, true), (65, true)])
+            .unwrap();
+        assert_eq!(bits.read(62), Some(false));
+        assert_eq!(bits.read(63), Some(true));
+        assert_eq!(bits.read(64), Some(true));
+        assert_eq!(bits.read(65), Some(true));
+        assert_eq!(bits.read(66), None);
+        assert_eq!(bits.words[1], 0b11);
+
+        assert!(bits.set(66, true).is_err());
+        assert_eq!(bits.words[1], 0b11);
+    }
+
+    #[test]
+    fn consumed_bits_batch_preflight_is_atomic_and_cow_isolated() {
+        let mut parent = ConsumedBits::new(66);
+        let before = parent.words.clone();
+        assert!(parent.set_many(&[(1, true), (66, true)]).is_err());
+        assert!(Arc::ptr_eq(&before, &parent.words));
+        assert_eq!(parent.read(1), Some(false));
+
+        let mut child = parent.clone();
+        assert!(Arc::ptr_eq(&parent.words, &child.words));
+        child.set_many(&[(1, true), (65, true)]).unwrap();
+        assert!(!Arc::ptr_eq(&parent.words, &child.words));
+        assert_eq!(parent.read(1), Some(false));
+        assert_eq!(parent.read(65), Some(false));
+        assert_eq!(child.read(1), Some(true));
+        assert_eq!(child.read(65), Some(true));
     }
 
     fn transition_block(
@@ -2762,7 +2863,7 @@ mod tests {
         state.floor = "A".into();
         state.x = 0;
         state.y = 0;
-        state.consumed = Arc::new(vec![false]);
+        state.consumed = ConsumedBits::from_bools(&[false]);
         let terminals = [("B", (3, 0))];
         let closed = index.view(&state, &floors, &blocks, &terminals);
         assert_eq!(
@@ -2810,7 +2911,7 @@ mod tests {
         state.floor = "A".into();
         state.x = 2;
         state.y = 0;
-        state.consumed = Arc::new(vec![false]);
+        state.consumed = ConsumedBits::from_bools(&[false]);
         let view = index.view(&state, &floors, &blocks, &[]);
         assert_eq!(
             view.boundaries
@@ -2936,7 +3037,7 @@ mod tests {
             data: json!({"initial_active":false}),
             state_slot: Some(1),
         };
-        state.consumed = Arc::new(vec![false, true]);
+        state.consumed = ConsumedBits::from_bools(&[false, true]);
         let details = apply_audited_event(&mut state, &block, 0, &[block.clone(), target]).unwrap();
         assert_eq!(details["event_id"], "fairy_mt0");
         assert_eq!(state.attack.get(), 20.0 * 4.0 / 3.0);
@@ -2974,13 +3075,13 @@ mod tests {
         };
         let blocks = vec![gate_once.clone(), gate_retry.clone(), wand];
         let mut once = terminal_node(10, 10, 100, "x").state;
-        once.consumed = Arc::new(vec![false; 3]);
+        once.consumed = ConsumedBits::from_bools(&[false; 3]);
         assert!(apply_audited_event(&mut once, &gate_once, 0, &blocks).is_some());
-        assert!(once.consumed[0]);
+        assert_eq!(once.consumed.read(0), Some(true));
         let mut retry = terminal_node(10, 10, 100, "x").state;
-        retry.consumed = Arc::new(vec![false; 3]);
+        retry.consumed = ConsumedBits::from_bools(&[false; 3]);
         assert!(apply_audited_event(&mut retry, &gate_retry, 1, &blocks).is_none());
-        assert!(!retry.consumed[1]);
+        assert_eq!(retry.consumed.read(1), Some(false));
     }
 
     #[test]
@@ -3003,7 +3104,7 @@ mod tests {
         let floors = HashMap::from([("F".into(), floor)]);
         let mut state = terminal_node(10, 10, 100, "x").state;
         state.floor = "F".into();
-        state.consumed = Arc::new(vec![true]);
+        state.consumed = ConsumedBits::from_bools(&[true]);
         let index = ConnectivityIndex::new(&floors, std::slice::from_ref(&block));
         let (reachable, _) = index.local_reachable(&state, "F", (state.x, state.y), &[block]);
         assert!(reachable[2]);
@@ -3065,10 +3166,10 @@ mod tests {
         state.floor = "MT_1".into();
         state.x = 6;
         state.y = 5;
-        state.consumed = Arc::new(
-            (0..blocks.len())
+        state.consumed = ConsumedBits::from_bools(
+            &(0..blocks.len())
                 .map(|index| index > 0 && index % 2 == 0)
-                .collect(),
+                .collect::<Vec<_>>(),
         );
         assert!(apply_audited_event(&mut state, &gate, 0, &blocks).is_some());
         for (x, y, _, new) in positions {
@@ -3076,7 +3177,10 @@ mod tests {
                 .iter()
                 .enumerate()
                 .filter(|(index, block)| {
-                    block.floor == "MT_1" && block.x == x && block.y == y && !state.consumed[*index]
+                    block.floor == "MT_1"
+                        && block.x == x
+                        && block.y == y
+                        && state.consumed.read(*index) == Some(false)
                 })
                 .collect();
             assert_eq!(active.len(), 1);
@@ -3099,7 +3203,7 @@ mod tests {
             .position(|block| block.data["numeric_id"] == 258)
             .unwrap();
         assert!(enemy_loss(&state, &blocks[octopus].data["enemy"]).is_some());
-        Arc::make_mut(&mut state.consumed)[octopus] = true;
+        state.consumed.set(octopus, true).unwrap();
         let (reachable, _) = index.local_reachable(&state, "MT_1", (state.x, state.y), &blocks);
         assert!(reachable[4 * 13 + 6]);
     }
@@ -3146,11 +3250,11 @@ mod tests {
         let mut state = terminal_node(10, 10, 100, "x").state;
         state.flags = Arc::new(vec![("switch:MT4:6,1:A".into(), 2)]);
         state.inventory = Arc::new(vec![("icePickaxe".into(), 1)]);
-        state.consumed = Arc::new(vec![false; blocks.len()]);
+        state.consumed = ConsumedBits::from_bools(&vec![false; blocks.len()]);
         assert!(apply_audited_event(&mut state, &thief, 0, &blocks).is_some());
-        assert!(!state.consumed[1]);
-        assert!(state.consumed[2]);
-        assert!(state.consumed[3]);
+        assert_eq!(state.consumed.read(1), Some(false));
+        assert_eq!(state.consumed.read(2), Some(true));
+        assert_eq!(state.consumed.read(3), Some(true));
         assert_eq!(state_count(&state.inventory, "icePickaxe"), 0);
 
         let princess = SolverBlock {
@@ -3163,7 +3267,7 @@ mod tests {
             state_slot: Some(4),
         };
         state.flags = Arc::new(vec![("switch:MT18:6,5:A".into(), 1)]);
-        Arc::make_mut(&mut state.consumed).push(false);
+        state.consumed = ConsumedBits::from_bools(&[false; 5]);
         let princess_blocks = [blocks, vec![princess.clone()]].concat();
         assert!(apply_audited_event(&mut state, &princess, 4, &princess_blocks).is_none());
     }
