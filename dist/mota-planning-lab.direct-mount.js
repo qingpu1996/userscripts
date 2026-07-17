@@ -690,7 +690,14 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
           MotaLab.parseRestrictedShop(id, raw, flagValues)
         ));
         const shops = parsedShops.filter((shop) => shop.supported);
-        if (engineModel) engineModel.solver_model = MotaLab.buildSolverModel(engineModel, parsedShops);
+        if (engineModel) {
+          const solverFlags = MotaLab.projectSolverFlags(flagValues);
+          engineModel.solver_model = MotaLab.buildSolverModel(engineModel, parsedShops, {
+            level: Number.isSafeInteger(runtime.status.hero && runtime.status.hero.lv)
+              && runtime.status.hero.lv >= 0 ? runtime.status.hero.lv : 0,
+            flags: solverFlags,
+          });
+        }
         const activeMenus = shops.map((shop) => MotaLab.readRestrictedShopMenu(runtime, shop))
           .filter(Boolean);
         return {
@@ -837,6 +844,79 @@ MotaLab.parseRestrictedShop = function parseRestrictedShop(shopId, rawShop, flag
   if (!Array.isArray(rawShop.choices) || rawShop.choices.length < 1 || rawShop.choices.length > 32) {
     return reject("SHOP_CHOICES_INVALID");
   }
+  const auditedSpecs = {
+    expShop1: [
+      { currency: "experience", cost: 100, effects: { level: 1, hp: 1000, attack: 7, defense: 7 } },
+      { currency: "experience", cost: 30, effects: { attack: 5 } },
+      { currency: "experience", cost: 30, effects: { defense: 5 } },
+    ],
+    expShop2: [
+      { currency: "experience", cost: 270, effects: { level: 3, hp: 3000, attack: 20, defense: 20 } },
+      { currency: "experience", cost: 95, effects: { attack: 17 } },
+      { currency: "experience", cost: 95, effects: { defense: 17 } },
+    ],
+    keyShop1: [
+      { currency: "gold", cost: 10, effects: { yellow: 1 } },
+      { currency: "gold", cost: 50, effects: { blue: 1 } },
+      { currency: "gold", cost: 100, effects: { red: 1 } },
+    ],
+    keyShop2: [
+      { currency: "yellow", cost: 1, effects: { gold: 7 } },
+      { currency: "blue", cost: 1, effects: { gold: 35 } },
+      { currency: "red", cost: 1, effects: { gold: 70 } },
+    ],
+  };
+  const audited = auditedSpecs[shopId];
+  if (audited) {
+    if (rawShop.choices.length !== audited.length) return reject("SHOP_CHOICES_INVALID");
+    const choices = audited.map((spec, index) => {
+      const raw = rawShop.choices[index];
+      if (!raw || typeof raw.text !== "string" || !Array.isArray(raw.action)) return null;
+      const compact = (value) => typeof value === "string" ? value.replace(/[\s()]/gu, "") : "";
+      const fieldName = { level: "status:lv", hp: "status:hp", attack: "status:atk",
+        defense: "status:def", gold: "status:money", yellow: "item:yellowKey",
+        blue: "item:blueKey", red: "item:redKey" };
+      const currencyName = { gold: "status:money", experience: "status:exp",
+        yellow: "item:yellowKey", blue: "item:blueKey", red: "item:redKey" }[spec.currency];
+      const expectedEffects = Object.entries(spec.effects);
+      let valid = false;
+      if (shopId === "keyShop2") {
+        const branch = raw.action.length === 1 && raw.action[0] && raw.action[0].type === "if"
+          && compact(raw.action[0].condition) === `${currencyName}>=1`
+          && Array.isArray(raw.action[0].true) ? raw.action[0].true : null;
+        valid = compact(raw.need) === "true" && branch && branch.length === 3
+          && branch[0].type === "setValue" && branch[0].name === currencyName
+          && branch[0].operator === "-=" && compact(branch[0].value) === "1"
+          && branch[1].type === "setValue" && branch[1].name === "status:money"
+          && branch[1].operator === "+=" && compact(branch[1].value) === String(spec.effects.gold)
+          && branch[2].type === "setValue" && branch[2].operator === "+="
+          && compact(branch[2].value) === "1";
+      } else {
+        const expectedNeed = `${currencyName}>=${spec.cost}`;
+        valid = compact(raw.need) === expectedNeed && raw.action.length === expectedEffects.length + 2
+          && raw.action[0].type === "setValue" && raw.action[0].name === currencyName
+          && raw.action[0].operator === "-=" && compact(raw.action[0].value) === String(spec.cost)
+          && expectedEffects.every(([field, amount], offset) => {
+            const action = raw.action[offset + 1];
+            return action && action.type === "setValue" && action.name === fieldName[field]
+              && action.operator === "+=" && compact(action.value) === String(amount);
+          })
+          && raw.action.at(-1).type === "setValue" && raw.action.at(-1).operator === "+="
+          && compact(raw.action.at(-1).value) === "1";
+      }
+      if (!valid) return null;
+      return {
+        choice_id: `${shopId}:${index}:${spec.currency}:${spec.cost}`,
+        index, text: raw.text, cost: spec.cost, base_cost: spec.cost,
+        increment_per_purchase: 0, currency: spec.currency,
+        effects: Object.entries(spec.effects).map(([field, amount]) => ({ field, amount })),
+        counter_flag: `${shopId}:${index}`, purchase_count: 0,
+      };
+    });
+    return choices.every(Boolean)
+      ? { supported: true, shop_id: shopId, repeatable: true, choices }
+      : reject("SHOP_EFFECT_UNSUPPORTED");
+  }
   const choices = [];
   const parseCost = (expression) => {
     const source = expression.replace(/\s+/gu, "");
@@ -914,7 +994,7 @@ MotaLab.parseRestrictedShop = function parseRestrictedShop(shopId, rawShop, flag
         : `${shopId}:${index}:${effect.field}:${effect.amount}:${price.base_cost}:${price.increment_per_purchase}`,
       index, text: choice.text, cost, base_cost: price.base_cost,
       increment_per_purchase: price.increment_per_purchase, effect, counter_flag: counter,
-      purchase_count: count,
+      purchase_count: count, currency: "gold", effects: [effect],
     });
   }
   return { supported: true, shop_id: shopId, repeatable: true, choices };
@@ -1215,7 +1295,7 @@ MotaLab.collectEngineFloor = function collectEngineFloor(
   }
   const blocks = blockValues.map((raw) => {
     const event = raw && raw.event && typeof raw.event === "object" ? raw.event : {};
-    if (!raw || raw.disable === true || event.disable === true) return null;
+    if (!raw) return null;
     const numericId = raw.numeric_id !== undefined ? raw.numeric_id
       : typeof raw.id === "number" ? raw.id : raw.number !== undefined ? raw.number : event.number;
     const id = event.id !== undefined ? event.id : raw.id;
@@ -1236,7 +1316,7 @@ MotaLab.collectEngineFloor = function collectEngineFloor(
       } : {}),
       no_pass: Boolean(event.noPass !== undefined ? event.noPass
         : raw.noPass !== undefined ? raw.noPass : raw.no_pass),
-      disabled: false,
+      disabled: raw.disable === true || event.disable === true || event.enable === false,
     };
   }).filter(Boolean).sort((left, right) => left.y - right.y || left.x - right.x);
   const changeSource = definition.changeFloor || dynamic.changeFloor || {};
@@ -1349,7 +1429,7 @@ MotaLab.collectEngineFloor = function collectEngineFloor(
 
 MotaLab.parseSolverItemDelta = function parseSolverItemDelta(item, values, keySlots) {
   const zero = { hp: 0, attack: 0, defense: 0, gold: 0, experience: 0,
-    keys: { yellow: 0, blue: 0, red: 0 }, inventory: {} };
+    level: 0, keys: { yellow: 0, blue: 0, red: 0 }, inventory: {} };
   if (!item) {
     return { supported: false, reason: "resource_effect_opaque" };
   }
@@ -1358,6 +1438,24 @@ MotaLab.parseSolverItemDelta = function parseSolverItemDelta(item, values, keySl
     const result = MotaLab.cloneJsonValue(zero);
     result.keys[keyColor] = 1;
     return { supported: true, delta: result };
+  }
+  // These ids are audited against the structured itemEffect definitions of games/24.
+  // Keep the projection deliberately finite: new ids or changed scripts still fail closed.
+  const audited = {
+    bigKey: { keys: { yellow: 1, blue: 1, red: 1 } },
+    centerFly: { level: 1, hp: 1000, attack: 10, defense: 10 },
+    superPotion: { multiply: { hp: 2 } },
+    skill1: {},
+    wand: {},
+  }[item.id];
+  if (audited) {
+    const delta = MotaLab.cloneJsonValue(zero);
+    if (audited.keys) Object.assign(delta.keys, audited.keys);
+    for (const field of ["level", "hp", "attack", "defense"]) {
+      if (audited[field]) delta[field] = audited[field];
+    }
+    if (audited.multiply) delta.multiply = MotaLab.cloneJsonValue(audited.multiply);
+    return { supported: true, delta };
   }
   if (typeof item.item_effect !== "string" || item.complex === true) {
     return { supported: false, reason: "resource_effect_opaque" };
@@ -1395,7 +1493,34 @@ MotaLab.parseSolverItemDelta = function parseSolverItemDelta(item, values, keySl
   return { supported: true, delta: result };
 };
 
-MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = []) {
+MotaLab.auditedSolverEvent = function auditedSolverEvent(floorId, x, y) {
+  const id = ({
+    "MT0:5,9": "fairy_mt0", "MT1:2,11": "book_reward",
+    "MT2:8,11": "sword2_reward", "MT2:10,11": "shield2_reward",
+    "MT4:6,1": "thief_quest", "MT7:6,5": "cross_reward",
+    "MT9:1,1": "fly_reward", "MT12:11,1": "ice_pickaxe_reward",
+    "MT15:5,4": "exp_sword_trade", "MT15:7,4": "gold_shield_trade",
+    "MT16:5,5": "ice_wand_reward", "MT16:6,5": "dialogue_once",
+    "MT18:6,5": "princess_quest", "MT19:6,8": "dialogue_once",
+    "MT22:6,3": "wand_gate_remove_on_failure", "MT22:7,3": "wand_gate_retry",
+  })[`${floorId}:${x},${y}`];
+  return id ? { id } : null;
+};
+
+MotaLab.projectSolverFlags = function projectSolverFlags(flagValues) {
+  const source = flagValues && typeof flagValues === "object" ? flagValues : {};
+  const projected = {};
+  for (const [floorId, x, y] of [["MT4", 6, 1], ["MT18", 6, 5]]) {
+    const rawKey = `${floorId}@${x}@${y}@A`;
+    const value = source[rawKey];
+    if (value === true || value === false || (Number.isSafeInteger(value) && value >= 0)) {
+      projected[`switch:${floorId}:${x},${y}:A`] = value;
+    }
+  }
+  return projected;
+};
+
+MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = [], runtimeFacts = {}) {
   if (!engineModel || typeof engineModel !== "object") return null;
   const blockCatalog = new Map((engineModel.blocks || []).map((block) => [block.numeric_id, block]));
   const items = new Map((engineModel.items || []).map((item) => [item.id, item]));
@@ -1416,9 +1541,10 @@ MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = []) {
       const catalog = blockCatalog.get(block.numeric_id) || {};
       const trigger = block.trigger || catalog.trigger;
       const base = { floor_id: floor.floor_id, x: block.x, y: block.y,
-        block_id: block.id, numeric_id: block.numeric_id };
-      if (trigger === "changeFloor") {
-        const transition = transitions.get(`${block.x},${block.y}`);
+        block_id: block.id, numeric_id: block.numeric_id, initial_active: block.disabled !== true };
+      const coordinateTransition = transitions.get(`${block.x},${block.y}`);
+      if (trigger === "changeFloor" || coordinateTransition) {
+        const transition = coordinateTransition;
         let landing = transition && transition.loc;
         if (!landing && transition && transition.floor_id && transition.stair) {
           const targetFloor = floorById.get(transition.floor_id);
@@ -1442,6 +1568,10 @@ MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = []) {
         for (const [slot, count] of Object.entries(catalog.door_info && catalog.door_info.keys || {})) {
           const color = Object.entries(engineModel.inventory.key_slots || {})
             .find(([, id]) => id === slot)?.[0];
+          if (slot === "specialKey" && count === 1) {
+            return { ...base, kind: "door", key_cost: costs,
+              inventory_cost: { specialKey: 1 } };
+          }
           if (!color || !Object.hasOwn(costs, color)) {
             blockers.push({ code: "DOOR_UNSUPPORTED", detail: block.id });
             return { ...base, kind: "opaque", reason: "door_key_unknown" };
@@ -1473,15 +1603,38 @@ MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = []) {
         return { ...base, kind: "opaque", reason: "wall" };
       }
       if (trigger) {
-        blockers.push({ code: "EVENT_UNSUPPORTED", detail: `${floor.floor_id}:${block.x},${block.y}` });
+        const event = MotaLab.auditedSolverEvent(floor.floor_id, block.x, block.y);
+        if (event) return { ...base, kind: "event", event };
         return { ...base, kind: "opaque", reason: "event_unsupported" };
       }
       return { ...base, kind: "terrain" };
     });
+    if (floor.floor_id === "MT_1") {
+      for (const [x, y, numericId] of [
+        [5, 2, 181], [6, 2, 182], [7, 2, 183],
+        [5, 3, 184], [6, 3, 185], [7, 3, 186],
+        [5, 4, 187], [6, 4, 258], [7, 4, 188],
+      ]) {
+        const catalog = blockCatalog.get(numericId);
+        if (!catalog) continue;
+        const replacement = { floor_id: floor.floor_id, x, y, block_id: catalog.id,
+          numeric_id: numericId, initial_active: false };
+        if (numericId === 258) {
+          const enemy = enemies.get("octopus");
+          if (enemy && enemy.attack !== null && enemy.defense !== null && !(enemy.special || []).length) {
+            blocks.push({ ...replacement, kind: "enemy", enemy: MotaLab.cloneJsonValue(enemy) });
+          }
+        } else {
+          blocks.push({ ...replacement, kind: "terrain" });
+        }
+      }
+    }
     for (const event of floor.opaque_events || []) {
-      blockers.push({ code: "EVENT_UNSUPPORTED", detail: `${floor.floor_id}:${event.x},${event.y}` });
-      blocks.push({ floor_id: floor.floor_id, x: event.x, y: event.y, block_id: "opaqueEvent",
-        numeric_id: 0, kind: "opaque", reason: event.reason });
+      if (blocks.some((block) => block.x === event.x && block.y === event.y)) continue;
+      const audited = MotaLab.auditedSolverEvent(floor.floor_id, event.x, event.y);
+      blocks.push({ floor_id: floor.floor_id, x: event.x, y: event.y,
+        block_id: audited ? audited.id : "opaqueEvent", numeric_id: 0,
+        kind: audited ? "event" : "opaque", ...(audited ? { event: audited } : { reason: event.reason }) });
     }
     return { floor_id: floor.floor_id, width: floor.width, height: floor.height,
       topology: MotaLab.cloneJsonValue(floor.topology), blocks };
@@ -1490,6 +1643,10 @@ MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = []) {
     : goals.length > 1 && goals.length <= 32
       ? { kind: "any_location", locations: MotaLab.cloneJsonValue(goals) } : null;
   return { protocol: 1, terminal, floors,
+    initial: { level: MotaLab.isFiniteInteger(runtimeFacts.level) && runtimeFacts.level >= 0
+      ? runtimeFacts.level : 0,
+    flags: runtimeFacts.flags && typeof runtimeFacts.flags === "object"
+      ? MotaLab.cloneJsonValue(runtimeFacts.flags) : {} },
     shops: MotaLab.cloneJsonValue(shops.filter((shop) => shop && shop.supported === true)), blockers };
 };
 
@@ -2470,11 +2627,11 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
         || !MotaLab.isFiniteInteger(global.explored_states) || global.explored_states < 0
         || !Array.isArray(global.blockers) || global.blockers.length > 65536
         || !(global.terminal_hp === undefined
-          || (MotaLab.isFiniteInteger(global.terminal_hp) && global.terminal_hp > 0))
+          || (typeof global.terminal_hp === "number" && Number.isFinite(global.terminal_hp) && global.terminal_hp > 0))
         || !(global.terminal_attack === undefined
-          || (MotaLab.isFiniteInteger(global.terminal_attack) && global.terminal_attack >= 0))
+          || (typeof global.terminal_attack === "number" && Number.isFinite(global.terminal_attack) && global.terminal_attack >= 0))
         || !(global.terminal_defense === undefined
-          || (MotaLab.isFiniteInteger(global.terminal_defense) && global.terminal_defense >= 0))) {
+          || (typeof global.terminal_defense === "number" && Number.isFinite(global.terminal_defense) && global.terminal_defense >= 0))) {
         throw new TypeError("Invalid global shadow analysis");
       }
       for (const blocker of global.blockers) {
@@ -2496,7 +2653,7 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
           || typeof step.floor_id !== "string" || step.floor_id.length < 1) {
           throw new TypeError("Invalid global shadow step");
         }
-        const positioned = ["door", "enemy", "resource", "transition"].includes(step.step_kind);
+        const positioned = ["door", "enemy", "resource", "transition", "event"].includes(step.step_kind);
         const required = positioned
           ? ["step_kind", "floor_id", "x", "y", "block_id", "details"]
           : step.step_kind === "shop"
@@ -2518,11 +2675,12 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
           MotaLab.validateResponseKeys(step.details.key_cost, "door key_cost");
         } else if (step.step_kind === "enemy") {
           MotaLab.assertProtocolShape(step.details, ["hp_loss"], [], "enemy details");
-          if (!MotaLab.isFiniteInteger(step.details.hp_loss) || step.details.hp_loss < 0) throw new TypeError("Invalid enemy details");
+          if (typeof step.details.hp_loss !== "number" || !Number.isFinite(step.details.hp_loss)
+            || step.details.hp_loss < 0) throw new TypeError("Invalid enemy details");
         } else if (step.step_kind === "resource") {
           MotaLab.assertProtocolShape(step.details,
-            ["hp", "attack", "defense", "gold", "experience", "keys", "inventory"], [], "resource details");
-          for (const field of ["hp", "attack", "defense", "gold", "experience"]) {
+            ["hp", "attack", "defense", "gold", "experience", "level", "keys", "inventory"], ["multiply"], "resource details");
+          for (const field of ["hp", "attack", "defense", "gold", "experience", "level"]) {
             if (!MotaLab.isFiniteInteger(step.details[field]) || step.details[field] < 0) throw new TypeError("Invalid resource details");
           }
           MotaLab.validateResponseKeys(step.details.keys, "resource keys");
@@ -2532,15 +2690,18 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
           }
         } else if (step.step_kind === "shop") {
           MotaLab.assertProtocolShape(step.details,
-            ["cost", "purchase_count_before", "field", "amount"], [], "shop details");
+            ["currency", "cost", "purchase_count_before", "effects"], [], "shop details");
           if (typeof step.shop_id !== "string" || typeof step.choice_id !== "string"
             || !MotaLab.isFiniteInteger(step.details.cost) || step.details.cost < 1
             || !MotaLab.isFiniteInteger(step.details.purchase_count_before)
             || step.details.purchase_count_before < 0
-            || !new Set(["hp", "attack", "defense"]).has(step.details.field)
-            || !MotaLab.isFiniteInteger(step.details.amount) || step.details.amount < 1) {
+            || !new Set(["gold", "experience", "yellow", "blue", "red"]).has(step.details.currency)
+            || !Array.isArray(step.details.effects) || step.details.effects.length < 1) {
             throw new TypeError("Invalid shop step");
           }
+        } else if (step.step_kind === "event") {
+          MotaLab.assertProtocolShape(step.details, ["event_id"], [], "event details");
+          MotaLab.validateProtocolString(step.details.event_id, "event_id", 1, 128);
         } else if (Object.keys(step.details).length !== 0) {
           throw new TypeError("Invalid empty global step details");
         }

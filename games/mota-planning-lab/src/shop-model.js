@@ -7,6 +7,79 @@ MotaLab.parseRestrictedShop = function parseRestrictedShop(shopId, rawShop, flag
   if (!Array.isArray(rawShop.choices) || rawShop.choices.length < 1 || rawShop.choices.length > 32) {
     return reject("SHOP_CHOICES_INVALID");
   }
+  const auditedSpecs = {
+    expShop1: [
+      { currency: "experience", cost: 100, effects: { level: 1, hp: 1000, attack: 7, defense: 7 } },
+      { currency: "experience", cost: 30, effects: { attack: 5 } },
+      { currency: "experience", cost: 30, effects: { defense: 5 } },
+    ],
+    expShop2: [
+      { currency: "experience", cost: 270, effects: { level: 3, hp: 3000, attack: 20, defense: 20 } },
+      { currency: "experience", cost: 95, effects: { attack: 17 } },
+      { currency: "experience", cost: 95, effects: { defense: 17 } },
+    ],
+    keyShop1: [
+      { currency: "gold", cost: 10, effects: { yellow: 1 } },
+      { currency: "gold", cost: 50, effects: { blue: 1 } },
+      { currency: "gold", cost: 100, effects: { red: 1 } },
+    ],
+    keyShop2: [
+      { currency: "yellow", cost: 1, effects: { gold: 7 } },
+      { currency: "blue", cost: 1, effects: { gold: 35 } },
+      { currency: "red", cost: 1, effects: { gold: 70 } },
+    ],
+  };
+  const audited = auditedSpecs[shopId];
+  if (audited) {
+    if (rawShop.choices.length !== audited.length) return reject("SHOP_CHOICES_INVALID");
+    const choices = audited.map((spec, index) => {
+      const raw = rawShop.choices[index];
+      if (!raw || typeof raw.text !== "string" || !Array.isArray(raw.action)) return null;
+      const compact = (value) => typeof value === "string" ? value.replace(/[\s()]/gu, "") : "";
+      const fieldName = { level: "status:lv", hp: "status:hp", attack: "status:atk",
+        defense: "status:def", gold: "status:money", yellow: "item:yellowKey",
+        blue: "item:blueKey", red: "item:redKey" };
+      const currencyName = { gold: "status:money", experience: "status:exp",
+        yellow: "item:yellowKey", blue: "item:blueKey", red: "item:redKey" }[spec.currency];
+      const expectedEffects = Object.entries(spec.effects);
+      let valid = false;
+      if (shopId === "keyShop2") {
+        const branch = raw.action.length === 1 && raw.action[0] && raw.action[0].type === "if"
+          && compact(raw.action[0].condition) === `${currencyName}>=1`
+          && Array.isArray(raw.action[0].true) ? raw.action[0].true : null;
+        valid = compact(raw.need) === "true" && branch && branch.length === 3
+          && branch[0].type === "setValue" && branch[0].name === currencyName
+          && branch[0].operator === "-=" && compact(branch[0].value) === "1"
+          && branch[1].type === "setValue" && branch[1].name === "status:money"
+          && branch[1].operator === "+=" && compact(branch[1].value) === String(spec.effects.gold)
+          && branch[2].type === "setValue" && branch[2].operator === "+="
+          && compact(branch[2].value) === "1";
+      } else {
+        const expectedNeed = `${currencyName}>=${spec.cost}`;
+        valid = compact(raw.need) === expectedNeed && raw.action.length === expectedEffects.length + 2
+          && raw.action[0].type === "setValue" && raw.action[0].name === currencyName
+          && raw.action[0].operator === "-=" && compact(raw.action[0].value) === String(spec.cost)
+          && expectedEffects.every(([field, amount], offset) => {
+            const action = raw.action[offset + 1];
+            return action && action.type === "setValue" && action.name === fieldName[field]
+              && action.operator === "+=" && compact(action.value) === String(amount);
+          })
+          && raw.action.at(-1).type === "setValue" && raw.action.at(-1).operator === "+="
+          && compact(raw.action.at(-1).value) === "1";
+      }
+      if (!valid) return null;
+      return {
+        choice_id: `${shopId}:${index}:${spec.currency}:${spec.cost}`,
+        index, text: raw.text, cost: spec.cost, base_cost: spec.cost,
+        increment_per_purchase: 0, currency: spec.currency,
+        effects: Object.entries(spec.effects).map(([field, amount]) => ({ field, amount })),
+        counter_flag: `${shopId}:${index}`, purchase_count: 0,
+      };
+    });
+    return choices.every(Boolean)
+      ? { supported: true, shop_id: shopId, repeatable: true, choices }
+      : reject("SHOP_EFFECT_UNSUPPORTED");
+  }
   const choices = [];
   const parseCost = (expression) => {
     const source = expression.replace(/\s+/gu, "");
@@ -84,7 +157,7 @@ MotaLab.parseRestrictedShop = function parseRestrictedShop(shopId, rawShop, flag
         : `${shopId}:${index}:${effect.field}:${effect.amount}:${price.base_cost}:${price.increment_per_purchase}`,
       index, text: choice.text, cost, base_cost: price.base_cost,
       increment_per_purchase: price.increment_per_purchase, effect, counter_flag: counter,
-      purchase_count: count,
+      purchase_count: count, currency: "gold", effects: [effect],
     });
   }
   return { supported: true, shop_id: shopId, repeatable: true, choices };

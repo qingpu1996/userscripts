@@ -212,8 +212,9 @@ test("完整 engine_model 采集多地图、13x13、异形拓扑和动态 blocks
   assert.equal(model.floors.find((floor) => floor.floor_id === "MT2").height, 13);
   assert.equal(model.floors.find((floor) => floor.floor_id === "MT1A").topology.kind, "valid_cells");
   assert.equal(model.floors.find((floor) => floor.floor_id === "MT1A").topology.valid_cells.length, 6);
-  assert.equal(model.floors.find((floor) => floor.floor_id === "MT0").blocks.length, 1);
+  assert.equal(model.floors.find((floor) => floor.floor_id === "MT0").blocks.length, 2);
   assert.equal(model.floors.find((floor) => floor.floor_id === "MT0").blocks[0].id, "yellowDoor");
+  assert.equal(model.floors.find((floor) => floor.floor_id === "MT0").blocks[1].disabled, true);
   assert.equal(model.floors.find((floor) => floor.floor_id === "MT0").change_floor[0].floor_id, "MT1A");
   assert.equal(model.blocks.find((block) => block.id === "yellowDoor").trigger, null);
   assert.deepEqual(JSON.parse(JSON.stringify(
@@ -324,7 +325,7 @@ test("solver 投影只接受可证明的资源增量并保留未知脚本 blocke
     complex: false,
   }, { redGem: 3 }, keySlots))), {
     supported: true,
-    delta: { hp: 0, attack: 3, defense: 0, gold: 0, experience: 0,
+    delta: { hp: 0, attack: 3, defense: 0, gold: 0, experience: 0, level: 0,
       keys: { yellow: 1, blue: 0, red: 0 }, inventory: {} },
   });
   assert.deepEqual(JSON.parse(JSON.stringify(lab.parseSolverItemDelta(
@@ -400,9 +401,68 @@ test("solver 商店仅绑定运行态 event.data 的唯一严格 openShop", () =
   assert.equal(solver.floors[0].blocks[0].shop_id, "moneyShop");
   assert.equal(solver.shops[0].choices[0].purchase_count, 2);
   assert.equal(solver.floors[0].blocks[1].kind, "opaque");
-  assert.deepEqual(JSON.parse(JSON.stringify(solver.blockers)), [{
-    code: "EVENT_UNSUPPORTED", detail: "F:2,0",
-  }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(solver.blockers)), []);
+});
+
+test("审计资源、特殊门与事件投影为有限 solver 语义，未知事件仅局部 opaque", () => {
+  const keySlots = { yellow: "yellowKey", blue: "blueKey", red: "redKey" };
+  const big = lab.parseSolverItemDelta({ id: "bigKey" }, {}, keySlots).delta;
+  const potion = lab.parseSolverItemDelta({ id: "superPotion" }, {}, keySlots).delta;
+  const feather = lab.parseSolverItemDelta({ id: "centerFly" }, {}, keySlots).delta;
+  assert.deepEqual(JSON.parse(JSON.stringify(big.keys)), { yellow: 1, blue: 1, red: 1 });
+  assert.deepEqual(JSON.parse(JSON.stringify(potion.multiply)), { hp: 2 });
+  assert.deepEqual([feather.level, feather.hp, feather.attack, feather.defense], [1, 1000, 10, 10]);
+  assert.equal(lab.auditedSolverEvent("MT0", 5, 9).id, "fairy_mt0");
+  assert.equal(lab.auditedSolverEvent("MT0", 1, 1), null);
+  const floor = { floor_id: "MT2", width: 3, height: 1, topology: { kind: "rectangle" },
+    terminal_goals: [{ kind: "location", floor_id: "MT2", x: 0, y: 0 }], change_floor: [],
+    opaque_events: [{ x: 1, y: 0, reason: "event_script" }],
+    blocks: [{ x: 2, y: 0, numeric_id: 85, id: "specialDoor", trigger: "openDoor", no_pass: true }] };
+  const solver = lab.buildSolverModel({ floors: [floor], blocks: [{ numeric_id: 85,
+    id: "specialDoor", trigger: "openDoor", door_info: { keys: { specialKey: 1 } } }],
+  items: [], enemies: [], values: {}, inventory: { key_slots: keySlots } });
+  assert.deepEqual(JSON.parse(JSON.stringify(solver.floors[0].blocks[0].inventory_cost)), { specialKey: 1 });
+  assert.equal(solver.floors[0].blocks[1].kind, "opaque");
+  assert.deepEqual(JSON.parse(JSON.stringify(solver.blockers)), []);
+});
+
+test("floor-local switch:A 只从引擎真实 prefix flag key 显式投影", () => {
+  assert.deepEqual(JSON.parse(JSON.stringify(lab.projectSolverFlags({
+    "MT4@6@1@A": 2,
+    "MT18@6@5@A": true,
+    "switch:MT4:6,1:A": 99,
+    "MT4@6@2@A": 7,
+  }))), {
+    "switch:MT4:6,1:A": 2,
+    "switch:MT18:6,5:A": true,
+  });
+});
+
+test("MT22 成功事件预投影 MT_1 九格精确替换身份与 octopus 战斗语义", () => {
+  const oldIds = [189, 190, 191, 192, 193, 194, 195, 257, 196];
+  const positions = [[5, 2], [6, 2], [7, 2], [5, 3], [6, 3], [7, 3], [5, 4], [6, 4], [7, 4]];
+  const replacements = [181, 182, 183, 184, 185, 186, 187, 258, 188];
+  const blocks = oldIds.map((numeric_id, index) => ({ x: positions[index][0], y: positions[index][1],
+    numeric_id, id: numeric_id === 257 ? "magicDragon" : `old${numeric_id}`,
+    trigger: numeric_id === 257 ? "battle" : null, no_pass: numeric_id === 257 }));
+  const catalog = [...oldIds, ...replacements].map((numeric_id) => ({ numeric_id,
+    id: numeric_id === 258 ? "octopus" : numeric_id === 257 ? "magicDragon" : `tile${numeric_id}`,
+    trigger: numeric_id === 257 ? "battle" : null }));
+  const solver = lab.buildSolverModel({ floors: [{ floor_id: "MT_1", width: 13, height: 13,
+    topology: { kind: "rectangle" }, terminal_goals: [{ kind: "location", floor_id: "MT_1", x: 6, y: 6 }],
+    opaque_events: [], change_floor: [], blocks }], blocks: catalog, items: [], values: {},
+  enemies: [{ id: "magicDragon", hp: 99999, attack: 9999, defense: 5000, gold: 0, experience: 0, special: [] },
+    { id: "octopus", hp: 99999, attack: 5000, defense: 4000, gold: 0, experience: 0, special: [] }],
+  inventory: { key_slots: {} } }, []);
+  const projected = solver.floors[0].blocks.filter((block) => positions.some(
+    ([x, y]) => block.x === x && block.y === y,
+  ));
+  assert.equal(projected.length, 18);
+  const inactive = projected.filter((block) => block.initial_active === false);
+  assert.deepEqual(inactive.map((block) => block.numeric_id), replacements);
+  assert.equal(inactive.find((block) => block.numeric_id === 258).block_id, "octopus");
+  assert.equal(inactive.find((block) => block.numeric_id === 258).kind, "enemy");
+  assert.equal(inactive.find((block) => block.numeric_id === 258).enemy.defense, 4000);
 });
 
 test("普通静态历史事件不会重建 blocker，当前运行态事件仍阻路，静态 win 仍可作终局", () => {

@@ -645,9 +645,10 @@ struct SolverState {
     floor: String,
     x: u64,
     y: u64,
-    hp: u64,
-    attack: u64,
-    defense: u64,
+    hp: F64Bits,
+    attack: F64Bits,
+    defense: F64Bits,
+    level: u64,
     gold: u64,
     experience: u64,
     yellow: u64,
@@ -656,6 +657,28 @@ struct SolverState {
     inventory: Vec<(String, u64)>,
     consumed: Vec<bool>,
     shop_counts: Vec<u64>,
+    flags: Vec<(String, u64)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct F64Bits(u64);
+
+impl F64Bits {
+    fn new(value: f64) -> Option<Self> {
+        (value.is_finite() && value >= 0.0).then_some(Self(value.to_bits()))
+    }
+    fn get(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+    fn add(self, value: f64) -> Option<Self> {
+        Self::new(self.get() + value)
+    }
+    fn mul(self, value: f64) -> Option<Self> {
+        Self::new(self.get() * value)
+    }
+    fn div(self, value: f64) -> Option<Self> {
+        Self::new(self.get() / value)
+    }
 }
 
 #[derive(Clone)]
@@ -667,13 +690,20 @@ struct SearchNode {
 fn terminal_route_is_better(candidate: &SearchNode, current: &SearchNode) -> bool {
     let score = |node: &SearchNode| {
         (
-            u128::from(node.state.attack) + u128::from(node.state.defense),
-            node.state.attack.min(node.state.defense),
-            node.state.hp,
+            node.state.attack.get() + node.state.defense.get(),
+            node.state.attack.get().min(node.state.defense.get()),
+            node.state.hp.get(),
         )
     };
-    score(candidate) > score(current)
-        || (score(candidate) == score(current)
+    let left = score(candidate);
+    let right = score(current);
+    let ordering = left
+        .0
+        .total_cmp(&right.0)
+        .then(left.1.total_cmp(&right.1))
+        .then(left.2.total_cmp(&right.2));
+    ordering.is_gt()
+        || (ordering.is_eq()
             && serde_json::to_string(&candidate.steps).unwrap()
                 < serde_json::to_string(&current.steps).unwrap())
 }
@@ -806,8 +836,7 @@ fn reachable_cells(
         .filter_map(|index| {
             let block = &blocks[*index];
             let consumed = state.consumed.get(*index).copied().unwrap_or(false);
-            ((!consumed && block.kind != "terrain" && block.kind != "shop")
-                || block.kind == "opaque")
+            (!consumed && block.kind != "terrain" && block.kind != "shop")
                 .then_some((block.x, block.y))
         })
         .collect();
@@ -851,15 +880,36 @@ fn add_delta(state: &mut SolverState, delta: &Value) -> Result<(), String> {
         .as_object()
         .ok_or_else(|| "resource_delta_invalid".to_owned())?;
     for (name, target) in [
-        ("hp", &mut state.hp),
-        ("attack", &mut state.attack),
-        ("defense", &mut state.defense),
         ("gold", &mut state.gold),
         ("experience", &mut state.experience),
     ] {
         *target = target
             .checked_add(delta.get(name).and_then(Value::as_u64).unwrap_or(0))
             .ok_or_else(|| "stat_overflow".to_owned())?;
+    }
+    for (name, target) in [
+        ("hp", &mut state.hp),
+        ("attack", &mut state.attack),
+        ("defense", &mut state.defense),
+    ] {
+        *target = target
+            .add(delta.get(name).and_then(Value::as_f64).unwrap_or(0.0))
+            .ok_or_else(|| "stat_overflow".to_owned())?;
+    }
+    state.level = state
+        .level
+        .checked_add(delta.get("level").and_then(Value::as_u64).unwrap_or(0))
+        .ok_or_else(|| "stat_overflow".to_owned())?;
+    if let Some(multiply) = delta.get("multiply").and_then(Value::as_object) {
+        for (name, target) in [
+            ("hp", &mut state.hp),
+            ("attack", &mut state.attack),
+            ("defense", &mut state.defense),
+        ] {
+            *target = target
+                .mul(multiply.get(name).and_then(Value::as_f64).unwrap_or(1.0))
+                .ok_or_else(|| "stat_overflow".to_owned())?;
+        }
     }
     if let Some(keys) = delta.get("keys").and_then(Value::as_object) {
         state.yellow += keys.get("yellow").and_then(Value::as_u64).unwrap_or(0);
@@ -876,26 +926,220 @@ fn add_delta(state: &mut SolverState, delta: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn enemy_loss(state: &SolverState, enemy: &Value) -> Option<u64> {
+fn enemy_loss(state: &SolverState, enemy: &Value) -> Option<f64> {
     let enemy = enemy.as_object()?;
     let hp = enemy.get("hp")?.as_u64()?;
     let attack = enemy.get("attack")?.as_u64()?;
     let defense = enemy.get("defense")?.as_u64()?;
-    let hero_damage = state.attack.checked_sub(defense)?;
-    if hero_damage == 0 {
+    let hero_damage = state.attack.get() - defense as f64;
+    if hero_damage <= 0.0 {
         return None;
     }
-    let rounds = (hp + hero_damage - 1) / hero_damage;
-    Some(
-        rounds
-            .saturating_sub(1)
-            .saturating_mul(attack.saturating_sub(state.defense)),
-    )
+    let rounds = (hp as f64 / hero_damage).ceil();
+    Some((rounds - 1.0).max(0.0) * (attack as f64 - state.defense.get()).max(0.0))
 }
 
 fn step_json(kind: &str, block: &SolverBlock, details: Value) -> Value {
     json!({"step_kind":kind,"floor_id":block.floor,"x":block.x,"y":block.y,
         "block_id":block.id,"details":details})
+}
+
+fn state_count(entries: &[(String, u64)], id: &str) -> u64 {
+    entries
+        .iter()
+        .find(|(name, _)| name == id)
+        .map(|(_, value)| *value)
+        .unwrap_or(0)
+}
+
+fn state_set(entries: &mut Vec<(String, u64)>, id: &str, value: u64) {
+    let mut map: BTreeMap<String, u64> = entries.iter().cloned().collect();
+    if value == 0 {
+        map.remove(id);
+    } else {
+        map.insert(id.to_owned(), value);
+    }
+    *entries = map.into_iter().collect();
+}
+
+fn consume_at(state: &mut SolverState, blocks: &[SolverBlock], floor: &str, x: u64, y: u64) {
+    for (index, block) in blocks.iter().enumerate() {
+        if block.floor == floor && block.x == x && block.y == y {
+            state.consumed[index] = true;
+        }
+    }
+}
+
+fn activate_at(state: &mut SolverState, blocks: &[SolverBlock], floor: &str, x: u64, y: u64) {
+    for (index, block) in blocks.iter().enumerate() {
+        if block.floor == floor && block.x == x && block.y == y {
+            state.consumed[index] = false;
+        }
+    }
+}
+
+fn replace_at(
+    state: &mut SolverState,
+    blocks: &[SolverBlock],
+    floor: &str,
+    x: u64,
+    y: u64,
+    numeric_id: u64,
+) -> bool {
+    let mut replacement = None;
+    for (index, block) in blocks.iter().enumerate() {
+        if block.floor == floor && block.x == x && block.y == y {
+            state.consumed[index] = true;
+            if block.data.get("numeric_id").and_then(Value::as_u64) == Some(numeric_id) {
+                replacement = Some(index);
+            }
+        }
+    }
+    if let Some(index) = replacement {
+        state.consumed[index] = false;
+        true
+    } else {
+        false
+    }
+}
+
+fn apply_audited_event(
+    state: &mut SolverState,
+    block: &SolverBlock,
+    block_index: usize,
+    blocks: &[SolverBlock],
+) -> Option<Value> {
+    let id = block.data.get("event")?.get("id")?.as_str()?;
+    let add_item = |state: &mut SolverState, name: &str, amount: u64| {
+        let old = state_count(&state.inventory, name);
+        state_set(&mut state.inventory, name, old.saturating_add(amount));
+    };
+    let consume_item = |state: &mut SolverState, name: &str, amount: u64| -> bool {
+        let old = state_count(&state.inventory, name);
+        if old < amount {
+            return false;
+        }
+        state_set(&mut state.inventory, name, old - amount);
+        true
+    };
+    match id {
+        "fairy_mt0" => {
+            if state_count(&state.flags, "16") == 1 {
+                state_set(&mut state.flags, "16", 0);
+                state_set(&mut state.flags, "22", 1);
+            } else if consume_item(state, "cross", 1) {
+                state.hp = state.hp.mul(4.0)?.div(3.0)?;
+                state.attack = state.attack.mul(4.0)?.div(3.0)?;
+                state.defense = state.defense.mul(4.0)?.div(3.0)?;
+                state.consumed[block_index] = true;
+                activate_at(state, blocks, "MT20", 6, 8);
+            } else {
+                return None;
+            }
+        }
+        "book_reward" => {
+            add_item(state, "book", 1);
+            state.consumed[block_index] = true;
+        }
+        "sword2_reward" => {
+            state.attack = state.attack.add(70.0)?;
+            state.consumed[block_index] = true;
+        }
+        "shield2_reward" => {
+            state.defense = state.defense.add(30.0)?;
+            state.consumed[block_index] = true;
+        }
+        "cross_reward" => {
+            add_item(state, "cross", 1);
+            state.consumed[block_index] = true;
+            consume_at(state, blocks, "MT16", 5, 5);
+        }
+        "fly_reward" => {
+            add_item(state, "fly", 1);
+            state_set(&mut state.flags, "fly", 1);
+            state.consumed[block_index] = true;
+        }
+        "ice_pickaxe_reward" => {
+            add_item(state, "icePickaxe", 1);
+            state.consumed[block_index] = true;
+        }
+        "exp_sword_trade" => {
+            if state.experience < 500 {
+                return None;
+            }
+            state.experience -= 500;
+            state.attack = state.attack.add(120.0)?;
+            state.consumed[block_index] = true;
+        }
+        "gold_shield_trade" => {
+            if state.gold < 500 {
+                return None;
+            }
+            state.gold -= 500;
+            state.defense = state.defense.add(120.0)?;
+            state.consumed[block_index] = true;
+        }
+        "ice_wand_reward" => {
+            state_set(&mut state.flags, "16", 1);
+            state.consumed[block_index] = true;
+        }
+        "dialogue_once" => {
+            state.consumed[block_index] = true;
+        }
+        "thief_quest" => {
+            if state_count(&state.flags, "switch:MT4:6,1:A") == 0 {
+                state_set(&mut state.flags, "switch:MT4:6,1:A", 1);
+                consume_at(state, blocks, "MT2", 2, 7);
+            } else if consume_item(state, "icePickaxe", 1) {
+                consume_at(state, blocks, "MT18", 6, 9);
+                consume_at(state, blocks, "MT18", 6, 10);
+                state.consumed[block_index] = true;
+            } else {
+                return None;
+            }
+        }
+        "princess_quest" => {
+            if state_count(&state.flags, "switch:MT18:6,5:A") > 0 {
+                return None;
+            }
+            state_set(&mut state.flags, "switch:MT18:6,5:A", 1);
+            activate_at(state, blocks, "MT18", 11, 11);
+        }
+        "wand_gate_remove_on_failure" | "wand_gate_retry" => {
+            let missing = blocks.iter().enumerate().any(|(index, candidate)| {
+                ((candidate.floor == "MT23w" && candidate.x == 5 && candidate.y == 6)
+                    || (candidate.floor == "MT23e" && candidate.x == 7 && candidate.y == 6))
+                    && !state.consumed[index]
+            });
+            if missing {
+                if id == "wand_gate_remove_on_failure" {
+                    state.consumed[block_index] = true;
+                } else {
+                    return None;
+                }
+            } else {
+                state_set(&mut state.flags, "final_wand_gate", 1);
+                state.consumed[block_index] = true;
+                for (x, y, numeric_id) in [
+                    (5, 2, 181),
+                    (6, 2, 182),
+                    (7, 2, 183),
+                    (5, 3, 184),
+                    (6, 3, 185),
+                    (7, 3, 186),
+                    (5, 4, 187),
+                    (6, 4, 258),
+                    (7, 4, 188),
+                ] {
+                    if !replace_at(state, blocks, "MT_1", x, y, numeric_id) {
+                        return None;
+                    }
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(json!({"event_id":id}))
 }
 
 fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
@@ -944,16 +1188,29 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
             .to_owned(),
         x: loc.get("x").and_then(Value::as_u64).unwrap_or(0),
         y: loc.get("y").and_then(Value::as_u64).unwrap_or(0),
-        hp: hero.get("hp").and_then(Value::as_u64).unwrap_or(0),
-        attack: hero.get("attack").and_then(Value::as_u64).unwrap_or(0),
-        defense: hero.get("defense").and_then(Value::as_u64).unwrap_or(0),
+        hp: F64Bits::new(hero.get("hp").and_then(Value::as_f64).unwrap_or(0.0)).unwrap(),
+        attack: F64Bits::new(hero.get("attack").and_then(Value::as_f64).unwrap_or(0.0)).unwrap(),
+        defense: F64Bits::new(hero.get("defense").and_then(Value::as_f64).unwrap_or(0.0)).unwrap(),
+        level: observation
+            .get("engine_model")
+            .and_then(Value::as_object)
+            .and_then(|m| m.get("solver_model"))
+            .and_then(Value::as_object)
+            .and_then(|m| m.get("initial"))
+            .and_then(Value::as_object)
+            .and_then(|i| i.get("level"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         gold: hero.get("gold").and_then(Value::as_u64).unwrap_or(0),
         experience: hero.get("experience").and_then(Value::as_u64).unwrap_or(0),
         yellow: keys.get("yellow").and_then(Value::as_u64).unwrap_or(0),
         blue: keys.get("blue").and_then(Value::as_u64).unwrap_or(0),
         red: keys.get("red").and_then(Value::as_u64).unwrap_or(0),
         inventory,
-        consumed: vec![false; blocks.len()],
+        consumed: blocks
+            .iter()
+            .map(|block| block.data.get("initial_active").and_then(Value::as_bool) == Some(false))
+            .collect(),
         shop_counts: shops
             .iter()
             .flat_map(|shop| {
@@ -969,6 +1226,25 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     .unwrap_or(0)
             })
             .collect(),
+        flags: observation
+            .get("engine_model")
+            .and_then(Value::as_object)
+            .and_then(|m| m.get("solver_model"))
+            .and_then(Value::as_object)
+            .and_then(|m| m.get("initial"))
+            .and_then(Value::as_object)
+            .and_then(|i| i.get("flags"))
+            .and_then(Value::as_object)
+            .map(|flags| {
+                flags
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        let number = value.as_u64().or_else(|| value.as_bool().map(u64::from))?;
+                        Some((name.clone(), number))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
     let terminal_object = terminal.as_object().unwrap();
     let terminal_values: Vec<&Value> =
@@ -1005,7 +1281,7 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         steps: Vec::new(),
     }]);
     let mut seen = HashSet::new();
-    let mut dominance: HashMap<String, Vec<[u64; 8]>> = HashMap::new();
+    let mut dominance: HashMap<String, Vec<[f64; 8]>> = HashMap::new();
     let mut explored = 0usize;
     let mut best: Option<SearchNode> = None;
     let mut budget_exhausted = false;
@@ -1018,16 +1294,17 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
             continue;
         }
         let structural=json!({"floor":node.state.floor,"x":node.state.x,"y":node.state.y,
-            "inventory":node.state.inventory,"consumed":node.state.consumed,"shops":node.state.shop_counts}).to_string();
+            "inventory":node.state.inventory,"consumed":node.state.consumed,"shops":node.state.shop_counts,
+            "level":node.state.level,"flags":node.state.flags}).to_string();
         let resources = [
-            node.state.hp,
-            node.state.attack,
-            node.state.defense,
-            node.state.gold,
-            node.state.experience,
-            node.state.yellow,
-            node.state.blue,
-            node.state.red,
+            node.state.hp.get(),
+            node.state.attack.get(),
+            node.state.defense.get(),
+            node.state.gold as f64,
+            node.state.experience as f64,
+            node.state.yellow as f64,
+            node.state.blue as f64,
+            node.state.red as f64,
         ];
         let frontier = dominance.entry(structural).or_default();
         if frontier.iter().any(|old| {
@@ -1082,9 +1359,30 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     if next.state.yellow < y || next.state.blue < b || next.state.red < r {
                         continue;
                     }
+                    let mut inventory: BTreeMap<String, u64> =
+                        next.state.inventory.iter().cloned().collect();
+                    let inventory_cost =
+                        block.data.get("inventory_cost").and_then(Value::as_object);
+                    if inventory_cost.is_some_and(|costs| {
+                        costs.iter().any(|(id, count)| {
+                            inventory.get(id).copied().unwrap_or(0)
+                                < count.as_u64().unwrap_or(u64::MAX)
+                        })
+                    }) {
+                        continue;
+                    }
                     next.state.yellow -= y;
                     next.state.blue -= b;
                     next.state.red -= r;
+                    if let Some(costs) = inventory_cost {
+                        for (id, count) in costs {
+                            *inventory.entry(id.clone()).or_default() -= count.as_u64().unwrap();
+                        }
+                    }
+                    next.state.inventory = inventory
+                        .into_iter()
+                        .filter(|(_, count)| *count > 0)
+                        .collect();
                     next.state.consumed[index] = true;
                     details = json!({"key_cost":{"yellow":y,"blue":b,"red":r}});
                 }
@@ -1099,10 +1397,10 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     let Some(loss) = enemy_loss(&next.state, &block.data["enemy"]) else {
                         continue;
                     };
-                    if loss >= next.state.hp {
+                    if loss >= next.state.hp.get() {
                         continue;
                     }
-                    next.state.hp -= loss;
+                    next.state.hp = F64Bits::new(next.state.hp.get() - loss).unwrap();
                     next.state.gold += block.data["enemy"]["gold"].as_u64().unwrap_or(0);
                     next.state.experience +=
                         block.data["enemy"]["experience"].as_u64().unwrap_or(0);
@@ -1114,6 +1412,14 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     next.state.floor = target["floor_id"].as_str().unwrap_or_default().to_owned();
                     next.state.x = target["x"].as_u64().unwrap_or(0);
                     next.state.y = target["y"].as_u64().unwrap_or(0);
+                }
+                "event" => {
+                    let Some(event_details) =
+                        apply_audited_event(&mut next.state, block, index, &blocks)
+                    else {
+                        continue;
+                    };
+                    details = event_details;
                 }
                 _ => continue,
             }
@@ -1152,21 +1458,68 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     }) else {
                         continue;
                     };
-                    if node.state.gold < cost {
-                        continue;
-                    }
                     let mut next = node.clone();
-                    next.state.gold -= cost;
-                    let field = choice["effect"]["field"].as_str().unwrap_or_default();
-                    let amount = choice["effect"]["amount"].as_u64().unwrap_or(0);
-                    match field {
-                        "hp" => next.state.hp += amount,
-                        "attack" => next.state.attack += amount,
-                        "defense" => next.state.defense += amount,
+                    let currency = choice
+                        .get("currency")
+                        .and_then(Value::as_str)
+                        .unwrap_or("gold");
+                    let balance = match currency {
+                        "gold" => next.state.gold,
+                        "experience" => next.state.experience,
+                        "yellow" => next.state.yellow,
+                        "blue" => next.state.blue,
+                        "red" => next.state.red,
                         _ => continue,
                     };
+                    if balance < cost {
+                        continue;
+                    }
+                    match currency {
+                        "gold" => next.state.gold -= cost,
+                        "experience" => next.state.experience -= cost,
+                        "yellow" => next.state.yellow -= cost,
+                        "blue" => next.state.blue -= cost,
+                        "red" => next.state.red -= cost,
+                        _ => unreachable!(),
+                    }
+                    let effects: Vec<Value> = choice
+                        .get("effects")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_else(|| vec![choice["effect"].clone()]);
+                    let mut valid = true;
+                    for effect in &effects {
+                        let field = effect["field"].as_str().unwrap_or_default();
+                        let amount = effect["amount"].as_u64().unwrap_or(0);
+                        match field {
+                            "level" => next.state.level = next.state.level.saturating_add(amount),
+                            "hp" => next.state.hp = next.state.hp.add(amount as f64).unwrap(),
+                            "attack" => {
+                                next.state.attack = next.state.attack.add(amount as f64).unwrap()
+                            }
+                            "defense" => {
+                                next.state.defense = next.state.defense.add(amount as f64).unwrap()
+                            }
+                            "gold" => next.state.gold = next.state.gold.saturating_add(amount),
+                            "experience" => {
+                                next.state.experience = next.state.experience.saturating_add(amount)
+                            }
+                            "yellow" => {
+                                next.state.yellow = next.state.yellow.saturating_add(amount)
+                            }
+                            "blue" => next.state.blue = next.state.blue.saturating_add(amount),
+                            "red" => next.state.red = next.state.red.saturating_add(amount),
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        continue;
+                    }
                     next.state.shop_counts[choice_offset + local] += 1;
-                    next.steps.push(json!({"step_kind":"shop","floor_id":node.state.floor,"shop_id":shop_id,"choice_id":choice["choice_id"],"details":{"cost":cost,"purchase_count_before":purchase_count,"field":field,"amount":amount}}));
+                    next.steps.push(json!({"step_kind":"shop","floor_id":node.state.floor,"shop_id":shop_id,"choice_id":choice["choice_id"],"details":{"currency":currency,"cost":cost,"purchase_count_before":purchase_count,"effects":effects}}));
                     queue.push_back(next);
                 }
             }
@@ -1179,8 +1532,8 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
     } else if let Some(best) = best {
         let first = best.steps.first().cloned();
         json!({"scope":"global_terminal_route","proof":"proven","reason":"complete terminal route found","truncated":false,
-        "explored_states":explored,"terminal_hp":best.state.hp,"terminal_attack":best.state.attack,
-        "terminal_defense":best.state.defense,"blockers":blockers,"route":{"step_count":best.steps.len(),"steps":best.steps},"first_suggestion":first})
+        "explored_states":explored,"terminal_hp":best.state.hp.get(),"terminal_attack":best.state.attack.get(),
+        "terminal_defense":best.state.defense.get(),"blockers":blockers,"route":{"step_count":best.steps.len(),"steps":best.steps},"first_suggestion":first})
     } else {
         json!({"scope":"global_terminal_route","proof":if blockers.is_empty(){"unproven"}else{"unsupported"},"reason":"no_complete_supported_route",
         "truncated":false,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null})
@@ -1368,9 +1721,10 @@ mod tests {
                 floor: "F".to_owned(),
                 x: 0,
                 y: 0,
-                hp,
-                attack,
-                defense,
+                hp: F64Bits::new(hp as f64).unwrap(),
+                attack: F64Bits::new(attack as f64).unwrap(),
+                defense: F64Bits::new(defense as f64).unwrap(),
+                level: 0,
                 gold: 0,
                 experience: 0,
                 yellow: 0,
@@ -1379,6 +1733,7 @@ mod tests {
                 inventory: Vec::new(),
                 consumed: Vec::new(),
                 shop_counts: Vec::new(),
+                flags: Vec::new(),
             },
             steps: vec![json!({"route": route})],
         }
@@ -1406,6 +1761,245 @@ mod tests {
 
         let overflow_safe = terminal_node(u64::MAX, u64::MAX, 1, "a");
         assert!(terminal_route_is_better(&overflow_safe, &stronger));
+    }
+
+    #[test]
+    fn audited_resource_math_keeps_javascript_fractional_number_semantics() {
+        let mut state = terminal_node(10, 11, 1001, "x").state;
+        add_delta(
+            &mut state,
+            &json!({"hp":1000,"attack":10,"defense":10,
+            "gold":0,"experience":0,"level":1,"keys":{"yellow":1,"blue":1,"red":1},
+            "inventory":{},"multiply":{"hp":2}}),
+        )
+        .unwrap();
+        assert_eq!(state.level, 1);
+        assert_eq!(state.hp.get(), 4002.0);
+        assert_eq!((state.yellow, state.blue, state.red), (1, 1, 1));
+        state_set(&mut state.inventory, "cross", 1);
+        let block = SolverBlock {
+            floor: "MT0".into(),
+            x: 5,
+            y: 9,
+            id: "fairy".into(),
+            kind: "event".into(),
+            data: json!({"event":{"id":"fairy_mt0"}}),
+        };
+        state.consumed = vec![false];
+        let details =
+            apply_audited_event(&mut state, &block, 0, std::slice::from_ref(&block)).unwrap();
+        assert_eq!(details["event_id"], "fairy_mt0");
+        assert_eq!(state.attack.get(), 20.0 * 4.0 / 3.0);
+        assert!(!state.attack.get().fract().eq(&0.0));
+    }
+
+    #[test]
+    fn audited_wand_gate_preserves_the_two_failure_behaviors() {
+        let gate_once = SolverBlock {
+            floor: "MT22".into(),
+            x: 6,
+            y: 3,
+            id: "fairy".into(),
+            kind: "event".into(),
+            data: json!({"event":{"id":"wand_gate_remove_on_failure"}}),
+        };
+        let gate_retry = SolverBlock {
+            floor: "MT22".into(),
+            x: 7,
+            y: 3,
+            id: "fairy".into(),
+            kind: "event".into(),
+            data: json!({"event":{"id":"wand_gate_retry"}}),
+        };
+        let wand = SolverBlock {
+            floor: "MT23w".into(),
+            x: 5,
+            y: 6,
+            id: "skill1".into(),
+            kind: "resource".into(),
+            data: json!({}),
+        };
+        let blocks = vec![gate_once.clone(), gate_retry.clone(), wand];
+        let mut once = terminal_node(10, 10, 100, "x").state;
+        once.consumed = vec![false; 3];
+        assert!(apply_audited_event(&mut once, &gate_once, 0, &blocks).is_some());
+        assert!(once.consumed[0]);
+        let mut retry = terminal_node(10, 10, 100, "x").state;
+        retry.consumed = vec![false; 3];
+        assert!(apply_audited_event(&mut retry, &gate_retry, 1, &blocks).is_none());
+        assert!(!retry.consumed[1]);
+    }
+
+    #[test]
+    fn consumed_opaque_blocks_no_longer_obstruct_reachability() {
+        let block = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "old-event".into(),
+            kind: "opaque".into(),
+            data: json!({"numeric_id":99}),
+        };
+        let floor = SolverFloor {
+            width: 3,
+            height: 1,
+            cells: HashSet::from([(0, 0), (1, 0), (2, 0)]),
+            blocks: vec![0],
+        };
+        let mut state = terminal_node(10, 10, 100, "x").state;
+        state.floor = "F".into();
+        state.consumed = vec![true];
+        assert!(
+            reachable_cells(&state, &HashMap::from([("F".into(), floor)]), &[block])
+                .contains(&(2, 0))
+        );
+    }
+
+    #[test]
+    fn audited_wand_success_replaces_nine_blocks_and_octopus_remains_fightable() {
+        let gate = SolverBlock {
+            floor: "MT22".into(),
+            x: 7,
+            y: 3,
+            id: "fairy".into(),
+            kind: "event".into(),
+            data: json!({"numeric_id":0,"event":{"id":"wand_gate_retry"}}),
+        };
+        let positions = [
+            (5, 2, 189, 181),
+            (6, 2, 190, 182),
+            (7, 2, 191, 183),
+            (5, 3, 192, 184),
+            (6, 3, 193, 185),
+            (7, 3, 194, 186),
+            (5, 4, 195, 187),
+            (6, 4, 257, 258),
+            (7, 4, 196, 188),
+        ];
+        let mut blocks = vec![gate.clone()];
+        for (x, y, old, new) in positions {
+            blocks.push(SolverBlock {
+                floor: "MT_1".into(),
+                x,
+                y,
+                id: format!("old{old}"),
+                kind: if old == 257 { "enemy" } else { "terrain" }.into(),
+                data: json!({"numeric_id":old}),
+            });
+            blocks.push(SolverBlock {
+                floor: "MT_1".into(),
+                x,
+                y,
+                id: if new == 258 {
+                    "octopus".into()
+                } else {
+                    format!("new{new}")
+                },
+                kind: if new == 258 { "enemy" } else { "terrain" }.into(),
+                data: if new == 258 {
+                    json!({"numeric_id":258,"enemy":{"hp":99999,"attack":5000,
+                        "defense":4000,"gold":0,"experience":0}})
+                } else {
+                    json!({"numeric_id":new})
+                },
+            });
+        }
+        let mut state = terminal_node(5001, 5000, 200000, "x").state;
+        state.floor = "MT_1".into();
+        state.x = 6;
+        state.y = 5;
+        state.consumed = (0..blocks.len())
+            .map(|index| index > 0 && index % 2 == 0)
+            .collect();
+        assert!(apply_audited_event(&mut state, &gate, 0, &blocks).is_some());
+        for (x, y, _, new) in positions {
+            let active: Vec<_> = blocks
+                .iter()
+                .enumerate()
+                .filter(|(index, block)| {
+                    block.floor == "MT_1" && block.x == x && block.y == y && !state.consumed[*index]
+                })
+                .collect();
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].1.data["numeric_id"], new);
+        }
+        let floor_indices: Vec<_> = (1..blocks.len()).collect();
+        let floor = SolverFloor {
+            width: 13,
+            height: 13,
+            cells: (0..13).flat_map(|y| (0..13).map(move |x| (x, y))).collect(),
+            blocks: floor_indices,
+        };
+        let floors = HashMap::from([("MT_1".into(), floor)]);
+        let reachable = reachable_cells(&state, &floors, &blocks);
+        assert!(reachable.contains(&(5, 4)));
+        assert!(!reachable.contains(&(6, 4)));
+        let octopus = blocks
+            .iter()
+            .position(|block| block.data["numeric_id"] == 258)
+            .unwrap();
+        assert!(enemy_loss(&state, &blocks[octopus].data["enemy"]).is_some());
+        state.consumed[octopus] = true;
+        assert!(reachable_cells(&state, &floors, &blocks).contains(&(6, 4)));
+    }
+
+    #[test]
+    fn nonzero_floor_local_switches_take_the_already_started_event_branches() {
+        let thief = SolverBlock {
+            floor: "MT4".into(),
+            x: 6,
+            y: 1,
+            id: "thief".into(),
+            kind: "event".into(),
+            data: json!({"event":{"id":"thief_quest"}}),
+        };
+        let mt2_door = SolverBlock {
+            floor: "MT2".into(),
+            x: 2,
+            y: 7,
+            id: "door".into(),
+            kind: "door".into(),
+            data: json!({}),
+        };
+        let road_a = SolverBlock {
+            floor: "MT18".into(),
+            x: 6,
+            y: 9,
+            id: "wall".into(),
+            kind: "opaque".into(),
+            data: json!({}),
+        };
+        let road_b = SolverBlock {
+            floor: "MT18".into(),
+            x: 6,
+            y: 10,
+            id: "wall".into(),
+            kind: "opaque".into(),
+            data: json!({}),
+        };
+        let blocks = vec![thief.clone(), mt2_door, road_a, road_b];
+        let mut state = terminal_node(10, 10, 100, "x").state;
+        state.flags = vec![("switch:MT4:6,1:A".into(), 2)];
+        state.inventory = vec![("icePickaxe".into(), 1)];
+        state.consumed = vec![false; blocks.len()];
+        assert!(apply_audited_event(&mut state, &thief, 0, &blocks).is_some());
+        assert!(!state.consumed[1]);
+        assert!(state.consumed[2]);
+        assert!(state.consumed[3]);
+        assert_eq!(state_count(&state.inventory, "icePickaxe"), 0);
+
+        let princess = SolverBlock {
+            floor: "MT18".into(),
+            x: 6,
+            y: 5,
+            id: "princess".into(),
+            kind: "event".into(),
+            data: json!({"event":{"id":"princess_quest"}}),
+        };
+        state.flags = vec![("switch:MT18:6,5:A".into(), 1)];
+        state.consumed.push(false);
+        let princess_blocks = [blocks, vec![princess.clone()]].concat();
+        assert!(apply_audited_event(&mut state, &princess, 4, &princess_blocks).is_none());
     }
 
     fn request() -> Vec<u8> {
@@ -1529,9 +2123,9 @@ mod tests {
         .unwrap();
         let global = &response["shadow"]["analysis"]["global"];
         assert_eq!(global["proof"], "proven");
-        assert_eq!(global["terminal_hp"], 19);
-        assert_eq!(global["terminal_attack"], 15);
-        assert_eq!(global["terminal_defense"], 5);
+        assert_eq!(global["terminal_hp"], 19.0);
+        assert_eq!(global["terminal_attack"], 15.0);
+        assert_eq!(global["terminal_defense"], 5.0);
         let kinds: Vec<_> = global["route"]["steps"]
             .as_array()
             .unwrap()
@@ -1670,14 +2264,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(complete["shadow"]["analysis"]["global"]["proof"], "proven");
-        assert_eq!(complete["shadow"]["analysis"]["global"]["terminal_hp"], 21);
+        assert_eq!(
+            complete["shadow"]["analysis"]["global"]["terminal_hp"],
+            21.0
+        );
         assert_eq!(
             complete["shadow"]["analysis"]["global"]["terminal_attack"],
-            1
+            1.0
         );
         assert_eq!(
             complete["shadow"]["analysis"]["global"]["terminal_defense"],
-            1
+            1.0
         );
     }
 

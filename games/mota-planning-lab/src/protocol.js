@@ -409,11 +409,11 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
         || !MotaLab.isFiniteInteger(global.explored_states) || global.explored_states < 0
         || !Array.isArray(global.blockers) || global.blockers.length > 65536
         || !(global.terminal_hp === undefined
-          || (MotaLab.isFiniteInteger(global.terminal_hp) && global.terminal_hp > 0))
+          || (typeof global.terminal_hp === "number" && Number.isFinite(global.terminal_hp) && global.terminal_hp > 0))
         || !(global.terminal_attack === undefined
-          || (MotaLab.isFiniteInteger(global.terminal_attack) && global.terminal_attack >= 0))
+          || (typeof global.terminal_attack === "number" && Number.isFinite(global.terminal_attack) && global.terminal_attack >= 0))
         || !(global.terminal_defense === undefined
-          || (MotaLab.isFiniteInteger(global.terminal_defense) && global.terminal_defense >= 0))) {
+          || (typeof global.terminal_defense === "number" && Number.isFinite(global.terminal_defense) && global.terminal_defense >= 0))) {
         throw new TypeError("Invalid global shadow analysis");
       }
       for (const blocker of global.blockers) {
@@ -435,7 +435,7 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
           || typeof step.floor_id !== "string" || step.floor_id.length < 1) {
           throw new TypeError("Invalid global shadow step");
         }
-        const positioned = ["door", "enemy", "resource", "transition"].includes(step.step_kind);
+        const positioned = ["door", "enemy", "resource", "transition", "event"].includes(step.step_kind);
         const required = positioned
           ? ["step_kind", "floor_id", "x", "y", "block_id", "details"]
           : step.step_kind === "shop"
@@ -457,11 +457,12 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
           MotaLab.validateResponseKeys(step.details.key_cost, "door key_cost");
         } else if (step.step_kind === "enemy") {
           MotaLab.assertProtocolShape(step.details, ["hp_loss"], [], "enemy details");
-          if (!MotaLab.isFiniteInteger(step.details.hp_loss) || step.details.hp_loss < 0) throw new TypeError("Invalid enemy details");
+          if (typeof step.details.hp_loss !== "number" || !Number.isFinite(step.details.hp_loss)
+            || step.details.hp_loss < 0) throw new TypeError("Invalid enemy details");
         } else if (step.step_kind === "resource") {
           MotaLab.assertProtocolShape(step.details,
-            ["hp", "attack", "defense", "gold", "experience", "keys", "inventory"], [], "resource details");
-          for (const field of ["hp", "attack", "defense", "gold", "experience"]) {
+            ["hp", "attack", "defense", "gold", "experience", "level", "keys", "inventory"], ["multiply"], "resource details");
+          for (const field of ["hp", "attack", "defense", "gold", "experience", "level"]) {
             if (!MotaLab.isFiniteInteger(step.details[field]) || step.details[field] < 0) throw new TypeError("Invalid resource details");
           }
           MotaLab.validateResponseKeys(step.details.keys, "resource keys");
@@ -471,15 +472,18 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
           }
         } else if (step.step_kind === "shop") {
           MotaLab.assertProtocolShape(step.details,
-            ["cost", "purchase_count_before", "field", "amount"], [], "shop details");
+            ["currency", "cost", "purchase_count_before", "effects"], [], "shop details");
           if (typeof step.shop_id !== "string" || typeof step.choice_id !== "string"
             || !MotaLab.isFiniteInteger(step.details.cost) || step.details.cost < 1
             || !MotaLab.isFiniteInteger(step.details.purchase_count_before)
             || step.details.purchase_count_before < 0
-            || !new Set(["hp", "attack", "defense"]).has(step.details.field)
-            || !MotaLab.isFiniteInteger(step.details.amount) || step.details.amount < 1) {
+            || !new Set(["gold", "experience", "yellow", "blue", "red"]).has(step.details.currency)
+            || !Array.isArray(step.details.effects) || step.details.effects.length < 1) {
             throw new TypeError("Invalid shop step");
           }
+        } else if (step.step_kind === "event") {
+          MotaLab.assertProtocolShape(step.details, ["event_id"], [], "event details");
+          MotaLab.validateProtocolString(step.details.event_id, "event_id", 1, 128);
         } else if (Object.keys(step.details).length !== 0) {
           throw new TypeError("Invalid empty global step details");
         }

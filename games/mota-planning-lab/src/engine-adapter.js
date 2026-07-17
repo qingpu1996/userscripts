@@ -526,7 +526,14 @@ MotaLab.createEngineAdapter = function createEngineAdapter(pageScope) {
           MotaLab.parseRestrictedShop(id, raw, flagValues)
         ));
         const shops = parsedShops.filter((shop) => shop.supported);
-        if (engineModel) engineModel.solver_model = MotaLab.buildSolverModel(engineModel, parsedShops);
+        if (engineModel) {
+          const solverFlags = MotaLab.projectSolverFlags(flagValues);
+          engineModel.solver_model = MotaLab.buildSolverModel(engineModel, parsedShops, {
+            level: Number.isSafeInteger(runtime.status.hero && runtime.status.hero.lv)
+              && runtime.status.hero.lv >= 0 ? runtime.status.hero.lv : 0,
+            flags: solverFlags,
+          });
+        }
         const activeMenus = shops.map((shop) => MotaLab.readRestrictedShopMenu(runtime, shop))
           .filter(Boolean);
         return {

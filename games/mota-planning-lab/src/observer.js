@@ -251,7 +251,7 @@ MotaLab.collectEngineFloor = function collectEngineFloor(
   }
   const blocks = blockValues.map((raw) => {
     const event = raw && raw.event && typeof raw.event === "object" ? raw.event : {};
-    if (!raw || raw.disable === true || event.disable === true) return null;
+    if (!raw) return null;
     const numericId = raw.numeric_id !== undefined ? raw.numeric_id
       : typeof raw.id === "number" ? raw.id : raw.number !== undefined ? raw.number : event.number;
     const id = event.id !== undefined ? event.id : raw.id;
@@ -272,7 +272,7 @@ MotaLab.collectEngineFloor = function collectEngineFloor(
       } : {}),
       no_pass: Boolean(event.noPass !== undefined ? event.noPass
         : raw.noPass !== undefined ? raw.noPass : raw.no_pass),
-      disabled: false,
+      disabled: raw.disable === true || event.disable === true || event.enable === false,
     };
   }).filter(Boolean).sort((left, right) => left.y - right.y || left.x - right.x);
   const changeSource = definition.changeFloor || dynamic.changeFloor || {};
@@ -385,7 +385,7 @@ MotaLab.collectEngineFloor = function collectEngineFloor(
 
 MotaLab.parseSolverItemDelta = function parseSolverItemDelta(item, values, keySlots) {
   const zero = { hp: 0, attack: 0, defense: 0, gold: 0, experience: 0,
-    keys: { yellow: 0, blue: 0, red: 0 }, inventory: {} };
+    level: 0, keys: { yellow: 0, blue: 0, red: 0 }, inventory: {} };
   if (!item) {
     return { supported: false, reason: "resource_effect_opaque" };
   }
@@ -394,6 +394,24 @@ MotaLab.parseSolverItemDelta = function parseSolverItemDelta(item, values, keySl
     const result = MotaLab.cloneJsonValue(zero);
     result.keys[keyColor] = 1;
     return { supported: true, delta: result };
+  }
+  // These ids are audited against the structured itemEffect definitions of games/24.
+  // Keep the projection deliberately finite: new ids or changed scripts still fail closed.
+  const audited = {
+    bigKey: { keys: { yellow: 1, blue: 1, red: 1 } },
+    centerFly: { level: 1, hp: 1000, attack: 10, defense: 10 },
+    superPotion: { multiply: { hp: 2 } },
+    skill1: {},
+    wand: {},
+  }[item.id];
+  if (audited) {
+    const delta = MotaLab.cloneJsonValue(zero);
+    if (audited.keys) Object.assign(delta.keys, audited.keys);
+    for (const field of ["level", "hp", "attack", "defense"]) {
+      if (audited[field]) delta[field] = audited[field];
+    }
+    if (audited.multiply) delta.multiply = MotaLab.cloneJsonValue(audited.multiply);
+    return { supported: true, delta };
   }
   if (typeof item.item_effect !== "string" || item.complex === true) {
     return { supported: false, reason: "resource_effect_opaque" };
@@ -431,7 +449,34 @@ MotaLab.parseSolverItemDelta = function parseSolverItemDelta(item, values, keySl
   return { supported: true, delta: result };
 };
 
-MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = []) {
+MotaLab.auditedSolverEvent = function auditedSolverEvent(floorId, x, y) {
+  const id = ({
+    "MT0:5,9": "fairy_mt0", "MT1:2,11": "book_reward",
+    "MT2:8,11": "sword2_reward", "MT2:10,11": "shield2_reward",
+    "MT4:6,1": "thief_quest", "MT7:6,5": "cross_reward",
+    "MT9:1,1": "fly_reward", "MT12:11,1": "ice_pickaxe_reward",
+    "MT15:5,4": "exp_sword_trade", "MT15:7,4": "gold_shield_trade",
+    "MT16:5,5": "ice_wand_reward", "MT16:6,5": "dialogue_once",
+    "MT18:6,5": "princess_quest", "MT19:6,8": "dialogue_once",
+    "MT22:6,3": "wand_gate_remove_on_failure", "MT22:7,3": "wand_gate_retry",
+  })[`${floorId}:${x},${y}`];
+  return id ? { id } : null;
+};
+
+MotaLab.projectSolverFlags = function projectSolverFlags(flagValues) {
+  const source = flagValues && typeof flagValues === "object" ? flagValues : {};
+  const projected = {};
+  for (const [floorId, x, y] of [["MT4", 6, 1], ["MT18", 6, 5]]) {
+    const rawKey = `${floorId}@${x}@${y}@A`;
+    const value = source[rawKey];
+    if (value === true || value === false || (Number.isSafeInteger(value) && value >= 0)) {
+      projected[`switch:${floorId}:${x},${y}:A`] = value;
+    }
+  }
+  return projected;
+};
+
+MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = [], runtimeFacts = {}) {
   if (!engineModel || typeof engineModel !== "object") return null;
   const blockCatalog = new Map((engineModel.blocks || []).map((block) => [block.numeric_id, block]));
   const items = new Map((engineModel.items || []).map((item) => [item.id, item]));
@@ -452,9 +497,10 @@ MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = []) {
       const catalog = blockCatalog.get(block.numeric_id) || {};
       const trigger = block.trigger || catalog.trigger;
       const base = { floor_id: floor.floor_id, x: block.x, y: block.y,
-        block_id: block.id, numeric_id: block.numeric_id };
-      if (trigger === "changeFloor") {
-        const transition = transitions.get(`${block.x},${block.y}`);
+        block_id: block.id, numeric_id: block.numeric_id, initial_active: block.disabled !== true };
+      const coordinateTransition = transitions.get(`${block.x},${block.y}`);
+      if (trigger === "changeFloor" || coordinateTransition) {
+        const transition = coordinateTransition;
         let landing = transition && transition.loc;
         if (!landing && transition && transition.floor_id && transition.stair) {
           const targetFloor = floorById.get(transition.floor_id);
@@ -478,6 +524,10 @@ MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = []) {
         for (const [slot, count] of Object.entries(catalog.door_info && catalog.door_info.keys || {})) {
           const color = Object.entries(engineModel.inventory.key_slots || {})
             .find(([, id]) => id === slot)?.[0];
+          if (slot === "specialKey" && count === 1) {
+            return { ...base, kind: "door", key_cost: costs,
+              inventory_cost: { specialKey: 1 } };
+          }
           if (!color || !Object.hasOwn(costs, color)) {
             blockers.push({ code: "DOOR_UNSUPPORTED", detail: block.id });
             return { ...base, kind: "opaque", reason: "door_key_unknown" };
@@ -509,15 +559,38 @@ MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = []) {
         return { ...base, kind: "opaque", reason: "wall" };
       }
       if (trigger) {
-        blockers.push({ code: "EVENT_UNSUPPORTED", detail: `${floor.floor_id}:${block.x},${block.y}` });
+        const event = MotaLab.auditedSolverEvent(floor.floor_id, block.x, block.y);
+        if (event) return { ...base, kind: "event", event };
         return { ...base, kind: "opaque", reason: "event_unsupported" };
       }
       return { ...base, kind: "terrain" };
     });
+    if (floor.floor_id === "MT_1") {
+      for (const [x, y, numericId] of [
+        [5, 2, 181], [6, 2, 182], [7, 2, 183],
+        [5, 3, 184], [6, 3, 185], [7, 3, 186],
+        [5, 4, 187], [6, 4, 258], [7, 4, 188],
+      ]) {
+        const catalog = blockCatalog.get(numericId);
+        if (!catalog) continue;
+        const replacement = { floor_id: floor.floor_id, x, y, block_id: catalog.id,
+          numeric_id: numericId, initial_active: false };
+        if (numericId === 258) {
+          const enemy = enemies.get("octopus");
+          if (enemy && enemy.attack !== null && enemy.defense !== null && !(enemy.special || []).length) {
+            blocks.push({ ...replacement, kind: "enemy", enemy: MotaLab.cloneJsonValue(enemy) });
+          }
+        } else {
+          blocks.push({ ...replacement, kind: "terrain" });
+        }
+      }
+    }
     for (const event of floor.opaque_events || []) {
-      blockers.push({ code: "EVENT_UNSUPPORTED", detail: `${floor.floor_id}:${event.x},${event.y}` });
-      blocks.push({ floor_id: floor.floor_id, x: event.x, y: event.y, block_id: "opaqueEvent",
-        numeric_id: 0, kind: "opaque", reason: event.reason });
+      if (blocks.some((block) => block.x === event.x && block.y === event.y)) continue;
+      const audited = MotaLab.auditedSolverEvent(floor.floor_id, event.x, event.y);
+      blocks.push({ floor_id: floor.floor_id, x: event.x, y: event.y,
+        block_id: audited ? audited.id : "opaqueEvent", numeric_id: 0,
+        kind: audited ? "event" : "opaque", ...(audited ? { event: audited } : { reason: event.reason }) });
     }
     return { floor_id: floor.floor_id, width: floor.width, height: floor.height,
       topology: MotaLab.cloneJsonValue(floor.topology), blocks };
@@ -526,6 +599,10 @@ MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = []) {
     : goals.length > 1 && goals.length <= 32
       ? { kind: "any_location", locations: MotaLab.cloneJsonValue(goals) } : null;
   return { protocol: 1, terminal, floors,
+    initial: { level: MotaLab.isFiniteInteger(runtimeFacts.level) && runtimeFacts.level >= 0
+      ? runtimeFacts.level : 0,
+    flags: runtimeFacts.flags && typeof runtimeFacts.flags === "object"
+      ? MotaLab.cloneJsonValue(runtimeFacts.flags) : {} },
     shops: MotaLab.cloneJsonValue(shops.filter((shop) => shop && shop.supported === true)), blockers };
 };
 

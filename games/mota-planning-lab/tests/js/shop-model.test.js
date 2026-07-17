@@ -129,3 +129,36 @@ test("shop input uses the engine actions keyUp path and fails closed on a foreig
     error.detail_code === "SHOP_MENU_IDENTITY_MISMATCH");
   assert.deepEqual(keys, [50, 27]);
 });
+
+test("audited experience and key shops expose currency plus deterministic effects", () => {
+  const set = (name, operator, value) => ({ type: "setValue", name, operator, value: String(value) });
+  const exp = lab.parseRestrictedShop("expShop1", { choices: [
+    { text: "level", need: "status:exp>=100", action: [set("status:exp", "-=", 100),
+      set("status:lv", "+=", 1), set("status:hp", "+=", 1000), set("status:atk", "+=", 7),
+      set("status:def", "+=", 7), set("flag:n", "+=", 1)] },
+    { text: "atk", need: "status:exp>=30", action: [set("status:exp", "-=", 30),
+      set("status:atk", "+=", 5), set("flag:n", "+=", 1)] },
+    { text: "def", need: "status:exp>=30", action: [set("status:exp", "-=", 30),
+      set("status:def", "+=", 5), set("flag:n", "+=", 1)] },
+  ] });
+  assert.equal(exp.supported, true);
+  assert.equal(exp.choices[0].currency, "experience");
+  assert.deepEqual(JSON.parse(JSON.stringify(exp.choices[0].effects)), [
+    { field: "level", amount: 1 }, { field: "hp", amount: 1000 },
+    { field: "attack", amount: 7 }, { field: "defense", amount: 7 },
+  ]);
+  const buy = lab.parseRestrictedShop("keyShop1", { choices: [10, 50, 100].map((cost, index) => {
+    const key = ["yellowKey", "blueKey", "redKey"][index];
+    return { text: key, need: `status:money>=${cost}`, action: [set("status:money", "-=", cost),
+      set(`item:${key}`, "+=", 1), set("flag:n", "+=", 1)] };
+  }) });
+  assert.deepEqual(JSON.parse(JSON.stringify([buy.choices[1].currency, buy.choices[1].cost, buy.choices[1].effects])),
+    ["gold", 50, [{ field: "blue", amount: 1 }]]);
+  const sell = lab.parseRestrictedShop("keyShop2", { choices: [
+    ["yellowKey", 7], ["blueKey", 35], ["redKey", 70],
+  ].map(([key, gold]) => ({ text: key, need: "true", action: [{ type: "if",
+    condition: `(item:${key}>=1)`, true: [set(`item:${key}`, "-=", 1),
+      set("status:money", "+=", gold), set("flag:n", "+=", 1)], false: ["none"] }] })) });
+  assert.deepEqual(JSON.parse(JSON.stringify([sell.choices[2].currency, sell.choices[2].cost, sell.choices[2].effects])),
+    ["red", 1, [{ field: "gold", amount: 70 }]]);
+});
