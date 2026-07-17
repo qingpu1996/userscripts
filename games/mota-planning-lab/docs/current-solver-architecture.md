@@ -2,7 +2,7 @@
 
 ## 1. 文档定位与版本基线
 
-本文描述仓库当前实现，而不是下一阶段目标。代码基线为 `af5b5119c770a775d219e516e301a4a39d28b534`（2026-07-17，`main`）。Rust 服务是只读 Shadow runtime：它在一次请求内解析 observation、建立求解状态、搜索有界的全局终局路线，并把证明结果或 `unproven` 状态返回给浏览器；浏览器当前强制 `shadowOnly`，不会执行路线。Rust 进程只保留进程内 cycle 计数，不持久化世界、搜索队列或路线。
+本文描述仓库当前实现，而不是下一阶段目标。Rust 服务是只读 Shadow runtime：它在一次请求内解析 observation、建立求解状态、搜索有界的全局终局路线，并把证明结果或 `unproven` 状态返回给浏览器；浏览器当前强制 `shadowOnly`，不会执行路线。Rust 进程只保留进程内 cycle 计数，不持久化世界、搜索队列或路线。
 
 `docs/solver-architecture.md`、`docs/protocol.md` 中仍有 Stage2B 的历史描述；当描述与当前代码不一致时，以 `rust/shadow-runtime/src/main.rs`、`src/observer.js` 和协议 schema 为准。本文不把未来的自动驾驶、逆向搜索或更强剪枝写成已实现能力。
 
@@ -44,7 +44,7 @@ flowchart LR
 
 `ConnectivityIndex` 预先保存每层有效格和每格 block 索引，并为每个 transition 检查“纯、激活、非自环、唯一且互相可逆”的伙伴。只有满足这些条件的换层才是免费导航边；单向、inactive、带额外字段（副作用）或无法唯一配对的换层保留为战略 boundary。
 
-对每个搜索状态，`view` 从当前位置做局部 BFS：未消耗的非 `terrain`、非 `shop` block 阻断格子；门、敌人、资源、事件和战略换层停在边界。发现可逆楼梯后，带着 transition 序列进入目标楼层，再对目标楼层重算局部 BFS。组件用 `(floor, 最小可达格索引)` 去重，因而 floor 只是坐标命名空间，不是策略阶段。`ReachBoundary` 同时携带相邻可达格和 navigation route witness，远端楼层的候选可以直接入队。
+对每个搜索状态，`view` 从当前位置做局部 BFS：未消耗的非 `terrain`、非 `shop` block 阻断格子；门、敌人、资源、事件和战略换层停在边界。发现可逆楼梯后，会进入目标楼层并重算局部 BFS。组件用 `(floor, 最小可达格索引)` 去重，因而 floor 只是坐标命名空间，不是策略阶段。第一阶段不记录 transition 序列；只有路线见证阶段才重新计算并保留 navigation witness，远端楼层的候选仍可直接入队。
 
 动态门、事件替换或激活会改变 `ConsumedBits`/flags；下一状态会重新计算闭包，不复用过时的可达区域。对应 transition 的移动步骤仍写入 route witness/最终 route；系统没有独立的移动代价模型，也不制造一个“只是在第 N 层”的战略状态。
 
@@ -55,21 +55,23 @@ flowchart TD
   A[解析 solver_model 与初始 hero] --> B[建立 ConsumedBits、inventory、shop counts、flags]
   B --> C[ConnectivityIndex.view：局部 BFS + 可逆换层闭包]
   C --> D[收集 boundary、shops、reachable terminal]
-  D --> E[VecDeque PendingCandidate\n只存 source/navigation/动作句柄]
-  E --> F[pop_front，materialize_candidate]
+  D --> E[Phase 1 VecDeque PendingCandidate\n只存 source/动作句柄]
+  E --> F[pop_front，模拟动作]
   F --> G[模拟 door/resource/enemy/event/shop/transition]
   G --> H[canonical representative]
   H --> I[exact seen]
   I --> J[StructuralKey + 8 维 dominance]
-  J --> K[state_arena + route_arena]
+  J --> K[state_arena + NumericObjective]
   K --> L{terminal?}
   L -- 否 --> D
-  L -- 是 --> M[比较终局路线并继续搜索]
+  L -- 是 --> M[只更新数值目标并继续搜索]
+  M --> N{Phase 1 队列耗尽?}
+  N -- 是 --> O[Phase 2：固定数值目标，字典序路线见证]
 ```
 
-实现是 FIFO 的 bounded state-space search：`VecDeque<PendingCandidate>` 按入队顺序取出，不按启发式优先级排序。每个已接受节点把 `SolverState` 放进 `state_arena`，把父索引、动作和导航链放进 `route_arena`；候选只保留 source index、navigation 及 block/shop 的索引和相邻坐标，真正执行规则时才 materialize。无效钥匙、资源、战斗、商店或未支持事件在 materialize 阶段返回 `None`，不会产生后继。
+Phase 1 是 FIFO 的 bounded state-space search：`VecDeque<PendingCandidate>` 按入队顺序取出，不按启发式优先级排序。每个已接受节点只把 `SolverState` 放进 `state_arena`；候选只保留 source index 及 block/shop 的稳定索引和相邻坐标，真正执行规则时才 materialize。它不创建 `RouteAction`、父链、route arena 或长期 navigation payload。无效钥匙、资源、战斗、商店或未支持事件在 materialize 阶段返回 `None`，不会产生后继。
 
-对每个新节点，先用 `view` 得到代表位置，再做 exact seen、dominance、入 arena、终局检查和候选入队。候选包括所有可达 boundary（door、enemy、resource、event、战略 transition）以及可达受限商店的每个 choice；当前楼层的 `current_floor_immediate` 分析是同一响应中的独立即时 BFS，最多返回 256 个候选。
+对每个新节点，先用 `view` 得到代表位置，再做 exact seen、dominance、入 arena、终局检查和候选入队。终局只更新 `NumericObjective`。候选包括所有可达 boundary（door、enemy、resource、event、战略 transition）以及可达受限商店的每个 choice；当前楼层的 `current_floor_immediate` 分析是同一响应中的独立即时 BFS，最多返回 256 个候选。
 
 ## 7. 当前动作模型与 fail-closed 边界
 
@@ -81,12 +83,13 @@ flowchart TD
 
 ## 8. 目标函数与终局比较
 
-到达任一终局坐标只记录一个候选 `TerminalRoute`，搜索仍会继续以寻找更优路线。`terminal_route_is_better` 的字典序是：
+终局比较拆为两个严格阶段。Phase 1 到达任一终局坐标时只记录 `NumericObjective`，搜索仍会继续以寻找更优数值。该目标顺序是：
 
 1. `attack + defense` 最大；
 2. `min(attack, defense)` 最大，用于偏好攻防均衡；
 3. 终局 `hp` 最大；
-4. 三项相同，比较完整 route steps 的 JSON 字典序，取字典序较小者保证确定性。
+
+Phase 1 队列耗尽后，才启动独立、同预算上限的 Phase 2。它将数值目标固定为 Phase 1 的最优三元组，重新计算 connectivity/navigation，并以 route steps JSON 前缀的最小堆展开。`ConnectivityView` 收集当前闭包内的全部可达终点（按 floor/坐标/导航稳定排序），因此 Phase 2 会为每个终点构造完整候选，再以完整 route steps JSON 取全局字典序最小者。对同一完整 `SolverState`，它保留字典序较小的前缀；路线见证同时要求 canonical state-simple，故两个有效的同状态前缀不会互为严格前缀，追加相同后缀不会逆转 JSON 字典序。这里的 tie-break 范围是 canonical BFS navigation、全部可达终点和战略动作路线；它不枚举同一导航闭包内所有物理绕行路线。Phase 2 枚举耗尽后，从初始状态重放 block/shop/transition 段验证。Phase 2 达到预算时沿用协议合法的 `reason: search_budget_exhausted`、`truncated: true`、`route: null`；无法重放时 fail closed，返回 `unproven`、`route: null`。响应的 `explored_states` 始终是 Phase 1 数量，避免把两阶段计数混合。
 
 金币、经验、钥匙和背包不直接进入终局评分，但会影响可达性和后续消费。找到路线不等于已证明全局最优：只有队列耗尽且没有 blocker 时才返回 `proof: proven`；达到 `search_budget`（默认最多 50,000）返回 `proof: unproven`、`reason: search_budget_exhausted`，不返回路线。
 
@@ -98,13 +101,13 @@ flowchart TD
 
 ## 10. 路线记录与 Shadow 边界
 
-`RouteLink { parent, navigation, action }` 是压缩的父链；`reconstruct_steps` 反向回溯 block/shop 动作，再插入跨层 navigation transition，最后追加 terminal step。响应中的 route 只读描述字段可按 step 类型变化，例如包含 `step_kind`、`floor_id`、坐标和详情；block step 还带 `block_id`，shop step 还带 `shop_id`/`choice_id`。协议递归拒绝 `action`、`operation`、`guard` 等可执行字段。当前 Rust 不自动操作页面、不保存路线到磁盘；下一轮由 JS 重新采集 observation。浏览器 journal 可保存会话/恢复元数据，但不承载 Rust 搜索状态。
+Phase 2 的临时节点保存 block/shop 动作及 navigation segment，生成 steps 后追加 terminal step；Phase 1 不保留这些数据。响应中的 route 只读描述字段可按 step 类型变化，例如包含 `step_kind`、`floor_id`、坐标和详情；block step 还带 `block_id`，shop step 还带 `shop_id`/`choice_id`。协议递归拒绝 `action`、`operation`、`guard` 等可执行字段。当前 Rust 不自动操作页面、不保存路线到磁盘；下一轮由 JS 重新采集 observation。浏览器 journal 可保存会话/恢复元数据，但不承载 Rust 搜索状态。
 
 ## 11. 性能与内存（版本区分）
 
-当前 `af5b511` 的一次正式 50k HTTP 测量（证据目录：`/private/tmp/mota-consumed-bitset-rss-formal-20260717/`）结果为：请求耗时 `2.987945 s`，`explored_states=50000`，`truncated=true`，`reason=search_budget_exhausted`；`/usr/bin/time -l` 最大 RSS 为 `144,850,944 B`（约 138.14 MiB），peak memory footprint 为 `144,114,168 B`。响应与位压缩前基线逐字节一致。该测量只代表一个固定 observation，不是所有存档的 SLA。
+`af5b511` 的正式 50k HTTP 基线结果为：请求耗时 `2.987945 s`，`explored_states=50000`，`truncated=true`，`reason=search_budget_exhausted`；`/usr/bin/time -l` 最大 RSS 为 `144,850,944 B`（约 138.14 MiB），peak memory footprint 为 `144,114,168 B`。本轮修复后使用同一 request 只发送一次 HTTP 请求：耗时 `1.857626 s`，最大 RSS `125,452,288 B`（约 119.64 MiB），peak memory footprint `124,715,488 B`；响应与基线逐字节一致，`explored_states=50000`、`Phase 2=0`、`reason=search_budget_exhausted`。证据保存在本机一次性 `/tmp` 临时目录，不是仓库运行时依赖。上述性能数据只代表一个固定 observation，不是所有存档的 SLA；Phase 2 在复杂且最终 `proven` 的真实世界上的额外开销尚未实测。
 
-历史 profile 中出现的“frontier 约 40 MiB、route/navigation 等分项”来自更早的容器快照或 bitset 之前版本；当前没有把这些旧分项相加当作 `af5b511` 的精确结构占用。已保留的优化包括 COW 状态、动态 mutable slots、压缩父链、typed `StructuralKey`、lazy candidate queue、可逆联通索引和 `ConsumedBits`。曾经的 eager reversible-region 搜索已在 `bf33f0d` 回滚；PendingCandidate 缩窄实验未保留，不能算当前实现。
+历史 profile 中出现的“frontier 约 40 MiB、route/navigation 等分项”来自更早的容器快照或 bitset 之前版本；当前没有把这些旧分项相加当作 `af5b511` 的精确结构占用。已保留的优化包括 COW 状态、动态 mutable slots、Phase 1 移除父链和 route arena、typed `StructuralKey`、lazy candidate queue、可逆联通索引和 `ConsumedBits`；Phase 2 只在当前请求内保存临时 route/navigation witness。曾经的 eager reversible-region 搜索已在 `bf33f0d` 回滚；PendingCandidate 缩窄实验未保留，不能算当前实现。
 
 ## 12. 为什么 4000 格仍会组合爆炸
 
@@ -115,7 +118,7 @@ flowchart TD
 ## 13. 已知缺口与风险
 
 - 50k 预算可能在仍有候选时停止，结果必须显示 `unproven`，不能当作无解或全局最优。
-- queue、state/route arena、exact seen 和 dominance frontier 会随动作组合增长；当前没有最终每类结构的稳定内存配额。
+- queue、state arena、exact seen 和 dominance frontier 会随动作组合增长；Phase 2 的 route/navigation witness 只在当前请求内临时存在，当前没有最终每类结构的稳定内存配额。
 - solver model 只覆盖已审计规则子集；真实页面的动态事件、怪物 special、楼梯映射和终局投影仍需以 observation 覆盖率验证。
 - Shadow 输出是路线证明/建议，不是执行授权；`main.js` 的 `shadowOnly: true` 会在任何 adapter/executor 调用前拒绝 `execute` 响应。
 - 现有测试覆盖固定 fixture、协议和 Rust 单元行为；它们不证明任意真实存档都存在完整终局路线。
@@ -141,6 +144,6 @@ flowchart TD
 | 浏览器请求与 Shadow-only | [`src/controller.js`](../src/controller.js)：`cycleBody`；[`src/main.js`](../src/main.js)：`shadowOnly: true` |
 | HTTP/响应 | [`rust/shadow-runtime/src/main.rs`](../rust/shadow-runtime/src/main.rs)：`read_request`、`handle_connection`、`shadow_response` |
 | 状态/位图/去重 | 同上：`ConsumedBits`、`SolverState`、`StructuralKey`、`global_analysis` |
-| 联通与 route witness | 同上：`ConnectivityIndex::view`、`ReachBoundary`、`RouteLink`、`reconstruct_steps` |
-| 动作模拟 | 同上：`materialize_candidate`、`apply_audited_event`、`enemy_loss` |
+| 联通与 route witness | 同上：`ConnectivityIndex::view`、`ReachBoundary`、`ReachTerminal`、`Phase2Node`、`Phase2Route` |
+| 动作模拟 | 同上：`materialize_pending_action`、`apply_audited_event`、`enemy_loss` |
 | 协议约束 | [`protocol/cycle-response.schema.json`](../protocol/cycle-response.schema.json)、[`src/protocol.js`](../src/protocol.js) |

@@ -1,5 +1,8 @@
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::cell::Cell;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
@@ -16,6 +19,10 @@ const SHADOW_REASON: &str =
     "Stage3 Rust shadow runtime analyzed bounded global routes; execution remains disabled.";
 const ALLOWED_ORIGIN: &str = "https://h5mota.com";
 const ALLOWED_REQUEST_HEADERS: [&str; 2] = ["content-type", "x-mota-lab"];
+#[cfg(test)]
+thread_local! {
+    static PHASE2_CALLS: Cell<usize> = const { Cell::new(0) };
+}
 
 #[derive(Default)]
 struct ShadowState {
@@ -830,20 +837,7 @@ enum RouteAction {
     },
 }
 
-struct RouteLink {
-    parent: Option<usize>,
-    navigation: Arc<Vec<usize>>,
-    action: Option<RouteAction>,
-}
-
 #[derive(Clone)]
-struct SearchNode {
-    state: SolverState,
-    parent: Option<usize>,
-    navigation: Arc<Vec<usize>>,
-    action: Option<RouteAction>,
-}
-
 enum PendingAction {
     Block {
         index: usize,
@@ -860,13 +854,35 @@ enum PendingAction {
 
 struct PendingCandidate {
     source: usize,
-    navigation: Arc<Vec<usize>>,
     action: PendingAction,
 }
 
-struct TerminalRoute {
-    state: SolverState,
-    steps: Vec<Value>,
+#[derive(Clone, Copy, Debug)]
+struct NumericObjective {
+    attack_and_defense: f64,
+    balanced_stat: f64,
+    hp: f64,
+}
+
+impl NumericObjective {
+    fn from_state(state: &SolverState) -> Self {
+        Self {
+            attack_and_defense: state.attack.get() + state.defense.get(),
+            balanced_stat: state.attack.get().min(state.defense.get()),
+            hp: state.hp.get(),
+        }
+    }
+
+    fn cmp(self, other: Self) -> Ordering {
+        self.attack_and_defense
+            .total_cmp(&other.attack_and_defense)
+            .then(self.balanced_stat.total_cmp(&other.balanced_stat))
+            .then(self.hp.total_cmp(&other.hp))
+    }
+
+    fn matches(self, other: Self) -> bool {
+        self.cmp(other).is_eq()
+    }
 }
 
 fn route_action_json(action: &RouteAction, blocks: &[SolverBlock]) -> Value {
@@ -900,31 +916,6 @@ fn route_action_json(action: &RouteAction, blocks: &[SolverBlock]) -> Value {
     }
 }
 
-fn reconstruct_steps(arena: &[RouteLink], mut index: usize, blocks: &[SolverBlock]) -> Vec<Value> {
-    let mut actions = Vec::new();
-    loop {
-        let link = &arena[index];
-        if let Some(action) = &link.action {
-            actions.push(route_action_json(action, blocks));
-        }
-        for transition in link.navigation.iter().rev() {
-            actions.push(route_action_json(
-                &RouteAction::Block {
-                    index: *transition,
-                    action: BlockRouteAction::Transition,
-                },
-                blocks,
-            ));
-        }
-        match link.parent {
-            Some(parent) => index = parent,
-            None => break,
-        }
-    }
-    actions.reverse();
-    actions
-}
-
 #[derive(Clone)]
 struct ConnectivityFloor {
     width: usize,
@@ -942,35 +933,21 @@ struct ConnectivityIndex {
 struct ReachBoundary {
     index: usize,
     adjacent: (u64, u64),
-    navigation: Arc<Vec<usize>>,
+    navigation: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct ReachTerminal {
+    floor: String,
+    position: (u64, u64),
+    navigation: Vec<usize>,
 }
 
 struct ConnectivityView {
     representative: (String, u64, u64),
     boundaries: Vec<ReachBoundary>,
-    shops: HashMap<String, (String, (u64, u64), Arc<Vec<usize>>)>,
-    terminal: Option<(String, (u64, u64), Arc<Vec<usize>>)>,
-}
-
-fn terminal_route_is_better(candidate: &TerminalRoute, current: &TerminalRoute) -> bool {
-    let score = |node: &TerminalRoute| {
-        (
-            node.state.attack.get() + node.state.defense.get(),
-            node.state.attack.get().min(node.state.defense.get()),
-            node.state.hp.get(),
-        )
-    };
-    let left = score(candidate);
-    let right = score(current);
-    let ordering = left
-        .0
-        .total_cmp(&right.0)
-        .then(left.1.total_cmp(&right.1))
-        .then(left.2.total_cmp(&right.2));
-    ordering.is_gt()
-        || (ordering.is_eq()
-            && serde_json::to_string(&candidate.steps).unwrap()
-                < serde_json::to_string(&current.steps).unwrap())
+    shops: HashMap<String, (String, (u64, u64), Vec<usize>)>,
+    terminals: Vec<ReachTerminal>,
 }
 
 fn solver_u64(object: &serde_json::Map<String, Value>, name: &str) -> Result<u64, String> {
@@ -1290,15 +1267,15 @@ impl ConnectivityIndex {
         floors: &HashMap<String, SolverFloor>,
         blocks: &[SolverBlock],
         terminals: &[(&str, (u64, u64))],
+        record_navigation: bool,
     ) -> ConnectivityView {
-        let empty_navigation = Arc::new(Vec::new());
-        let mut queue =
-            VecDeque::from([(state.floor.clone(), (state.x, state.y), empty_navigation)]);
+        let mut queue = VecDeque::from([(state.floor.clone(), (state.x, state.y), Vec::new())]);
         let mut components = HashSet::<(String, usize)>::new();
         let mut boundary_seen = HashSet::new();
         let mut boundaries = Vec::new();
         let mut shops = HashMap::new();
-        let mut terminal = None;
+        let mut terminal_seen = HashSet::new();
+        let mut reachable_terminals = Vec::new();
         let mut representative = (state.floor.clone(), state.x, state.y);
         while let Some((floor_id, entry, navigation)) = queue.pop_front() {
             let (reachable, Some(local_representative)) =
@@ -1318,20 +1295,25 @@ impl ConnectivityIndex {
             );
             representative =
                 representative.min((floor_id.clone(), local_position.0, local_position.1));
-            if terminal.is_none() {
-                terminal = terminals.iter().find_map(|(candidate_floor, position)| {
-                    if *candidate_floor != floor_id {
-                        return None;
-                    }
-                    let (x, y) = (
-                        usize::try_from(position.0).ok()?,
-                        usize::try_from(position.1).ok()?,
-                    );
-                    (x < indexed_floor.width
-                        && y < indexed_floor.height
-                        && reachable[y * indexed_floor.width + x])
-                        .then(|| (floor_id.clone(), *position, navigation.clone()))
-                });
+            for &(candidate_floor, position) in terminals {
+                if candidate_floor != floor_id {
+                    continue;
+                }
+                let (Ok(x), Ok(y)) = (usize::try_from(position.0), usize::try_from(position.1))
+                else {
+                    continue;
+                };
+                if x < indexed_floor.width
+                    && y < indexed_floor.height
+                    && reachable[y * indexed_floor.width + x]
+                    && terminal_seen.insert((floor_id.clone(), position))
+                {
+                    reachable_terminals.push(ReachTerminal {
+                        floor: floor_id.clone(),
+                        position,
+                        navigation: navigation.clone(),
+                    });
+                }
             }
             for &index in floors
                 .get(&floor_id)
@@ -1352,12 +1334,17 @@ impl ConnectivityIndex {
                 };
                 if block.kind == "transition" && self.reversible[index].is_some() {
                     if let Some((target_floor, target_x, target_y)) = transition_target(block) {
-                        let mut next_navigation = (*navigation).clone();
-                        next_navigation.push(index);
+                        let next_navigation = if record_navigation {
+                            let mut next = navigation.clone();
+                            next.push(index);
+                            next
+                        } else {
+                            Vec::new()
+                        };
                         queue.push_back((
                             target_floor.to_owned(),
                             (target_x, target_y),
-                            Arc::new(next_navigation),
+                            next_navigation,
                         ));
                     }
                     continue;
@@ -1379,11 +1366,18 @@ impl ConnectivityIndex {
                 }
             }
         }
+        reachable_terminals.sort_by(|left, right| {
+            left.floor
+                .cmp(&right.floor)
+                .then_with(|| left.position.0.cmp(&right.position.0))
+                .then_with(|| left.position.1.cmp(&right.position.1))
+                .then_with(|| left.navigation.cmp(&right.navigation))
+        });
         ConnectivityView {
             representative,
             boundaries,
             shops,
-            terminal,
+            terminals: reachable_terminals,
         }
     }
 }
@@ -1716,19 +1710,23 @@ fn apply_audited_event(
     Some(json!({"event_id":id}))
 }
 
-fn materialize_candidate(
-    candidate: PendingCandidate,
-    state_arena: &[SolverState],
+struct MaterializedCandidate {
+    state: SolverState,
+    route_action: Option<RouteAction>,
+}
+
+fn materialize_pending_action(
+    source: &SolverState,
+    pending_action: PendingAction,
     blocks: &[SolverBlock],
     shops: &[Value],
-) -> Option<SearchNode> {
-    let mut next = SearchNode {
-        state: state_arena.get(candidate.source)?.clone(),
-        parent: Some(candidate.source),
-        navigation: candidate.navigation,
-        action: None,
+    record_route: bool,
+) -> Option<MaterializedCandidate> {
+    let mut next = MaterializedCandidate {
+        state: source.clone(),
+        route_action: None,
     };
-    match candidate.action {
+    match pending_action {
         PendingAction::Block { index, adjacent } => {
             let block = blocks.get(index)?;
             next.state.floor = block.floor.clone();
@@ -1774,20 +1772,24 @@ fn materialize_candidate(
                     if !set_block_consumed(&mut next.state, block, true) {
                         return None;
                     }
-                    next.action = Some(RouteAction::Block {
-                        index,
-                        action: BlockRouteAction::Door { yellow, blue, red },
-                    });
+                    if record_route {
+                        next.route_action = Some(RouteAction::Block {
+                            index,
+                            action: BlockRouteAction::Door { yellow, blue, red },
+                        });
+                    }
                 }
                 "resource" => {
                     add_delta(&mut next.state, &block.data["delta"]).ok()?;
                     if !set_block_consumed(&mut next.state, block, true) {
                         return None;
                     }
-                    next.action = Some(RouteAction::Block {
-                        index,
-                        action: BlockRouteAction::Resource,
-                    });
+                    if record_route {
+                        next.route_action = Some(RouteAction::Block {
+                            index,
+                            action: BlockRouteAction::Resource,
+                        });
+                    }
                 }
                 "enemy" => {
                     let loss = enemy_loss(&next.state, &block.data["enemy"])?;
@@ -1801,34 +1803,40 @@ fn materialize_candidate(
                     if !set_block_consumed(&mut next.state, block, true) {
                         return None;
                     }
-                    next.action = Some(RouteAction::Block {
-                        index,
-                        action: BlockRouteAction::Enemy {
-                            hp_loss: F64Bits::new(loss)?,
-                        },
-                    });
+                    if record_route {
+                        next.route_action = Some(RouteAction::Block {
+                            index,
+                            action: BlockRouteAction::Enemy {
+                                hp_loss: F64Bits::new(loss)?,
+                            },
+                        });
+                    }
                 }
                 "transition" => {
                     let target = &block.data["target"];
                     next.state.floor = target["floor_id"].as_str().unwrap_or_default().to_owned();
                     next.state.x = target["x"].as_u64().unwrap_or(0);
                     next.state.y = target["y"].as_u64().unwrap_or(0);
-                    next.action = Some(RouteAction::Block {
-                        index,
-                        action: BlockRouteAction::Transition,
-                    });
+                    if record_route {
+                        next.route_action = Some(RouteAction::Block {
+                            index,
+                            action: BlockRouteAction::Transition,
+                        });
+                    }
                 }
                 "event" => {
                     let event_details = apply_audited_event(&mut next.state, block, index, blocks)?;
-                    next.action = Some(RouteAction::Block {
-                        index,
-                        action: BlockRouteAction::Event {
-                            event_id: event_details["event_id"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_owned(),
-                        },
-                    });
+                    if record_route {
+                        next.route_action = Some(RouteAction::Block {
+                            index,
+                            action: BlockRouteAction::Event {
+                                event_id: event_details["event_id"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                            },
+                        });
+                    }
                 }
                 _ => return None,
             }
@@ -1902,26 +1910,295 @@ fn materialize_candidate(
                 }
             }
             Arc::make_mut(&mut next.state.shop_counts)[count_index] += 1;
-            next.action = Some(RouteAction::Shop {
-                floor,
-                shop_id: shop_id.to_owned(),
-                choice_id: choice["choice_id"].as_str().unwrap_or_default().to_owned(),
-                currency: currency.to_owned(),
-                cost,
-                purchase_count_before: purchase_count,
-                effects: effects
-                    .iter()
-                    .map(|effect| {
-                        Some(ShopRouteEffect {
-                            field: effect["field"].as_str().unwrap_or_default().to_owned(),
-                            amount: effect["amount"].as_u64().unwrap_or(0),
+            if record_route {
+                next.route_action = Some(RouteAction::Shop {
+                    floor,
+                    shop_id: shop_id.to_owned(),
+                    choice_id: choice["choice_id"].as_str().unwrap_or_default().to_owned(),
+                    currency: currency.to_owned(),
+                    cost,
+                    purchase_count_before: purchase_count,
+                    effects: effects
+                        .iter()
+                        .map(|effect| {
+                            Some(ShopRouteEffect {
+                                field: effect["field"].as_str().unwrap_or_default().to_owned(),
+                                amount: effect["amount"].as_u64().unwrap_or(0),
+                            })
                         })
-                    })
-                    .collect::<Option<Vec<_>>>()?,
-            });
+                        .collect::<Option<Vec<_>>>()?,
+                });
+            }
         }
     }
     Some(next)
+}
+
+#[derive(Clone)]
+struct RouteSegment {
+    navigation: Vec<usize>,
+    action: PendingAction,
+}
+
+struct Phase2Node {
+    route_key: String,
+    serial: usize,
+    state: SolverState,
+    steps: Vec<Value>,
+    segments: Vec<RouteSegment>,
+    // A witness is state-simple, matching Phase 1's exact-state search space.
+    // This prevents a route prefix from reaching the same state as one of its
+    // ancestors through a zero-state cycle.
+    visited_states: Vec<SolverState>,
+}
+
+impl PartialEq for Phase2Node {
+    fn eq(&self, other: &Self) -> bool {
+        self.route_key == other.route_key && self.serial == other.serial
+    }
+}
+
+impl Eq for Phase2Node {}
+
+impl Ord for Phase2Node {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .route_key
+            .cmp(&self.route_key)
+            .then_with(|| other.serial.cmp(&self.serial))
+    }
+}
+
+impl PartialOrd for Phase2Node {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct Phase2Route {
+    state: SolverState,
+    steps: Vec<Value>,
+    segments: Vec<RouteSegment>,
+    terminal_floor: String,
+    terminal_pos: (u64, u64),
+    terminal_navigation: Vec<usize>,
+}
+
+fn append_navigation_steps(steps: &mut Vec<Value>, navigation: &[usize], blocks: &[SolverBlock]) {
+    steps.extend(navigation.iter().map(|index| {
+        route_action_json(
+            &RouteAction::Block {
+                index: *index,
+                action: BlockRouteAction::Transition,
+            },
+            blocks,
+        )
+    }));
+}
+
+fn route_steps_key(steps: &[Value]) -> String {
+    serde_json::to_string(steps).expect("route steps are serializable")
+}
+
+fn phase2_prefix_is_better(
+    seen_prefix: &HashMap<SolverState, String>,
+    state: &SolverState,
+    route_key: &str,
+) -> bool {
+    seen_prefix
+        .get(state)
+        .is_none_or(|existing| route_key < existing.as_str())
+}
+
+fn enqueue_phase2_action(
+    queue: &mut BinaryHeap<Phase2Node>,
+    serial: &mut usize,
+    source: &Phase2Node,
+    navigation: Vec<usize>,
+    action: PendingAction,
+    blocks: &[SolverBlock],
+    shops: &[Value],
+) {
+    let Some(materialized) =
+        materialize_pending_action(&source.state, action.clone(), blocks, shops, true)
+    else {
+        return;
+    };
+    let Some(route_action) = materialized.route_action else {
+        return;
+    };
+    let mut steps = source.steps.clone();
+    append_navigation_steps(&mut steps, &navigation, blocks);
+    steps.push(route_action_json(&route_action, blocks));
+    let mut segments = source.segments.clone();
+    segments.push(RouteSegment { navigation, action });
+    *serial = serial.saturating_add(1);
+    queue.push(Phase2Node {
+        route_key: route_steps_key(&steps),
+        serial: *serial,
+        state: materialized.state,
+        steps,
+        segments,
+        visited_states: source.visited_states.clone(),
+    });
+}
+
+fn replay_phase2_route(
+    initial: &SolverState,
+    route: &Phase2Route,
+    blocks: &[SolverBlock],
+    shops: &[Value],
+) -> Option<SolverState> {
+    let mut state = initial.clone();
+    for segment in &route.segments {
+        for &index in &segment.navigation {
+            let transition = blocks.get(index)?;
+            if transition.kind != "transition" || block_is_consumed(&state, transition) {
+                return None;
+            }
+            let (floor, x, y) = transition_target(transition)?;
+            state.floor = floor.to_owned();
+            state.x = x;
+            state.y = y;
+        }
+        state =
+            materialize_pending_action(&state, segment.action.clone(), blocks, shops, false)?.state;
+    }
+    for &index in &route.terminal_navigation {
+        let transition = blocks.get(index)?;
+        if transition.kind != "transition" || block_is_consumed(&state, transition) {
+            return None;
+        }
+        let (floor, x, y) = transition_target(transition)?;
+        state.floor = floor.to_owned();
+        state.x = x;
+        state.y = y;
+    }
+    // Walking inside the reachable component is not a route step. The terminal
+    // witness may therefore end at another free cell after its last transition.
+    state.floor = route.terminal_floor.clone();
+    (state.x, state.y) = route.terminal_pos;
+    Some(state)
+}
+
+enum Phase2Outcome {
+    Found(Phase2Route),
+    BudgetExhausted,
+    NoWitness,
+}
+
+fn extract_route_witness(
+    initial: &SolverState,
+    target: NumericObjective,
+    max_states: usize,
+    connectivity: &ConnectivityIndex,
+    floors: &HashMap<String, SolverFloor>,
+    blocks: &[SolverBlock],
+    terminals: &[(&str, (u64, u64))],
+    shops: &[Value],
+) -> Phase2Outcome {
+    #[cfg(test)]
+    PHASE2_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let mut queue = BinaryHeap::new();
+    queue.push(Phase2Node {
+        route_key: route_steps_key(&[]),
+        serial: 0,
+        state: initial.clone(),
+        steps: Vec::new(),
+        segments: Vec::new(),
+        visited_states: Vec::new(),
+    });
+    let mut serial = 0usize;
+    let mut seen_prefix = HashMap::<SolverState, String>::new();
+    let mut explored = 0usize;
+    let mut best: Option<(String, Phase2Route)> = None;
+    while let Some(mut node) = queue.pop() {
+        if explored >= max_states {
+            return Phase2Outcome::BudgetExhausted;
+        }
+        let view = connectivity.view(&node.state, floors, blocks, terminals, true);
+        (node.state.floor, node.state.x, node.state.y) = view.representative.clone();
+        if node.visited_states.iter().any(|old| old == &node.state) {
+            continue;
+        }
+        if !phase2_prefix_is_better(&seen_prefix, &node.state, &node.route_key) {
+            continue;
+        }
+        seen_prefix.insert(node.state.clone(), node.route_key.clone());
+        node.visited_states.push(node.state.clone());
+        explored += 1;
+        for terminal in &view.terminals {
+            if NumericObjective::from_state(&node.state).matches(target) {
+                let mut steps = node.steps.clone();
+                append_navigation_steps(&mut steps, &terminal.navigation, blocks);
+                steps.push(json!({"step_kind":"terminal","floor_id":terminal.floor,"x":terminal.position.0,"y":terminal.position.1,"details":{}}));
+                let candidate = Phase2Route {
+                    state: node.state.clone(),
+                    steps,
+                    segments: node.segments.clone(),
+                    terminal_floor: terminal.floor.clone(),
+                    terminal_pos: terminal.position,
+                    terminal_navigation: terminal.navigation.clone(),
+                };
+                let key = route_steps_key(&candidate.steps);
+                if replay_phase2_route(initial, &candidate, blocks, shops)
+                    .is_some_and(|replayed| NumericObjective::from_state(&replayed).matches(target))
+                    && best.as_ref().is_none_or(|(old, _)| key < *old)
+                {
+                    best = Some((key, candidate));
+                }
+            }
+        }
+        for boundary in view.boundaries {
+            enqueue_phase2_action(
+                &mut queue,
+                &mut serial,
+                &node,
+                boundary.navigation,
+                PendingAction::Block {
+                    index: boundary.index,
+                    adjacent: boundary.adjacent,
+                },
+                blocks,
+                shops,
+            );
+        }
+        let mut choice_offset = 0usize;
+        for (shop_index, shop) in shops.iter().enumerate() {
+            let shop_id = shop
+                .get("shop_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let choices = shop
+                .get("choices")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some((floor, adjacent, navigation)) = view.shops.get(shop_id) {
+                for choice_index in 0..choices.len() {
+                    enqueue_phase2_action(
+                        &mut queue,
+                        &mut serial,
+                        &node,
+                        navigation.clone(),
+                        PendingAction::Shop {
+                            shop_index,
+                            choice_index,
+                            choice_offset,
+                            floor: floor.clone(),
+                            adjacent: *adjacent,
+                        },
+                        blocks,
+                        shops,
+                    );
+                }
+            }
+            choice_offset += choices.len();
+        }
+    }
+    best.map_or(Phase2Outcome::NoWitness, |(_, route)| {
+        Phase2Outcome::Found(route)
+    })
 }
 
 fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
@@ -2068,19 +2345,13 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         .and_then(Value::as_u64)
         .map(|value| value.clamp(1, MAX_GLOBAL_STATES as u64) as usize)
         .unwrap_or(MAX_GLOBAL_STATES);
-    let mut initial_node = Some(SearchNode {
-        state: initial,
-        parent: None,
-        navigation: Arc::new(Vec::new()),
-        action: None,
-    });
+    let mut initial_node = Some(initial.clone());
     let mut queue: VecDeque<PendingCandidate> = VecDeque::new();
     let mut state_arena = Vec::new();
-    let mut route_arena = Vec::new();
     let mut seen = HashSet::new();
     let mut dominance: HashMap<StructuralKey, Vec<[f64; 8]>> = HashMap::new();
     let mut explored = 0usize;
-    let mut best: Option<TerminalRoute> = None;
+    let mut best: Option<NumericObjective> = None;
     let mut budget_exhausted = false;
     loop {
         let mut next_node = initial_node.take();
@@ -2088,7 +2359,12 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
             let Some(candidate) = queue.pop_front() else {
                 break;
             };
-            next_node = materialize_candidate(candidate, &state_arena, &blocks, &shops);
+            let source = state_arena
+                .get(candidate.source)
+                .expect("pending candidate source must be an accepted state");
+            next_node =
+                materialize_pending_action(source, candidate.action, &blocks, &shops, false)
+                    .map(|candidate| candidate.state);
         }
         let Some(mut node) = next_node else {
             break;
@@ -2097,21 +2373,21 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
             budget_exhausted = true;
             break;
         }
-        let view = connectivity.view(&node.state, &floors, &blocks, &terminals);
-        (node.state.floor, node.state.x, node.state.y) = view.representative.clone();
-        if !seen.insert(node.state.clone()) {
+        let view = connectivity.view(&node, &floors, &blocks, &terminals, false);
+        (node.floor, node.x, node.y) = view.representative.clone();
+        if !seen.insert(node.clone()) {
             continue;
         }
-        let structural = StructuralKey::from(&node.state);
+        let structural = StructuralKey::from(&node);
         let resources = [
-            node.state.hp.get(),
-            node.state.attack.get(),
-            node.state.defense.get(),
-            node.state.gold as f64,
-            node.state.experience as f64,
-            node.state.yellow as f64,
-            node.state.blue as f64,
-            node.state.red as f64,
+            node.hp.get(),
+            node.attack.get(),
+            node.defense.get(),
+            node.gold as f64,
+            node.experience as f64,
+            node.yellow as f64,
+            node.blue as f64,
+            node.red as f64,
         ];
         let frontier = dominance.entry(structural).or_default();
         if frontier.iter().any(|old| {
@@ -2129,41 +2405,17 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         });
         frontier.push(resources);
         explored += 1;
-        let route_index = route_arena.len();
-        route_arena.push(RouteLink {
-            parent: node.parent,
-            navigation: node.navigation.clone(),
-            action: node.action.clone(),
-        });
-        debug_assert_eq!(route_index, state_arena.len());
-        state_arena.push(node.state.clone());
-        if let Some((terminal_floor, terminal_pos, terminal_navigation)) = view.terminal {
-            let mut steps = reconstruct_steps(&route_arena, route_index, &blocks);
-            steps.extend(terminal_navigation.iter().map(|index| {
-                route_action_json(
-                    &RouteAction::Block {
-                        index: *index,
-                        action: BlockRouteAction::Transition,
-                    },
-                    &blocks,
-                )
-            }));
-            steps.push(json!({"step_kind":"terminal","floor_id":terminal_floor,"x":terminal_pos.0,"y":terminal_pos.1,"details":{}}));
-            let won = TerminalRoute {
-                state: node.state.clone(),
-                steps,
-            };
-            if best
-                .as_ref()
-                .is_none_or(|old| terminal_route_is_better(&won, old))
-            {
-                best = Some(won);
+        let state_index = state_arena.len();
+        state_arena.push(node.clone());
+        if !view.terminals.is_empty() {
+            let objective = NumericObjective::from_state(&node);
+            if best.is_none_or(|old| objective.cmp(old).is_gt()) {
+                best = Some(objective);
             }
         }
         for boundary in view.boundaries {
             queue.push_back(PendingCandidate {
-                source: route_index,
-                navigation: boundary.navigation,
+                source: state_index,
                 action: PendingAction::Block {
                     index: boundary.index,
                     adjacent: boundary.adjacent,
@@ -2183,11 +2435,10 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            if let Some((shop_floor, adjacent, navigation)) = accessible {
+            if let Some((shop_floor, adjacent, _navigation)) = accessible {
                 for local in 0..choices.len() {
                     queue.push_back(PendingCandidate {
-                        source: route_index,
-                        navigation: navigation.clone(),
+                        source: state_index,
                         action: PendingAction::Shop {
                             shop_index,
                             choice_index: local,
@@ -2204,11 +2455,32 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
     if budget_exhausted {
         json!({"scope":"global_terminal_route","proof":"unproven","reason":"search_budget_exhausted",
         "truncated":true,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null})
-    } else if let Some(best) = best {
-        let first = best.steps.first().cloned();
-        json!({"scope":"global_terminal_route","proof":"proven","reason":"complete terminal route found","truncated":false,
-        "explored_states":explored,"terminal_hp":best.state.hp.get(),"terminal_attack":best.state.attack.get(),
-        "terminal_defense":best.state.defense.get(),"blockers":blockers,"route":{"step_count":best.steps.len(),"steps":best.steps},"first_suggestion":first})
+    } else if let Some(target) = best {
+        match extract_route_witness(
+            &initial,
+            target,
+            max_states,
+            &connectivity,
+            &floors,
+            &blocks,
+            &terminals,
+            &shops,
+        ) {
+            Phase2Outcome::Found(best) => {
+                let first = best.steps.first().cloned();
+                json!({"scope":"global_terminal_route","proof":"proven","reason":"complete terminal route found","truncated":false,
+                "explored_states":explored,"terminal_hp":best.state.hp.get(),"terminal_attack":best.state.attack.get(),
+                "terminal_defense":best.state.defense.get(),"blockers":blockers,"route":{"step_count":best.steps.len(),"steps":best.steps},"first_suggestion":first})
+            }
+            Phase2Outcome::BudgetExhausted => {
+                json!({"scope":"global_terminal_route","proof":"unproven","reason":"search_budget_exhausted",
+                "truncated":true,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null})
+            }
+            Phase2Outcome::NoWitness => {
+                json!({"scope":"global_terminal_route","proof":"unproven","reason":"route_witness_unavailable",
+                "truncated":false,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null})
+            }
+        }
     } else {
         json!({"scope":"global_terminal_route","proof":if blockers.is_empty(){"unproven"}else{"unsupported"},"reason":"no_complete_supported_route",
         "truncated":false,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null})
@@ -2390,52 +2662,96 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn terminal_node(attack: u64, defense: u64, hp: u64, route: &str) -> TerminalRoute {
-        TerminalRoute {
-            state: SolverState {
-                floor: "F".to_owned(),
-                x: 0,
-                y: 0,
-                hp: F64Bits::new(hp as f64).unwrap(),
-                attack: F64Bits::new(attack as f64).unwrap(),
-                defense: F64Bits::new(defense as f64).unwrap(),
-                level: 0,
-                gold: 0,
-                experience: 0,
-                yellow: 0,
-                blue: 0,
-                red: 0,
-                inventory: Arc::new(Vec::new()),
-                consumed: ConsumedBits::new(0),
-                shop_counts: Arc::new(Vec::new()),
-                flags: Arc::new(Vec::new()),
-            },
-            steps: vec![json!({"route": route})],
+    fn terminal_node(attack: u64, defense: u64, hp: u64, _route: &str) -> SolverState {
+        SolverState {
+            floor: "F".to_owned(),
+            x: 0,
+            y: 0,
+            hp: F64Bits::new(hp as f64).unwrap(),
+            attack: F64Bits::new(attack as f64).unwrap(),
+            defense: F64Bits::new(defense as f64).unwrap(),
+            level: 0,
+            gold: 0,
+            experience: 0,
+            yellow: 0,
+            blue: 0,
+            red: 0,
+            inventory: Arc::new(Vec::new()),
+            consumed: ConsumedBits::new(0),
+            shop_counts: Arc::new(Vec::new()),
+            flags: Arc::new(Vec::new()),
         }
     }
 
     #[test]
     fn terminal_route_order_is_attributes_then_balance_then_hp_then_route() {
-        let hp_rich = terminal_node(10, 10, 10_000, "b");
-        let stronger = terminal_node(11, 10, 1, "z");
-        assert!(terminal_route_is_better(&stronger, &hp_rich));
+        let hp_rich = NumericObjective::from_state(&terminal_node(10, 10, 10_000, "b"));
+        let stronger = NumericObjective::from_state(&terminal_node(11, 10, 1, "z"));
+        assert!(stronger.cmp(hp_rich).is_gt());
 
-        let unbalanced = terminal_node(19, 1, 10_000, "a");
-        let balanced = terminal_node(10, 10, 1, "z");
-        assert!(terminal_route_is_better(&balanced, &unbalanced));
+        let unbalanced = NumericObjective::from_state(&terminal_node(19, 1, 10_000, "a"));
+        let balanced = NumericObjective::from_state(&terminal_node(10, 10, 1, "z"));
+        assert!(balanced.cmp(unbalanced).is_gt());
 
-        let low_hp = terminal_node(10, 10, 5, "a");
-        let high_hp = terminal_node(10, 10, 6, "z");
-        assert!(terminal_route_is_better(&high_hp, &low_hp));
+        let low_hp = NumericObjective::from_state(&terminal_node(10, 10, 5, "a"));
+        let high_hp = NumericObjective::from_state(&terminal_node(10, 10, 6, "z"));
+        assert!(high_hp.cmp(low_hp).is_gt());
 
-        let later = terminal_node(10, 10, 6, "z");
-        let earlier = terminal_node(10, 10, 6, "a");
-        assert!(terminal_route_is_better(&earlier, &later));
-        assert!(!terminal_route_is_better(&later, &earlier));
-        assert!(!terminal_route_is_better(&earlier, &earlier));
+        let earlier = route_steps_key(&[json!({"route":"a"})]);
+        let later = route_steps_key(&[json!({"route":"z"})]);
+        assert!(earlier < later);
 
-        let overflow_safe = terminal_node(u64::MAX, u64::MAX, 1, "a");
-        assert!(terminal_route_is_better(&overflow_safe, &stronger));
+        let overflow_safe =
+            NumericObjective::from_state(&terminal_node(u64::MAX, u64::MAX, 1, "a"));
+        assert!(overflow_safe.cmp(stronger).is_gt());
+    }
+
+    #[test]
+    fn phase2_replaces_a_shorter_route_with_a_lexically_smaller_longer_route_to_same_state() {
+        let state = terminal_node(10, 10, 100, "same");
+        let shorter = route_steps_key(&[json!({"step_kind":"z_action"})]);
+        let longer = route_steps_key(&[
+            json!({"step_kind":"a_action"}),
+            json!({"step_kind":"z_action"}),
+        ]);
+        assert!(
+            longer < shorter,
+            "the longer route is deliberately lexically first"
+        );
+        let mut seen = HashMap::new();
+        seen.insert(state.clone(), shorter);
+        assert!(phase2_prefix_is_better(&seen, &state, &longer));
+    }
+
+    #[test]
+    fn phase2_budget_fails_closed_before_witness_search() {
+        let mut initial = terminal_node(10, 10, 100, "initial");
+        initial.consumed = ConsumedBits::from_bools(&[false]);
+        let blocks = vec![SolverBlock {
+            floor: "F".to_owned(),
+            x: 1,
+            y: 0,
+            id: "extra".to_owned(),
+            kind: "resource".to_owned(),
+            data: json!({"delta":{"hp":0,"attack":0,"defense":0,"gold":0,"experience":0,
+                "keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}),
+            state_slot: Some(0),
+        }];
+        let floors = HashMap::from([("F".to_owned(), indexed_floor(2, vec![0]))]);
+        let connectivity = ConnectivityIndex::new(&floors, &blocks);
+        assert!(matches!(
+            extract_route_witness(
+                &initial,
+                NumericObjective::from_state(&initial),
+                1,
+                &connectivity,
+                &floors,
+                &blocks,
+                &[("F", (0, 0))],
+                &[],
+            ),
+            Phase2Outcome::BudgetExhausted
+        ));
     }
 
     #[test]
@@ -2461,35 +2777,28 @@ mod tests {
                 state_slot: Some(1),
             },
         ];
-        let arena = vec![
-            RouteLink {
-                parent: None,
-                navigation: Arc::new(Vec::new()),
-                action: None,
-            },
-            RouteLink {
-                parent: Some(0),
-                navigation: Arc::new(Vec::new()),
-                action: Some(RouteAction::Block {
+        let steps = vec![
+            route_action_json(
+                &RouteAction::Block {
                     index: 0,
                     action: BlockRouteAction::Door {
                         yellow: 1,
                         blue: 0,
                         red: 0,
                     },
-                }),
-            },
-            RouteLink {
-                parent: Some(1),
-                navigation: Arc::new(Vec::new()),
-                action: Some(RouteAction::Block {
+                },
+                &blocks,
+            ),
+            route_action_json(
+                &RouteAction::Block {
                     index: 1,
                     action: BlockRouteAction::Resource,
-                }),
-            },
+                },
+                &blocks,
+            ),
         ];
         assert_eq!(
-            reconstruct_steps(&arena, 2, &blocks),
+            steps,
             vec![
                 json!({"step_kind":"door","floor_id":"F","x":1,"y":0,
                     "block_id":"yellowDoor","details":{"key_cost":{"yellow":1,"blue":0,"red":0}}}),
@@ -2510,54 +2819,41 @@ mod tests {
             data: json!({"key_cost":{"yellow":1,"blue":0,"red":0}}),
             state_slot: Some(0),
         }];
-        let mut source = terminal_node(10, 10, 100, "root").state;
+        let mut source = terminal_node(10, 10, 100, "root");
         source.yellow = 1;
         source.consumed = ConsumedBits::from_bools(&[false]);
         let candidate = PendingCandidate {
             source: 0,
-            navigation: Arc::new(Vec::new()),
             action: PendingAction::Block {
                 index: 0,
                 adjacent: (0, 0),
             },
         };
-        let next = materialize_candidate(candidate, &[source.clone()], &blocks, &[]).unwrap();
-        assert_eq!(next.parent, Some(0));
+        let next =
+            materialize_pending_action(&source, candidate.action, &blocks, &[], true).unwrap();
         assert_eq!(next.state.yellow, 0);
         assert!(block_is_consumed(&next.state, &blocks[0]));
-        let arena = vec![
-            RouteLink {
-                parent: None,
-                navigation: Arc::new(Vec::new()),
-                action: None,
-            },
-            RouteLink {
-                parent: next.parent,
-                navigation: next.navigation,
-                action: next.action,
-            },
-        ];
-        let steps = reconstruct_steps(&arena, 1, &blocks);
-        assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0]["step_kind"], "door");
-        assert_eq!(steps[0]["details"]["key_cost"]["yellow"], 1);
+        let step = route_action_json(next.route_action.as_ref().unwrap(), &blocks);
+        assert_eq!(step["step_kind"], "door");
+        assert_eq!(step["details"]["key_cost"]["yellow"], 1);
 
         let mut invalid = source;
         invalid.yellow = 0;
         let candidate = PendingCandidate {
             source: 0,
-            navigation: Arc::new(Vec::new()),
             action: PendingAction::Block {
                 index: 0,
                 adjacent: (0, 0),
             },
         };
-        assert!(materialize_candidate(candidate, &[invalid], &blocks, &[]).is_none());
+        assert!(
+            materialize_pending_action(&invalid, candidate.action, &blocks, &[], false).is_none()
+        );
     }
 
     #[test]
     fn typed_structural_key_matches_legacy_json_fields_and_distinguishes_each_field() {
-        let mut state = terminal_node(10, 11, 100, "x").state;
+        let mut state = terminal_node(10, 11, 100, "x");
         state.floor = "F1".into();
         state.x = 2;
         state.y = 3;
@@ -2612,7 +2908,7 @@ mod tests {
 
     #[test]
     fn solver_state_large_collections_share_until_branch_mutation() {
-        let mut parent = terminal_node(10, 10, 100, "x").state;
+        let mut parent = terminal_node(10, 10, 100, "x");
         parent.inventory = Arc::new(vec![("book".into(), 1)]);
         parent.consumed = ConsumedBits::from_bools(&[false, false]);
         parent.shop_counts = Arc::new(vec![0]);
@@ -2728,7 +3024,7 @@ mod tests {
             },
         ];
         let legacy = [false, true, false, false];
-        let mut state = terminal_node(10, 10, 100, "x").state;
+        let mut state = terminal_node(10, 10, 100, "x");
         state.consumed = ConsumedBits::from_bools(&[legacy[1], legacy[2]]);
         for (index, block) in blocks.iter().enumerate() {
             assert_eq!(block_is_consumed(&state, block), legacy[index]);
@@ -2859,13 +3155,13 @@ mod tests {
             ("B".into(), indexed_floor(4, vec![1, 2, 3])),
         ]);
         let index = ConnectivityIndex::new(&floors, &blocks);
-        let mut state = terminal_node(10, 10, 100, "x").state;
+        let mut state = terminal_node(10, 10, 100, "x");
         state.floor = "A".into();
         state.x = 0;
         state.y = 0;
         state.consumed = ConsumedBits::from_bools(&[false]);
         let terminals = [("B", (3, 0))];
-        let closed = index.view(&state, &floors, &blocks, &terminals);
+        let closed = index.view(&state, &floors, &blocks, &terminals, true);
         assert_eq!(
             closed
                 .boundaries
@@ -2877,12 +3173,13 @@ mod tests {
         assert_eq!(closed.boundaries[0].navigation.as_slice(), &[0]);
         assert_eq!(closed.shops["remoteShop"].0, "B");
         assert_eq!(closed.shops["remoteShop"].2.as_slice(), &[0]);
-        assert!(closed.terminal.is_none());
+        assert!(closed.terminals.is_empty());
 
         assert!(set_block_consumed(&mut state, &blocks[2], true));
-        let opened = index.view(&state, &floors, &blocks, &terminals);
-        assert_eq!(opened.terminal.as_ref().unwrap().0, "B");
-        assert_eq!(opened.terminal.as_ref().unwrap().2.as_slice(), &[0]);
+        let opened = index.view(&state, &floors, &blocks, &terminals, true);
+        assert_eq!(opened.terminals.len(), 1);
+        assert_eq!(opened.terminals[0].floor, "B");
+        assert_eq!(opened.terminals[0].navigation.as_slice(), &[0]);
     }
 
     #[test]
@@ -2907,12 +3204,12 @@ mod tests {
             ("B".into(), indexed_floor(5, vec![1, 3, 4])),
         ]);
         let index = ConnectivityIndex::new(&floors, &blocks);
-        let mut state = terminal_node(10, 10, 100, "x").state;
+        let mut state = terminal_node(10, 10, 100, "x");
         state.floor = "A".into();
         state.x = 2;
         state.y = 0;
         state.consumed = ConsumedBits::from_bools(&[false]);
-        let view = index.view(&state, &floors, &blocks, &[]);
+        let view = index.view(&state, &floors, &blocks, &[], true);
         assert_eq!(
             view.boundaries
                 .iter()
@@ -3007,7 +3304,7 @@ mod tests {
 
     #[test]
     fn audited_resource_math_keeps_javascript_fractional_number_semantics() {
-        let mut state = terminal_node(10, 11, 1001, "x").state;
+        let mut state = terminal_node(10, 11, 1001, "x");
         add_delta(
             &mut state,
             &json!({"hp":1000,"attack":10,"defense":10,
@@ -3074,11 +3371,11 @@ mod tests {
             state_slot: Some(2),
         };
         let blocks = vec![gate_once.clone(), gate_retry.clone(), wand];
-        let mut once = terminal_node(10, 10, 100, "x").state;
+        let mut once = terminal_node(10, 10, 100, "x");
         once.consumed = ConsumedBits::from_bools(&[false; 3]);
         assert!(apply_audited_event(&mut once, &gate_once, 0, &blocks).is_some());
         assert_eq!(once.consumed.read(0), Some(true));
-        let mut retry = terminal_node(10, 10, 100, "x").state;
+        let mut retry = terminal_node(10, 10, 100, "x");
         retry.consumed = ConsumedBits::from_bools(&[false; 3]);
         assert!(apply_audited_event(&mut retry, &gate_retry, 1, &blocks).is_none());
         assert_eq!(retry.consumed.read(1), Some(false));
@@ -3102,7 +3399,7 @@ mod tests {
             blocks: vec![0],
         };
         let floors = HashMap::from([("F".into(), floor)]);
-        let mut state = terminal_node(10, 10, 100, "x").state;
+        let mut state = terminal_node(10, 10, 100, "x");
         state.floor = "F".into();
         state.consumed = ConsumedBits::from_bools(&[true]);
         let index = ConnectivityIndex::new(&floors, std::slice::from_ref(&block));
@@ -3162,7 +3459,7 @@ mod tests {
                 state_slot: Some(blocks.len()),
             });
         }
-        let mut state = terminal_node(5001, 5000, 200000, "x").state;
+        let mut state = terminal_node(5001, 5000, 200000, "x");
         state.floor = "MT_1".into();
         state.x = 6;
         state.y = 5;
@@ -3247,7 +3544,7 @@ mod tests {
             state_slot: Some(3),
         };
         let blocks = vec![thief.clone(), mt2_door, road_a, road_b];
-        let mut state = terminal_node(10, 10, 100, "x").state;
+        let mut state = terminal_node(10, 10, 100, "x");
         state.flags = Arc::new(vec![("switch:MT4:6,1:A".into(), 2)]);
         state.inventory = Arc::new(vec![("icePickaxe".into(), 1)]);
         state.consumed = ConsumedBits::from_bools(&vec![false; blocks.len()]);
@@ -3367,6 +3664,43 @@ mod tests {
         }"#).unwrap();
         value["engine_model"]["solver_model"]["search_budget"] = json!(search_budget);
         value
+    }
+
+    fn any_location_terminal_observation(locations: &[(u64, u64)]) -> Value {
+        json!({
+            "session_id":"S","floor_id":"F","map_instance_id":"M",
+            "dimensions":{"width":3,"height":2},"topology":{"kind":"rectangle"},
+            "hero":{"hp":10,"attack":1,"defense":1,"gold":0,"experience":0,"loc":{"x":0,"y":0}},
+            "keys":{"yellow":0,"blue":0,"red":0},"blocks":[],
+            "engine_model":{"inventory":{"classes":{}},"solver_model":{
+                "protocol":1,
+                "terminal":{"kind":"any_location","locations":locations.iter().map(|(x,y)|
+                    json!({"kind":"location","floor_id":"F","x":x,"y":y})).collect::<Vec<_>>()},
+                "blockers":[],"shops":[],
+                "floors":[{"floor_id":"F","width":3,"height":2,"topology":{"kind":"rectangle"},"blocks":[]}]}}
+        })
+    }
+
+    fn phase2_budget_response_observation() -> Value {
+        serde_json::from_str(
+            r#"{
+              "session_id":"S","floor_id":"F","map_instance_id":"M",
+              "dimensions":{"width":2,"height":2},"topology":{"kind":"rectangle"},
+              "hero":{"hp":10,"attack":1,"defense":1,"gold":0,"experience":0,"loc":{"x":0,"y":0}},
+              "keys":{"yellow":0,"blue":0,"red":0},"blocks":[],
+              "engine_model":{"inventory":{"classes":{}},"solver_model":{
+                "protocol":1,"search_budget":4,
+                "terminal":{"kind":"location","floor_id":"F","x":0,"y":0},
+                "blockers":[],"shops":[],
+                "floors":[{"floor_id":"F","width":2,"height":2,"topology":{"kind":"rectangle"},"blocks":[
+                  {"floor_id":"F","x":1,"y":0,"block_id":"z_resource","numeric_id":1,"kind":"resource",
+                   "delta":{"hp":0,"attack":0,"defense":0,"gold":0,"experience":0,"keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}},
+                  {"floor_id":"F","x":0,"y":1,"block_id":"a_resource","numeric_id":2,"kind":"resource",
+                   "delta":{"hp":0,"attack":0,"defense":0,"gold":0,"experience":0,"keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}
+                ]}]}}
+            }"#,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3510,7 +3844,48 @@ mod tests {
     }
 
     #[test]
+    fn all_reachable_terminals_choose_the_same_lexical_result_independent_of_input_order() {
+        let reverse = shadow_response(
+            &request_with(any_location_terminal_observation(&[(2, 0), (0, 0)])),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        let forward = shadow_response(
+            &request_with(any_location_terminal_observation(&[(0, 0), (2, 0)])),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        for response in [&reverse, &forward] {
+            let global = &response["shadow"]["analysis"]["global"];
+            assert_eq!(global["proof"], "proven");
+            assert_eq!(global["route"]["steps"].as_array().unwrap().len(), 1);
+            assert_eq!(global["route"]["steps"][0]["step_kind"], "terminal");
+            assert_eq!(global["route"]["steps"][0]["x"], 0);
+        }
+        assert_eq!(
+            reverse["shadow"]["analysis"]["global"],
+            forward["shadow"]["analysis"]["global"]
+        );
+    }
+
+    #[test]
+    fn phase2_budget_exhaustion_uses_the_protocol_search_budget_reason() {
+        let response = shadow_response(
+            &request_with(phase2_budget_response_observation()),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        let global = &response["shadow"]["analysis"]["global"];
+        assert_eq!(global["proof"], "unproven");
+        assert_eq!(global["reason"], "search_budget_exhausted");
+        assert_eq!(global["truncated"], true);
+        assert_eq!(global["route"], Value::Null);
+        assert_eq!(global["first_suggestion"], Value::Null);
+    }
+
+    #[test]
     fn global_search_budget_exhaustion_is_unproven_and_deterministic() {
+        PHASE2_CALLS.with(|calls| calls.set(0));
         for budget in [2, 3] {
             let request = request_with(two_terminal_routes(budget));
             let first = shadow_response(&request, &Mutex::new(ShadowState::default())).unwrap();
@@ -3528,6 +3903,7 @@ mod tests {
             assert!(global.get("terminal_defense").is_none());
             assert_eq!(global, &second["shadow"]["analysis"]["global"]);
         }
+        PHASE2_CALLS.with(|calls| assert_eq!(calls.get(), 0));
         // Terminal observations now keep expanding same-region candidates, so this complete
         // fixture needs one additional pop after the terminal branch is recorded.
         let complete = shadow_response(
