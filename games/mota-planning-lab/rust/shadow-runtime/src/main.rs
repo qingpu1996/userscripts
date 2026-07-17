@@ -630,6 +630,28 @@ struct SolverBlock {
     id: String,
     kind: String,
     data: Value,
+    state_slot: Option<usize>,
+}
+
+fn audited_event_state_target(floor: &str, x: u64, y: u64) -> bool {
+    matches!(
+        (floor, x, y),
+        ("MT20", 6, 8)
+            | ("MT16", 5, 5)
+            | ("MT2", 2, 7)
+            | ("MT18", 6, 9)
+            | ("MT18", 6, 10)
+            | ("MT18", 11, 11)
+            | ("MT23w", 5, 6)
+            | ("MT23e", 7, 6)
+            | ("MT_1", 5..=7, 2..=4)
+    )
+}
+
+fn block_needs_state_slot(block: &SolverBlock) -> bool {
+    matches!(block.kind.as_str(), "door" | "enemy" | "resource" | "event")
+        || block.data.get("initial_active").and_then(Value::as_bool) == Some(false)
+        || audited_event_state_target(&block.floor, block.x, block.y)
 }
 
 #[derive(Clone, Debug)]
@@ -924,6 +946,7 @@ fn parse_solver_world(
                     .map_err(|_| "block_kind_invalid".to_owned())?
                     .to_owned(),
                 data: block.clone(),
+                state_slot: None,
             });
             indices.push(index);
         }
@@ -936,6 +959,13 @@ fn parse_solver_world(
                 blocks: indices,
             },
         );
+    }
+    let mut next_slot = 0;
+    for block in &mut blocks {
+        if block_needs_state_slot(block) {
+            block.state_slot = Some(next_slot);
+            next_slot += 1;
+        }
     }
     Ok((floors, blocks, terminal, shops, blockers))
 }
@@ -953,7 +983,7 @@ fn reachable_cells(
         .iter()
         .filter_map(|index| {
             let block = &blocks[*index];
-            let consumed = state.consumed.get(*index).copied().unwrap_or(false);
+            let consumed = block_is_consumed(state, block);
             (!consumed && block.kind != "terrain" && block.kind != "shop")
                 .then_some((block.x, block.y))
         })
@@ -1080,24 +1110,69 @@ fn state_set(entries: &mut Arc<Vec<(String, u64)>>, id: &str, value: u64) {
     *entries = Arc::new(map.into_iter().collect());
 }
 
-fn set_consumed(state: &mut SolverState, index: usize, value: bool) {
-    Arc::make_mut(&mut state.consumed)[index] = value;
+fn block_is_consumed(state: &SolverState, block: &SolverBlock) -> bool {
+    block
+        .state_slot
+        .and_then(|slot| state.consumed.get(slot))
+        .copied()
+        .unwrap_or(false)
 }
 
-fn consume_at(state: &mut SolverState, blocks: &[SolverBlock], floor: &str, x: u64, y: u64) {
-    for (index, block) in blocks.iter().enumerate() {
-        if block.floor == floor && block.x == x && block.y == y {
-            set_consumed(state, index, true);
-        }
-    }
+fn set_block_consumed(state: &mut SolverState, block: &SolverBlock, value: bool) -> bool {
+    let Some(slot) = block.state_slot else {
+        return false;
+    };
+    let Some(current) = Arc::make_mut(&mut state.consumed).get_mut(slot) else {
+        return false;
+    };
+    *current = value;
+    true
 }
 
-fn activate_at(state: &mut SolverState, blocks: &[SolverBlock], floor: &str, x: u64, y: u64) {
-    for (index, block) in blocks.iter().enumerate() {
-        if block.floor == floor && block.x == x && block.y == y {
-            set_consumed(state, index, false);
-        }
+fn set_at(
+    state: &mut SolverState,
+    blocks: &[SolverBlock],
+    floor: &str,
+    x: u64,
+    y: u64,
+    value: bool,
+) -> bool {
+    let targets: Vec<_> = blocks
+        .iter()
+        .filter(|block| block.floor == floor && block.x == x && block.y == y)
+        .collect();
+    if targets.is_empty()
+        || targets.iter().any(|block| {
+            block
+                .state_slot
+                .is_none_or(|slot| slot >= state.consumed.len())
+        })
+    {
+        return false;
     }
+    targets
+        .into_iter()
+        .all(|block| set_block_consumed(state, block, value))
+}
+
+fn consume_at(
+    state: &mut SolverState,
+    blocks: &[SolverBlock],
+    floor: &str,
+    x: u64,
+    y: u64,
+) -> bool {
+    set_at(state, blocks, floor, x, y, true)
+}
+
+fn activate_at(
+    state: &mut SolverState,
+    blocks: &[SolverBlock],
+    floor: &str,
+    x: u64,
+    y: u64,
+) -> bool {
+    set_at(state, blocks, floor, x, y, false)
 }
 
 fn replace_at(
@@ -1108,27 +1183,36 @@ fn replace_at(
     y: u64,
     numeric_id: u64,
 ) -> bool {
-    let mut replacement = None;
-    for (index, block) in blocks.iter().enumerate() {
-        if block.floor == floor && block.x == x && block.y == y {
-            set_consumed(state, index, true);
-            if block.data.get("numeric_id").and_then(Value::as_u64) == Some(numeric_id) {
-                replacement = Some(index);
+    let targets: Vec<_> = blocks
+        .iter()
+        .filter(|block| block.floor == floor && block.x == x && block.y == y)
+        .collect();
+    let replacement = targets
+        .iter()
+        .find(|block| block.data.get("numeric_id").and_then(Value::as_u64) == Some(numeric_id));
+    if targets.is_empty()
+        || replacement.is_none()
+        || targets.iter().any(|block| {
+            block
+                .state_slot
+                .is_none_or(|slot| slot >= state.consumed.len())
+        })
+    {
+        false
+    } else {
+        for block in &targets {
+            if !set_block_consumed(state, block, true) {
+                return false;
             }
         }
-    }
-    if let Some(index) = replacement {
-        set_consumed(state, index, false);
-        true
-    } else {
-        false
+        set_block_consumed(state, replacement.unwrap(), false)
     }
 }
 
 fn apply_audited_event(
     state: &mut SolverState,
     block: &SolverBlock,
-    block_index: usize,
+    _block_index: usize,
     blocks: &[SolverBlock],
 ) -> Option<Value> {
     let id = block.data.get("event")?.get("id")?.as_str()?;
@@ -1153,37 +1237,41 @@ fn apply_audited_event(
                 state.hp = state.hp.mul(4.0)?.div(3.0)?;
                 state.attack = state.attack.mul(4.0)?.div(3.0)?;
                 state.defense = state.defense.mul(4.0)?.div(3.0)?;
-                set_consumed(state, block_index, true);
-                activate_at(state, blocks, "MT20", 6, 8);
+                if !set_block_consumed(state, block, true)
+                    || !activate_at(state, blocks, "MT20", 6, 8)
+                {
+                    return None;
+                }
             } else {
                 return None;
             }
         }
         "book_reward" => {
             add_item(state, "book", 1);
-            set_consumed(state, block_index, true);
+            set_block_consumed(state, block, true).then_some(())?;
         }
         "sword2_reward" => {
             state.attack = state.attack.add(70.0)?;
-            set_consumed(state, block_index, true);
+            set_block_consumed(state, block, true).then_some(())?;
         }
         "shield2_reward" => {
             state.defense = state.defense.add(30.0)?;
-            set_consumed(state, block_index, true);
+            set_block_consumed(state, block, true).then_some(())?;
         }
         "cross_reward" => {
             add_item(state, "cross", 1);
-            set_consumed(state, block_index, true);
-            consume_at(state, blocks, "MT16", 5, 5);
+            if !set_block_consumed(state, block, true) || !consume_at(state, blocks, "MT16", 5, 5) {
+                return None;
+            }
         }
         "fly_reward" => {
             add_item(state, "fly", 1);
             state_set(&mut state.flags, "fly", 1);
-            set_consumed(state, block_index, true);
+            set_block_consumed(state, block, true).then_some(())?;
         }
         "ice_pickaxe_reward" => {
             add_item(state, "icePickaxe", 1);
-            set_consumed(state, block_index, true);
+            set_block_consumed(state, block, true).then_some(())?;
         }
         "exp_sword_trade" => {
             if state.experience < 500 {
@@ -1191,7 +1279,7 @@ fn apply_audited_event(
             }
             state.experience -= 500;
             state.attack = state.attack.add(120.0)?;
-            set_consumed(state, block_index, true);
+            set_block_consumed(state, block, true).then_some(())?;
         }
         "gold_shield_trade" => {
             if state.gold < 500 {
@@ -1199,23 +1287,26 @@ fn apply_audited_event(
             }
             state.gold -= 500;
             state.defense = state.defense.add(120.0)?;
-            set_consumed(state, block_index, true);
+            set_block_consumed(state, block, true).then_some(())?;
         }
         "ice_wand_reward" => {
             state_set(&mut state.flags, "16", 1);
-            set_consumed(state, block_index, true);
+            set_block_consumed(state, block, true).then_some(())?;
         }
         "dialogue_once" => {
-            set_consumed(state, block_index, true);
+            set_block_consumed(state, block, true).then_some(())?;
         }
         "thief_quest" => {
             if state_count(&state.flags, "switch:MT4:6,1:A") == 0 {
                 state_set(&mut state.flags, "switch:MT4:6,1:A", 1);
-                consume_at(state, blocks, "MT2", 2, 7);
+                consume_at(state, blocks, "MT2", 2, 7).then_some(())?;
             } else if consume_item(state, "icePickaxe", 1) {
-                consume_at(state, blocks, "MT18", 6, 9);
-                consume_at(state, blocks, "MT18", 6, 10);
-                set_consumed(state, block_index, true);
+                if !consume_at(state, blocks, "MT18", 6, 9)
+                    || !consume_at(state, blocks, "MT18", 6, 10)
+                    || !set_block_consumed(state, block, true)
+                {
+                    return None;
+                }
             } else {
                 return None;
             }
@@ -1225,23 +1316,23 @@ fn apply_audited_event(
                 return None;
             }
             state_set(&mut state.flags, "switch:MT18:6,5:A", 1);
-            activate_at(state, blocks, "MT18", 11, 11);
+            activate_at(state, blocks, "MT18", 11, 11).then_some(())?;
         }
         "wand_gate_remove_on_failure" | "wand_gate_retry" => {
-            let missing = blocks.iter().enumerate().any(|(index, candidate)| {
+            let missing = blocks.iter().any(|candidate| {
                 ((candidate.floor == "MT23w" && candidate.x == 5 && candidate.y == 6)
                     || (candidate.floor == "MT23e" && candidate.x == 7 && candidate.y == 6))
-                    && !state.consumed[index]
+                    && !block_is_consumed(state, candidate)
             });
             if missing {
                 if id == "wand_gate_remove_on_failure" {
-                    set_consumed(state, block_index, true);
+                    set_block_consumed(state, block, true).then_some(())?;
                 } else {
                     return None;
                 }
             } else {
                 state_set(&mut state.flags, "final_wand_gate", 1);
-                set_consumed(state, block_index, true);
+                set_block_consumed(state, block, true).then_some(())?;
                 for (x, y, numeric_id) in [
                     (5, 2, 181),
                     (6, 2, 182),
@@ -1332,8 +1423,10 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         consumed: Arc::new(
             blocks
                 .iter()
-                .map(|block| {
-                    block.data.get("initial_active").and_then(Value::as_bool) == Some(false)
+                .filter_map(|block| {
+                    block.state_slot.map(|_| {
+                        block.data.get("initial_active").and_then(Value::as_bool) == Some(false)
+                    })
                 })
                 .collect(),
         ),
@@ -1480,7 +1573,7 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         }
         for (index, block) in blocks.iter().enumerate() {
             if block.floor != node.state.floor
-                || node.state.consumed[index]
+                || block_is_consumed(&node.state, block)
                 || block.kind == "opaque"
                 || block.kind == "terrain"
                 || !adjacent(&reachable, block.x, block.y)
@@ -1530,7 +1623,9 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                             .filter(|(_, count)| *count > 0)
                             .collect(),
                     );
-                    set_consumed(&mut next.state, index, true);
+                    if !set_block_consumed(&mut next.state, block, true) {
+                        continue;
+                    }
                     next.action = Some(RouteAction::Block {
                         index,
                         action: BlockRouteAction::Door {
@@ -1544,7 +1639,9 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     if add_delta(&mut next.state, &block.data["delta"]).is_err() {
                         continue;
                     }
-                    set_consumed(&mut next.state, index, true);
+                    if !set_block_consumed(&mut next.state, block, true) {
+                        continue;
+                    }
                     next.action = Some(RouteAction::Block {
                         index,
                         action: BlockRouteAction::Resource,
@@ -1561,7 +1658,9 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     next.state.gold += block.data["enemy"]["gold"].as_u64().unwrap_or(0);
                     next.state.experience +=
                         block.data["enemy"]["experience"].as_u64().unwrap_or(0);
-                    set_consumed(&mut next.state, index, true);
+                    if !set_block_consumed(&mut next.state, block, true) {
+                        continue;
+                    }
                     next.action = Some(RouteAction::Block {
                         index,
                         action: BlockRouteAction::Enemy {
@@ -1965,6 +2064,7 @@ mod tests {
                 id: "yellowDoor".into(),
                 kind: "door".into(),
                 data: json!({}),
+                state_slot: Some(0),
             },
             SolverBlock {
                 floor: "F".into(),
@@ -1974,6 +2074,7 @@ mod tests {
                 kind: "resource".into(),
                 data: json!({"delta":{"hp":0,"attack":3,"defense":0,"gold":0,
                     "experience":0,"keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}),
+                state_slot: Some(1),
             },
         ];
         let arena = vec![
@@ -2080,7 +2181,7 @@ mod tests {
         assert!(Arc::ptr_eq(&parent.flags, &child.flags));
 
         state_set(&mut child.inventory, "cross", 1);
-        set_consumed(&mut child, 0, true);
+        Arc::make_mut(&mut child.consumed)[0] = true;
         Arc::make_mut(&mut child.shop_counts)[0] = 1;
         state_set(&mut child.flags, "quest", 2);
         assert!(!Arc::ptr_eq(&parent.inventory, &child.inventory));
@@ -2095,6 +2196,105 @@ mod tests {
         assert!(child.consumed[0]);
         assert_eq!(child.shop_counts[0], 1);
         assert_eq!(state_count(&child.flags, "quest"), 2);
+    }
+
+    #[test]
+    fn consumed_slots_cover_only_mutable_blocks_and_all_audited_event_targets() {
+        let block = |floor: &str, x, y, kind: &str, initial_active: Option<bool>| SolverBlock {
+            floor: floor.into(),
+            x,
+            y,
+            id: kind.into(),
+            kind: kind.into(),
+            data: initial_active.map_or_else(|| json!({}), |value| json!({"initial_active":value})),
+            state_slot: None,
+        };
+        for kind in ["door", "enemy", "resource", "event"] {
+            assert!(block_needs_state_slot(&block("F", 0, 0, kind, None)));
+        }
+        for (floor, x, y) in [
+            ("MT20", 6, 8),
+            ("MT16", 5, 5),
+            ("MT2", 2, 7),
+            ("MT18", 6, 9),
+            ("MT18", 6, 10),
+            ("MT18", 11, 11),
+            ("MT23w", 5, 6),
+            ("MT23e", 7, 6),
+        ] {
+            assert!(block_needs_state_slot(&block(floor, x, y, "opaque", None)));
+        }
+        for x in 5..=7 {
+            for y in 2..=4 {
+                assert!(block_needs_state_slot(&block(
+                    "MT_1", x, y, "terrain", None
+                )));
+            }
+        }
+        assert!(block_needs_state_slot(&block(
+            "F",
+            0,
+            0,
+            "terrain",
+            Some(false)
+        )));
+        for kind in ["opaque", "terrain", "transition", "shop"] {
+            assert!(!block_needs_state_slot(&block("F", 0, 0, kind, None)));
+        }
+    }
+
+    #[test]
+    fn compressed_consumed_projection_matches_legacy_full_block_projection() {
+        let mut blocks = vec![
+            SolverBlock {
+                floor: "F".into(),
+                x: 0,
+                y: 0,
+                id: "wall".into(),
+                kind: "terrain".into(),
+                data: json!({}),
+                state_slot: None,
+            },
+            SolverBlock {
+                floor: "F".into(),
+                x: 1,
+                y: 0,
+                id: "door".into(),
+                kind: "door".into(),
+                data: json!({}),
+                state_slot: Some(0),
+            },
+            SolverBlock {
+                floor: "F".into(),
+                x: 2,
+                y: 0,
+                id: "hidden".into(),
+                kind: "opaque".into(),
+                data: json!({"initial_active":false}),
+                state_slot: Some(1),
+            },
+            SolverBlock {
+                floor: "F".into(),
+                x: 3,
+                y: 0,
+                id: "stairs".into(),
+                kind: "transition".into(),
+                data: json!({}),
+                state_slot: None,
+            },
+        ];
+        let legacy = [false, true, false, false];
+        let mut state = terminal_node(10, 10, 100, "x").state;
+        state.consumed = Arc::new(vec![legacy[1], legacy[2]]);
+        for (index, block) in blocks.iter().enumerate() {
+            assert_eq!(block_is_consumed(&state, block), legacy[index]);
+        }
+        assert!(!set_block_consumed(&mut state, &blocks[0], true));
+        assert_eq!(&*state.consumed, &[true, false]);
+        assert!(set_block_consumed(&mut state, &blocks[2], true));
+        assert!(block_is_consumed(&state, &blocks[2]));
+        blocks[2].state_slot = None;
+        assert!(!set_block_consumed(&mut state, &blocks[2], false));
     }
 
     #[test]
@@ -2118,10 +2318,19 @@ mod tests {
             id: "fairy".into(),
             kind: "event".into(),
             data: json!({"event":{"id":"fairy_mt0"}}),
+            state_slot: Some(0),
         };
-        state.consumed = Arc::new(vec![false]);
-        let details =
-            apply_audited_event(&mut state, &block, 0, std::slice::from_ref(&block)).unwrap();
+        let target = SolverBlock {
+            floor: "MT20".into(),
+            x: 6,
+            y: 8,
+            id: "hidden".into(),
+            kind: "opaque".into(),
+            data: json!({"initial_active":false}),
+            state_slot: Some(1),
+        };
+        state.consumed = Arc::new(vec![false, true]);
+        let details = apply_audited_event(&mut state, &block, 0, &[block.clone(), target]).unwrap();
         assert_eq!(details["event_id"], "fairy_mt0");
         assert_eq!(state.attack.get(), 20.0 * 4.0 / 3.0);
         assert!(!state.attack.get().fract().eq(&0.0));
@@ -2136,6 +2345,7 @@ mod tests {
             id: "fairy".into(),
             kind: "event".into(),
             data: json!({"event":{"id":"wand_gate_remove_on_failure"}}),
+            state_slot: Some(0),
         };
         let gate_retry = SolverBlock {
             floor: "MT22".into(),
@@ -2144,6 +2354,7 @@ mod tests {
             id: "fairy".into(),
             kind: "event".into(),
             data: json!({"event":{"id":"wand_gate_retry"}}),
+            state_slot: Some(1),
         };
         let wand = SolverBlock {
             floor: "MT23w".into(),
@@ -2152,6 +2363,7 @@ mod tests {
             id: "skill1".into(),
             kind: "resource".into(),
             data: json!({}),
+            state_slot: Some(2),
         };
         let blocks = vec![gate_once.clone(), gate_retry.clone(), wand];
         let mut once = terminal_node(10, 10, 100, "x").state;
@@ -2173,6 +2385,7 @@ mod tests {
             id: "old-event".into(),
             kind: "opaque".into(),
             data: json!({"numeric_id":99}),
+            state_slot: Some(0),
         };
         let floor = SolverFloor {
             width: 3,
@@ -2198,6 +2411,7 @@ mod tests {
             id: "fairy".into(),
             kind: "event".into(),
             data: json!({"numeric_id":0,"event":{"id":"wand_gate_retry"}}),
+            state_slot: Some(0),
         };
         let positions = [
             (5, 2, 189, 181),
@@ -2219,6 +2433,7 @@ mod tests {
                 id: format!("old{old}"),
                 kind: if old == 257 { "enemy" } else { "terrain" }.into(),
                 data: json!({"numeric_id":old}),
+                state_slot: Some(blocks.len()),
             });
             blocks.push(SolverBlock {
                 floor: "MT_1".into(),
@@ -2236,6 +2451,7 @@ mod tests {
                 } else {
                     json!({"numeric_id":new})
                 },
+                state_slot: Some(blocks.len()),
             });
         }
         let mut state = terminal_node(5001, 5000, 200000, "x").state;
@@ -2288,6 +2504,7 @@ mod tests {
             id: "thief".into(),
             kind: "event".into(),
             data: json!({"event":{"id":"thief_quest"}}),
+            state_slot: Some(0),
         };
         let mt2_door = SolverBlock {
             floor: "MT2".into(),
@@ -2296,6 +2513,7 @@ mod tests {
             id: "door".into(),
             kind: "door".into(),
             data: json!({}),
+            state_slot: Some(1),
         };
         let road_a = SolverBlock {
             floor: "MT18".into(),
@@ -2304,6 +2522,7 @@ mod tests {
             id: "wall".into(),
             kind: "opaque".into(),
             data: json!({}),
+            state_slot: Some(2),
         };
         let road_b = SolverBlock {
             floor: "MT18".into(),
@@ -2312,6 +2531,7 @@ mod tests {
             id: "wall".into(),
             kind: "opaque".into(),
             data: json!({}),
+            state_slot: Some(3),
         };
         let blocks = vec![thief.clone(), mt2_door, road_a, road_b];
         let mut state = terminal_node(10, 10, 100, "x").state;
@@ -2331,6 +2551,7 @@ mod tests {
             id: "princess".into(),
             kind: "event".into(),
             data: json!({"event":{"id":"princess_quest"}}),
+            state_slot: Some(4),
         };
         state.flags = Arc::new(vec![("switch:MT18:6,5:A".into(), 1)]);
         Arc::make_mut(&mut state.consumed).push(false);
