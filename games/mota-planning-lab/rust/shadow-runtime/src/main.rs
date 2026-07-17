@@ -682,13 +682,104 @@ impl F64Bits {
 }
 
 #[derive(Clone)]
+enum BlockRouteAction {
+    Door { yellow: u64, blue: u64, red: u64 },
+    Resource,
+    Enemy { hp_loss: F64Bits },
+    Transition,
+    Event { event_id: String },
+}
+
+#[derive(Clone)]
+struct ShopRouteEffect {
+    field: String,
+    amount: u64,
+}
+
+#[derive(Clone)]
+enum RouteAction {
+    Block {
+        index: usize,
+        action: BlockRouteAction,
+    },
+    Shop {
+        floor: String,
+        shop_id: String,
+        choice_id: String,
+        currency: String,
+        cost: u64,
+        purchase_count_before: u64,
+        effects: Vec<ShopRouteEffect>,
+    },
+}
+
+struct RouteLink {
+    parent: Option<usize>,
+    action: Option<RouteAction>,
+}
+
+#[derive(Clone)]
 struct SearchNode {
+    state: SolverState,
+    parent: Option<usize>,
+    action: Option<RouteAction>,
+    depth: usize,
+}
+
+struct TerminalRoute {
     state: SolverState,
     steps: Vec<Value>,
 }
 
-fn terminal_route_is_better(candidate: &SearchNode, current: &SearchNode) -> bool {
-    let score = |node: &SearchNode| {
+fn route_action_json(action: &RouteAction, blocks: &[SolverBlock]) -> Value {
+    match action {
+        RouteAction::Block { index, action } => {
+            let block = &blocks[*index];
+            let (kind, details) = match action {
+                BlockRouteAction::Door { yellow, blue, red } => (
+                    "door",
+                    json!({"key_cost":{"yellow":yellow,"blue":blue,"red":red}}),
+                ),
+                BlockRouteAction::Resource => ("resource", block.data["delta"].clone()),
+                BlockRouteAction::Enemy { hp_loss } => ("enemy", json!({"hp_loss":hp_loss.get()})),
+                BlockRouteAction::Transition => ("transition", json!({})),
+                BlockRouteAction::Event { event_id } => ("event", json!({"event_id":event_id})),
+            };
+            step_json(kind, block, details)
+        }
+        RouteAction::Shop {
+            floor,
+            shop_id,
+            choice_id,
+            currency,
+            cost,
+            purchase_count_before,
+            effects,
+        } => json!({"step_kind":"shop","floor_id":floor,"shop_id":shop_id,
+            "choice_id":choice_id,"details":{"currency":currency,"cost":cost,
+            "purchase_count_before":purchase_count_before,"effects":effects.iter()
+                .map(|effect| json!({"field":effect.field,"amount":effect.amount})).collect::<Vec<_>>()}}),
+    }
+}
+
+fn reconstruct_steps(arena: &[RouteLink], mut index: usize, blocks: &[SolverBlock]) -> Vec<Value> {
+    let mut actions = Vec::new();
+    loop {
+        let link = &arena[index];
+        if let Some(action) = &link.action {
+            actions.push(route_action_json(action, blocks));
+        }
+        match link.parent {
+            Some(parent) => index = parent,
+            None => break,
+        }
+    }
+    actions.reverse();
+    actions
+}
+
+fn terminal_route_is_better(candidate: &TerminalRoute, current: &TerminalRoute) -> bool {
+    let score = |node: &TerminalRoute| {
         (
             node.state.attack.get() + node.state.defense.get(),
             node.state.attack.get().min(node.state.defense.get()),
@@ -1278,12 +1369,15 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         .unwrap_or(MAX_GLOBAL_STATES);
     let mut queue = VecDeque::from([SearchNode {
         state: initial,
-        steps: Vec::new(),
+        parent: None,
+        action: None,
+        depth: 0,
     }]);
+    let mut route_arena = Vec::new();
     let mut seen = HashSet::new();
     let mut dominance: HashMap<String, Vec<[f64; 8]>> = HashMap::new();
     let mut explored = 0usize;
-    let mut best: Option<SearchNode> = None;
+    let mut best: Option<TerminalRoute> = None;
     let mut budget_exhausted = false;
     while let Some(node) = queue.pop_front() {
         if explored >= max_states {
@@ -1322,17 +1416,26 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         });
         frontier.push(resources);
         explored += 1;
+        let route_index = route_arena.len();
+        route_arena.push(RouteLink {
+            parent: node.parent,
+            action: node.action.clone(),
+        });
         let reachable = reachable_cells(&node.state, &floors, &blocks);
         if let Some((terminal_floor, terminal_pos)) = terminals
             .iter()
             .find(|(floor, position)| node.state.floor == *floor && reachable.contains(position))
         {
+            let mut steps = reconstruct_steps(&route_arena, route_index, &blocks);
+            steps.push(json!({"step_kind":"terminal","floor_id":terminal_floor,"x":terminal_pos.0,"y":terminal_pos.1,"details":{}}));
+            let won = TerminalRoute {
+                state: node.state.clone(),
+                steps,
+            };
             if best
                 .as_ref()
-                .is_none_or(|old| terminal_route_is_better(&node, old))
+                .is_none_or(|old| terminal_route_is_better(&won, old))
             {
-                let mut won = node.clone();
-                won.steps.push(json!({"step_kind":"terminal","floor_id":terminal_floor,"x":terminal_pos.0,"y":terminal_pos.1,"details":{}}));
                 best = Some(won);
             }
             continue;
@@ -1346,8 +1449,12 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
             {
                 continue;
             }
-            let mut next = node.clone();
-            let mut details = json!({});
+            let mut next = SearchNode {
+                state: node.state.clone(),
+                parent: Some(route_index),
+                action: None,
+                depth: node.depth + 1,
+            };
             match block.kind.as_str() {
                 "door" => {
                     let cost = &block.data["key_cost"];
@@ -1384,14 +1491,24 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                         .filter(|(_, count)| *count > 0)
                         .collect();
                     next.state.consumed[index] = true;
-                    details = json!({"key_cost":{"yellow":y,"blue":b,"red":r}});
+                    next.action = Some(RouteAction::Block {
+                        index,
+                        action: BlockRouteAction::Door {
+                            yellow: y,
+                            blue: b,
+                            red: r,
+                        },
+                    });
                 }
                 "resource" => {
                     if add_delta(&mut next.state, &block.data["delta"]).is_err() {
                         continue;
                     }
                     next.state.consumed[index] = true;
-                    details = block.data["delta"].clone();
+                    next.action = Some(RouteAction::Block {
+                        index,
+                        action: BlockRouteAction::Resource,
+                    });
                 }
                 "enemy" => {
                     let Some(loss) = enemy_loss(&next.state, &block.data["enemy"]) else {
@@ -1405,13 +1522,22 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     next.state.experience +=
                         block.data["enemy"]["experience"].as_u64().unwrap_or(0);
                     next.state.consumed[index] = true;
-                    details = json!({"hp_loss":loss});
+                    next.action = Some(RouteAction::Block {
+                        index,
+                        action: BlockRouteAction::Enemy {
+                            hp_loss: F64Bits::new(loss).unwrap(),
+                        },
+                    });
                 }
                 "transition" => {
                     let target = &block.data["target"];
                     next.state.floor = target["floor_id"].as_str().unwrap_or_default().to_owned();
                     next.state.x = target["x"].as_u64().unwrap_or(0);
                     next.state.y = target["y"].as_u64().unwrap_or(0);
+                    next.action = Some(RouteAction::Block {
+                        index,
+                        action: BlockRouteAction::Transition,
+                    });
                 }
                 "event" => {
                     let Some(event_details) =
@@ -1419,11 +1545,18 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     else {
                         continue;
                     };
-                    details = event_details;
+                    next.action = Some(RouteAction::Block {
+                        index,
+                        action: BlockRouteAction::Event {
+                            event_id: event_details["event_id"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                        },
+                    });
                 }
                 _ => continue,
             }
-            next.steps.push(step_json(&block.kind, block, details));
             queue.push_back(next);
         }
         // A restricted shop can be used whenever its bound block is adjacent. Each purchase is a separate state.
@@ -1458,7 +1591,12 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     }) else {
                         continue;
                     };
-                    let mut next = node.clone();
+                    let mut next = SearchNode {
+                        state: node.state.clone(),
+                        parent: Some(route_index),
+                        action: None,
+                        depth: node.depth + 1,
+                    };
                     let currency = choice
                         .get("currency")
                         .and_then(Value::as_str)
@@ -1519,7 +1657,21 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                         continue;
                     }
                     next.state.shop_counts[choice_offset + local] += 1;
-                    next.steps.push(json!({"step_kind":"shop","floor_id":node.state.floor,"shop_id":shop_id,"choice_id":choice["choice_id"],"details":{"currency":currency,"cost":cost,"purchase_count_before":purchase_count,"effects":effects}}));
+                    next.action = Some(RouteAction::Shop {
+                        floor: node.state.floor.clone(),
+                        shop_id: shop_id.to_owned(),
+                        choice_id: choice["choice_id"].as_str().unwrap_or_default().to_owned(),
+                        currency: currency.to_owned(),
+                        cost,
+                        purchase_count_before: purchase_count,
+                        effects: effects
+                            .iter()
+                            .map(|effect| ShopRouteEffect {
+                                field: effect["field"].as_str().unwrap_or_default().to_owned(),
+                                amount: effect["amount"].as_u64().unwrap_or(0),
+                            })
+                            .collect(),
+                    });
                     queue.push_back(next);
                 }
             }
@@ -1715,8 +1867,8 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn terminal_node(attack: u64, defense: u64, hp: u64, route: &str) -> SearchNode {
-        SearchNode {
+    fn terminal_node(attack: u64, defense: u64, hp: u64, route: &str) -> TerminalRoute {
+        TerminalRoute {
             state: SolverState {
                 floor: "F".to_owned(),
                 x: 0,
@@ -1761,6 +1913,62 @@ mod tests {
 
         let overflow_safe = terminal_node(u64::MAX, u64::MAX, 1, "a");
         assert!(terminal_route_is_better(&overflow_safe, &stronger));
+    }
+
+    #[test]
+    fn compact_parent_route_reconstructs_original_step_format_and_order() {
+        let blocks = vec![
+            SolverBlock {
+                floor: "F".into(),
+                x: 1,
+                y: 0,
+                id: "yellowDoor".into(),
+                kind: "door".into(),
+                data: json!({}),
+            },
+            SolverBlock {
+                floor: "F".into(),
+                x: 2,
+                y: 0,
+                id: "redGem".into(),
+                kind: "resource".into(),
+                data: json!({"delta":{"hp":0,"attack":3,"defense":0,"gold":0,
+                    "experience":0,"keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}),
+            },
+        ];
+        let arena = vec![
+            RouteLink {
+                parent: None,
+                action: None,
+            },
+            RouteLink {
+                parent: Some(0),
+                action: Some(RouteAction::Block {
+                    index: 0,
+                    action: BlockRouteAction::Door {
+                        yellow: 1,
+                        blue: 0,
+                        red: 0,
+                    },
+                }),
+            },
+            RouteLink {
+                parent: Some(1),
+                action: Some(RouteAction::Block {
+                    index: 1,
+                    action: BlockRouteAction::Resource,
+                }),
+            },
+        ];
+        assert_eq!(
+            reconstruct_steps(&arena, 2, &blocks),
+            vec![
+                json!({"step_kind":"door","floor_id":"F","x":1,"y":0,
+                    "block_id":"yellowDoor","details":{"key_cost":{"yellow":1,"blue":0,"red":0}}}),
+                json!({"step_kind":"resource","floor_id":"F","x":2,"y":0,
+                    "block_id":"redGem","details":blocks[1].data["delta"]}),
+            ]
+        );
     }
 
     #[test]
