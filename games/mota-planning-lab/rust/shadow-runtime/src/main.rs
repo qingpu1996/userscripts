@@ -4,6 +4,7 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::env;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -759,8 +760,11 @@ struct SolverState {
     flags: Arc<Vec<(String, u64)>>,
 }
 
+// These fields are the complete Phase A identity that can change future
+// actions or terminal reachability. ResourceLabel deliberately owns the
+// eight monotone numeric values; keys must not also appear in this identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct StructuralKey {
+struct StructuralNode {
     floor: String,
     x: u64,
     y: u64,
@@ -771,8 +775,32 @@ struct StructuralKey {
     flags: Arc<Vec<(String, u64)>>,
 }
 
-impl From<&SolverState> for StructuralKey {
-    fn from(state: &SolverState) -> Self {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResourceLabel {
+    hp: F64Bits,
+    attack: F64Bits,
+    defense: F64Bits,
+    gold: u64,
+    experience: u64,
+    yellow: u64,
+    blue: u64,
+    red: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct StructuralNodeId(usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LabelId(usize);
+
+struct PhaseALabel {
+    structural_id: StructuralNodeId,
+    resources: ResourceLabel,
+    stale: bool,
+}
+
+impl StructuralNode {
+    fn from_state(state: &SolverState) -> Self {
         Self {
             floor: state.floor.clone(),
             x: state.x,
@@ -783,6 +811,175 @@ impl From<&SolverState> for StructuralKey {
             level: state.level,
             flags: state.flags.clone(),
         }
+    }
+
+    fn with_resources(&self, resources: &ResourceLabel) -> SolverState {
+        SolverState {
+            floor: self.floor.clone(),
+            x: self.x,
+            y: self.y,
+            hp: resources.hp,
+            attack: resources.attack,
+            defense: resources.defense,
+            level: self.level,
+            gold: resources.gold,
+            experience: resources.experience,
+            yellow: resources.yellow,
+            blue: resources.blue,
+            red: resources.red,
+            inventory: self.inventory.clone(),
+            consumed: self.consumed.clone(),
+            shop_counts: self.shop_counts.clone(),
+            flags: self.flags.clone(),
+        }
+    }
+}
+
+impl ResourceLabel {
+    fn from_state(state: &SolverState) -> Self {
+        Self {
+            hp: state.hp,
+            attack: state.attack,
+            defense: state.defense,
+            gold: state.gold,
+            experience: state.experience,
+            yellow: state.yellow,
+            blue: state.blue,
+            red: state.red,
+        }
+    }
+
+    fn dominates(&self, other: &Self) -> bool {
+        self.hp.get() >= other.hp.get()
+            && self.attack.get() >= other.attack.get()
+            && self.defense.get() >= other.defense.get()
+            && self.gold >= other.gold
+            && self.experience >= other.experience
+            && self.yellow >= other.yellow
+            && self.blue >= other.blue
+            && self.red >= other.red
+    }
+}
+
+// Phase A owns one copy of each structural state. Labels are append-only: a
+// stale label remains addressable until the whole proof search is dropped, so
+// queue and frontier IDs can never be reused while referenced.
+struct PhaseALabelStore {
+    structural_nodes: Vec<StructuralNode>,
+    // The interner index stores only a stable hash and arena IDs. Keeping a
+    // StructuralNode as a HashMap key would retain a second full copy of every
+    // structural value alongside the arena. Hash collisions are resolved by
+    // equality against the sole arena copy.
+    structural_ids: HashMap<u64, Vec<StructuralNodeId>>,
+    labels: Vec<PhaseALabel>,
+    // The vector position is the checked StructuralNodeId arena index.
+    frontiers: Vec<Vec<LabelId>>,
+}
+
+impl PhaseALabelStore {
+    fn structural_hash(node: &StructuralNode) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        node.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn find_structural(&self, node: &StructuralNode) -> Option<StructuralNodeId> {
+        let hash = Self::structural_hash(node);
+        self.structural_ids.get(&hash).and_then(|ids| {
+            ids.iter().copied().find(|id| {
+                self.structural_nodes
+                    .get(id.0)
+                    .is_some_and(|existing| existing == node)
+            })
+        })
+    }
+
+    fn intern_structural(&mut self, node: StructuralNode) -> StructuralNodeId {
+        if let Some(id) = self.find_structural(&node) {
+            return id;
+        }
+        let hash = Self::structural_hash(&node);
+        let id = StructuralNodeId(self.structural_nodes.len());
+        self.structural_nodes.push(node);
+        self.frontiers.push(Vec::new());
+        self.structural_ids.entry(hash).or_default().push(id);
+        id
+    }
+
+    fn state_for(&self, id: LabelId) -> Option<SolverState> {
+        let label = self.labels.get(id.0)?;
+        let node = self.structural_nodes.get(label.structural_id.0)?;
+        Some(node.with_resources(&label.resources))
+    }
+
+    fn is_stale(&self, id: LabelId) -> bool {
+        self.labels
+            .get(id.0)
+            .map(|label| label.stale)
+            .unwrap_or(true)
+    }
+
+    fn frontier_accepts(&self, structural_id: StructuralNodeId, resources: &ResourceLabel) -> bool {
+        self.frontiers
+            .get(structural_id.0)
+            .into_iter()
+            .flatten()
+            .all(|id| {
+                self.labels
+                    .get(id.0)
+                    .is_none_or(|label| !label.resources.dominates(resources))
+            })
+    }
+
+    fn stale_dominated_labels(
+        &mut self,
+        structural_id: StructuralNodeId,
+        resources: &ResourceLabel,
+    ) {
+        let dominated: Vec<LabelId> = self
+            .frontiers
+            .get(structural_id.0)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|id| {
+                self.labels
+                    .get(id.0)
+                    .is_some_and(|label| resources.dominates(&label.resources))
+            })
+            .collect();
+        for id in dominated {
+            if let Some(label) = self.labels.get_mut(id.0) {
+                label.stale = true;
+            }
+        }
+        let labels = &self.labels;
+        self.frontiers
+            .get_mut(structural_id.0)
+            .expect("interned structural ID must have a frontier slot")
+            .retain(|id| labels.get(id.0).is_some_and(|label| !label.stale));
+    }
+
+    // Equality is intentionally covered here: `dominates` is reflexive, so a
+    // second exact resource vector never needs a separate exact seen set.
+    fn accept(&mut self, state: SolverState) -> Option<LabelId> {
+        let structural_id = self.intern_structural(StructuralNode::from_state(&state));
+        let resources = ResourceLabel::from_state(&state);
+        if !self.frontier_accepts(structural_id, &resources) {
+            return None;
+        }
+        self.stale_dominated_labels(structural_id, &resources);
+        let id = LabelId(self.labels.len());
+        self.labels.push(PhaseALabel {
+            structural_id,
+            resources,
+            stale: false,
+        });
+        self.frontiers
+            .get_mut(structural_id.0)
+            .expect("interned structural ID must have a frontier slot")
+            .push(id);
+        Some(id)
     }
 }
 
@@ -852,11 +1049,6 @@ enum PendingAction {
         floor: String,
         adjacent: (u64, u64),
     },
-}
-
-struct PendingCandidate {
-    source: usize,
-    action: PendingAction,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1624,6 +1816,63 @@ impl ConnectivityIndex {
             shops,
             terminals: reachable_terminals,
         }
+    }
+
+    // Canonical identity needs only the reachable-component representative.
+    // Keep this separate from `view`: candidate admission must not allocate
+    // boundaries, shops, terminals, or navigation vectors that are used only
+    // after an accepted label is popped. The transition closure and ordering
+    // intentionally mirror `view`, so both produce the same representative.
+    fn representative(
+        &self,
+        state: &SolverState,
+        floors: &HashMap<String, SolverFloor>,
+        blocks: &[SolverBlock],
+    ) -> (String, u64, u64) {
+        let mut queue = VecDeque::from([(state.floor.clone(), (state.x, state.y))]);
+        let mut components = HashSet::<(String, usize)>::new();
+        let mut representative = (state.floor.clone(), state.x, state.y);
+        while let Some((floor_id, entry)) = queue.pop_front() {
+            let (reachable, Some(local_representative)) =
+                self.local_reachable(state, &floor_id, entry, blocks)
+            else {
+                continue;
+            };
+            if !components.insert((floor_id.clone(), local_representative)) {
+                continue;
+            }
+            let Some(indexed_floor) = self.floors.get(&floor_id) else {
+                continue;
+            };
+            let local_position = (
+                (local_representative % indexed_floor.width) as u64,
+                (local_representative / indexed_floor.width) as u64,
+            );
+            representative =
+                representative.min((floor_id.clone(), local_position.0, local_position.1));
+            for &index in floors
+                .get(&floor_id)
+                .into_iter()
+                .flat_map(|floor| &floor.blocks)
+            {
+                let block = &blocks[index];
+                if block_is_consumed(state, block)
+                    || block.kind == "opaque"
+                    || block.kind == "terrain"
+                    || block.kind != "transition"
+                    || self.reversible[index].is_none()
+                {
+                    continue;
+                }
+                if Self::adjacent_position(indexed_floor, &reachable, block.x, block.y).is_none() {
+                    continue;
+                }
+                if let Some((target_floor, target_x, target_y)) = transition_target(block) {
+                    queue.push_back((target_floor.to_owned(), (target_x, target_y)));
+                }
+            }
+        }
+        representative
     }
 }
 
@@ -2513,10 +2762,11 @@ impl Drop for PhaseADropProbe {
 }
 
 // Keep the proof search in a separate function rather than merely relying on
-// non-lexical lifetimes. Its queue, state arena, exact seen set, dominance
-// frontier, and all connectivity views are unconditionally dropped before a
-// caller can enter Phase 2. The result deliberately carries only a scalar
-// objective/status and count; it cannot retain a Phase A arena through Arc.
+// non-lexical lifetimes. Its label queue, structural-node/label arenas,
+// Pareto frontiers, and all connectivity views are unconditionally dropped
+// before a caller can enter Phase 2. The result deliberately carries only a
+// scalar objective/status and count; it cannot retain a Phase A arena through
+// Arc.
 fn run_numeric_proof(
     initial: &SolverState,
     max_states: usize,
@@ -2528,68 +2778,35 @@ fn run_numeric_proof(
 ) -> PhaseAResult {
     #[cfg(test)]
     let _drop_probe = PhaseADropProbe;
-    let mut initial_node = Some(initial.clone());
-    let mut queue: VecDeque<PendingCandidate> = VecDeque::new();
-    let mut state_arena = Vec::new();
-    let mut seen = HashSet::new();
-    let mut dominance: HashMap<StructuralKey, Vec<[f64; 8]>> = HashMap::new();
+    let mut store = PhaseALabelStore {
+        structural_nodes: Vec::new(),
+        structural_ids: HashMap::new(),
+        labels: Vec::new(),
+        frontiers: Vec::new(),
+    };
+    let mut queue = VecDeque::<LabelId>::new();
+    let mut initial = initial.clone();
+    (initial.floor, initial.x, initial.y) = connectivity.representative(&initial, floors, blocks);
+    if let Some(initial_id) = store.accept(initial) {
+        queue.push_back(initial_id);
+    }
     let mut explored = 0usize;
     let mut best: Option<NumericObjective> = None;
-    loop {
-        let mut next_node = initial_node.take();
-        while next_node.is_none() {
-            let Some(candidate) = queue.pop_front() else {
-                break;
-            };
-            let source = state_arena
-                .get(candidate.source)
-                .expect("pending candidate source must be an accepted state");
-            next_node = materialize_pending_action(source, candidate.action, blocks, shops, false)
-                .map(|candidate| candidate.state);
+    while let Some(label_id) = queue.pop_front() {
+        if store.is_stale(label_id) {
+            continue;
         }
-        let Some(mut node) = next_node else {
-            break;
-        };
         if explored >= max_states {
             return PhaseAResult {
                 outcome: PhaseAOutcome::BudgetExhausted,
                 explored,
             };
         }
+        let node = store
+            .state_for(label_id)
+            .expect("accepted label must reference a structural node");
         let view = connectivity.view(&node, floors, blocks, terminals, false);
-        (node.floor, node.x, node.y) = view.representative.clone();
-        if !seen.insert(node.clone()) {
-            continue;
-        }
-        let structural = StructuralKey::from(&node);
-        let resources = [
-            node.hp.get(),
-            node.attack.get(),
-            node.defense.get(),
-            node.gold as f64,
-            node.experience as f64,
-            node.yellow as f64,
-            node.blue as f64,
-            node.red as f64,
-        ];
-        let frontier = dominance.entry(structural).or_default();
-        if frontier.iter().any(|old| {
-            old.iter()
-                .zip(resources)
-                .all(|(left, right)| *left >= right)
-        }) {
-            continue;
-        }
-        frontier.retain(|old| {
-            !resources
-                .iter()
-                .zip(old)
-                .all(|(left, right)| *left >= *right)
-        });
-        frontier.push(resources);
         explored += 1;
-        let state_index = state_arena.len();
-        state_arena.push(node.clone());
         if !view.terminals.is_empty() {
             let objective = NumericObjective::from_state(&node);
             if best.is_none_or(|old| objective.cmp(old).is_gt()) {
@@ -2597,13 +2814,19 @@ fn run_numeric_proof(
             }
         }
         for boundary in view.boundaries {
-            queue.push_back(PendingCandidate {
-                source: state_index,
-                action: PendingAction::Block {
-                    index: boundary.index,
-                    adjacent: boundary.adjacent,
-                },
-            });
+            let action = PendingAction::Block {
+                index: boundary.index,
+                adjacent: boundary.adjacent,
+            };
+            if let Some(mut candidate) =
+                materialize_pending_action(&node, action, blocks, shops, false)
+            {
+                (candidate.state.floor, candidate.state.x, candidate.state.y) =
+                    connectivity.representative(&candidate.state, floors, blocks);
+                if let Some(id) = store.accept(candidate.state) {
+                    queue.push_back(id);
+                }
+            }
         }
         let mut choice_offset = 0usize;
         for (shop_index, shop) in shops.iter().enumerate() {
@@ -2619,16 +2842,22 @@ fn run_numeric_proof(
                 .unwrap_or_default();
             if let Some((shop_floor, adjacent, _navigation)) = accessible {
                 for local in 0..choices.len() {
-                    queue.push_back(PendingCandidate {
-                        source: state_index,
-                        action: PendingAction::Shop {
-                            shop_index,
-                            choice_index: local,
-                            choice_offset,
-                            floor: shop_floor.clone(),
-                            adjacent: *adjacent,
-                        },
-                    });
+                    let action = PendingAction::Shop {
+                        shop_index,
+                        choice_index: local,
+                        choice_offset,
+                        floor: shop_floor.clone(),
+                        adjacent: *adjacent,
+                    };
+                    if let Some(mut candidate) =
+                        materialize_pending_action(&node, action, blocks, shops, false)
+                    {
+                        (candidate.state.floor, candidate.state.x, candidate.state.y) =
+                            connectivity.representative(&candidate.state, floors, blocks);
+                        if let Some(id) = store.accept(candidate.state) {
+                            queue.push_back(id);
+                        }
+                    }
                 }
             }
             choice_offset += choices.len();
@@ -3314,7 +3543,7 @@ mod tests {
     }
 
     #[test]
-    fn lazy_candidate_materializes_the_same_successor_and_rejects_invalid_actions() {
+    fn lazy_action_materializes_the_same_successor_and_rejects_invalid_actions() {
         let blocks = vec![SolverBlock {
             floor: "F".into(),
             x: 1,
@@ -3327,15 +3556,11 @@ mod tests {
         let mut source = terminal_node(10, 10, 100, "root");
         source.yellow = 1;
         source.consumed = ConsumedBits::from_bools(&[false]);
-        let candidate = PendingCandidate {
-            source: 0,
-            action: PendingAction::Block {
-                index: 0,
-                adjacent: (0, 0),
-            },
+        let action = PendingAction::Block {
+            index: 0,
+            adjacent: (0, 0),
         };
-        let next =
-            materialize_pending_action(&source, candidate.action, &blocks, &[], true).unwrap();
+        let next = materialize_pending_action(&source, action, &blocks, &[], true).unwrap();
         assert_eq!(next.state.yellow, 0);
         assert!(block_is_consumed(&next.state, &blocks[0]));
         let step = route_action_json(next.route_action.as_ref().unwrap(), &blocks);
@@ -3344,20 +3569,15 @@ mod tests {
 
         let mut invalid = source;
         invalid.yellow = 0;
-        let candidate = PendingCandidate {
-            source: 0,
-            action: PendingAction::Block {
-                index: 0,
-                adjacent: (0, 0),
-            },
+        let action = PendingAction::Block {
+            index: 0,
+            adjacent: (0, 0),
         };
-        assert!(
-            materialize_pending_action(&invalid, candidate.action, &blocks, &[], false).is_none()
-        );
+        assert!(materialize_pending_action(&invalid, action, &blocks, &[], false).is_none());
     }
 
     #[test]
-    fn typed_structural_key_matches_legacy_json_fields_and_distinguishes_each_field() {
+    fn structural_node_round_trips_every_future_action_field() {
         let mut state = terminal_node(10, 11, 100, "x");
         state.floor = "F1".into();
         state.x = 2;
@@ -3367,19 +3587,22 @@ mod tests {
         state.shop_counts = Arc::new(vec![2]);
         state.level = 4;
         state.flags = Arc::new(vec![("quest".into(), 1)]);
-        let key = StructuralKey::from(&state);
+        let node = StructuralNode::from_state(&state);
+        let resources = ResourceLabel::from_state(&state);
+        let round_trip = node.with_resources(&resources);
+        assert_eq!(round_trip, state);
         let legacy = json!({"floor":state.floor,"x":state.x,"y":state.y,
             "inventory":&*state.inventory,"consumed":&*state.consumed.words,
             "shops":&*state.shop_counts,"level":state.level,"flags":&*state.flags});
         assert_eq!(legacy.as_object().unwrap().len(), 8);
-        assert_eq!(legacy["floor"], key.floor);
-        assert_eq!(legacy["x"], key.x);
-        assert_eq!(legacy["y"], key.y);
-        assert_eq!(legacy["inventory"], json!(&*key.inventory));
-        assert_eq!(legacy["consumed"], json!(&*key.consumed.words));
-        assert_eq!(legacy["shops"], json!(&*key.shop_counts));
-        assert_eq!(legacy["level"], key.level);
-        assert_eq!(legacy["flags"], json!(&*key.flags));
+        assert_eq!(legacy["floor"], node.floor);
+        assert_eq!(legacy["x"], node.x);
+        assert_eq!(legacy["y"], node.y);
+        assert_eq!(legacy["inventory"], json!(&*node.inventory));
+        assert_eq!(legacy["consumed"], json!(&*node.consumed.words));
+        assert_eq!(legacy["shops"], json!(&*node.shop_counts));
+        assert_eq!(legacy["level"], node.level);
+        assert_eq!(legacy["flags"], json!(&*node.flags));
 
         let mut variants = Vec::new();
         let mut changed = state.clone();
@@ -3407,8 +3630,128 @@ mod tests {
         Arc::make_mut(&mut changed.flags)[0].1 += 1;
         variants.push(changed);
         for changed in variants {
-            assert_ne!(StructuralKey::from(&changed), key);
+            assert_ne!(StructuralNode::from_state(&changed), node);
         }
+    }
+
+    fn empty_phase_a_store() -> PhaseALabelStore {
+        PhaseALabelStore {
+            structural_nodes: Vec::new(),
+            structural_ids: HashMap::new(),
+            labels: Vec::new(),
+            frontiers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pareto_rejects_an_equal_resource_label_without_exact_seen() {
+        let mut store = empty_phase_a_store();
+        let state = terminal_node(10, 10, 100, "same");
+        let accepted = store.accept(state.clone()).unwrap();
+        assert!(store.accept(state).is_none());
+        assert!(!store.is_stale(accepted));
+        assert_eq!(store.labels.len(), 1);
+        assert_eq!(store.frontiers.len(), 1);
+        assert_eq!(store.structural_nodes.len(), 1);
+        assert_eq!(store.structural_ids.len(), 1);
+        assert_eq!(store.structural_ids.values().flatten().count(), 1);
+    }
+
+    #[test]
+    fn eight_dimension_dominance_is_exhaustive_reflexive_and_transitive() {
+        // All 2^8 boolean resource vectors: pairwise checks validate the
+        // implementation against an independent bitwise oracle, and the
+        // complete triple relation checks transitivity without a new property
+        // testing dependency.
+        let labels: Vec<ResourceLabel> = (0_u16..(1 << 8))
+            .map(|bits| {
+                let bit = |offset: u16| u64::from((bits >> offset) & 1_u16);
+                ResourceLabel {
+                    hp: F64Bits::new(bit(0) as f64).unwrap(),
+                    attack: F64Bits::new(bit(1) as f64).unwrap(),
+                    defense: F64Bits::new(bit(2) as f64).unwrap(),
+                    gold: bit(3),
+                    experience: bit(4),
+                    yellow: bit(5),
+                    blue: bit(6),
+                    red: bit(7),
+                }
+            })
+            .collect();
+        for (left_bits, left) in labels.iter().enumerate() {
+            for (right_bits, right) in labels.iter().enumerate() {
+                assert_eq!(
+                    left.dominates(right),
+                    (left_bits & right_bits) == right_bits
+                );
+                assert!(left.dominates(left));
+            }
+        }
+        for left in &labels {
+            for middle in &labels {
+                for right in &labels {
+                    if left.dominates(middle) && middle.dominates(right) {
+                        assert!(left.dominates(right));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stronger_label_stales_old_label_and_frontier_keeps_its_dominator() {
+        let mut store = empty_phase_a_store();
+        let weak = store.accept(terminal_node(10, 10, 100, "weak")).unwrap();
+        let strong = store.accept(terminal_node(11, 10, 100, "strong")).unwrap();
+        assert!(store.is_stale(weak));
+        assert!(!store.is_stale(strong));
+        let frontier = store.frontiers.first().unwrap();
+        assert_eq!(frontier, &[strong]);
+        assert!(
+            store.labels[strong.0]
+                .resources
+                .dominates(&store.labels[weak.0].resources)
+        );
+    }
+
+    #[test]
+    fn phase_a_ids_reject_out_of_range_values_without_truncation() {
+        let mut store = empty_phase_a_store();
+        let accepted = store
+            .accept(terminal_node(10, 10, 100, "id-boundary"))
+            .unwrap();
+        assert_eq!(accepted.0, 0);
+        assert!(store.is_stale(LabelId(usize::MAX)));
+        assert!(store.state_for(LabelId(usize::MAX)).is_none());
+        store.labels.push(PhaseALabel {
+            structural_id: StructuralNodeId(usize::MAX),
+            resources: ResourceLabel::from_state(&terminal_node(10, 10, 100, "invalid")),
+            stale: false,
+        });
+        assert!(store.state_for(LabelId(1)).is_none());
+    }
+
+    #[test]
+    fn phase_a_labels_match_the_tiny_world_numeric_oracle_and_budget_status() {
+        // two_terminal_routes has only the no-potion, +1-potion, +10-potion,
+        // and both-potions terminal possibilities. Its independently enumerated
+        // optimum is hp=21 at unchanged attack/defense; five accepted labels
+        // suffice to prove it, while two cannot complete the search.
+        let complete = two_terminal_routes(5);
+        let (global, stats) = global_analysis_with_stats(complete.as_object().unwrap());
+        assert_eq!(global["proof"], "proven");
+        assert_eq!(global["terminal_attack"], 1.0);
+        assert_eq!(global["terminal_defense"], 1.0);
+        assert_eq!(global["terminal_hp"], 21.0);
+        assert!(stats.phase_a_explored <= 5);
+        assert!(stats.phase_b_explored > 0);
+
+        let exhausted = two_terminal_routes(2);
+        let (global, stats) = global_analysis_with_stats(exhausted.as_object().unwrap());
+        assert_eq!(global["proof"], "unproven");
+        assert_eq!(global["reason"], "search_budget_exhausted");
+        assert_eq!(stats.phase_a_explored, 2);
+        assert_eq!(stats.phase_b_explored, 0);
     }
 
     #[test]
@@ -3668,6 +4011,10 @@ mod tests {
         let terminals = [("B", (3, 0))];
         let closed = index.view(&state, &floors, &blocks, &terminals, true);
         assert_eq!(
+            index.representative(&state, &floors, &blocks),
+            closed.representative
+        );
+        assert_eq!(
             closed
                 .boundaries
                 .iter()
@@ -3682,6 +4029,10 @@ mod tests {
 
         assert!(set_block_consumed(&mut state, &blocks[2], true));
         let opened = index.view(&state, &floors, &blocks, &terminals, true);
+        assert_eq!(
+            index.representative(&state, &floors, &blocks),
+            opened.representative
+        );
         assert_eq!(opened.terminals.len(), 1);
         assert_eq!(opened.terminals[0].floor, "B");
         assert_eq!(opened.terminals[0].navigation.as_slice(), &[0]);
