@@ -199,6 +199,47 @@ test("engine model cache warm refresh 也只解码 detached 当前楼层", () =>
   assert.deepEqual(core.status.maps.MT0.map, before);
 });
 
+test("cold 与连续 warm 共用换层规范化并保持 floors solver 与 hash 一致", () => {
+  const floorIds = ["MT3", "MT4", "MT5"];
+  const floors = Object.fromEntries(floorIds.map((floorId) => [floorId, {
+    title: floorId, width: 13, height: 13, map: grid(13, 13),
+  }]));
+  floors.MT4.changeFloor = {
+    "1,11": { floorId: ":next", stair: "downFloor" },
+    "11,11": { floorId: ":before", stair: "upFloor" },
+  };
+  const statusMaps = Object.fromEntries(floorIds.map((floorId) => [floorId, {
+    title: floorId, width: 13, height: 13, map: grid(13, 13),
+  }]));
+  const runtimeBlocks = {
+    MT3: [{ x: 11, y: 10, id: 88, event: { id: "upFloor", cls: "terrains", trigger: "changeFloor" } }],
+    MT4: [
+      { x: 1, y: 11, id: 87, event: { id: "downFloor", cls: "terrains", trigger: "changeFloor" } },
+      { x: 11, y: 11, id: 88, event: { id: "upFloor", cls: "terrains", trigger: "changeFloor" } },
+    ],
+    MT5: [{ x: 1, y: 10, id: 87, event: { id: "downFloor", cls: "terrains", trigger: "changeFloor" } }],
+  };
+  const core = { floorIds, floors, status: { floorId: "MT4", maps: statusMaps,
+    hero: { items: {} } }, maps: { blocksInfo: {
+    87: { id: "downFloor", cls: "terrains", trigger: "changeFloor" },
+    88: { id: "upFloor", cls: "terrains", trigger: "changeFloor" },
+  } }, material: { items: {}, enemys: {} }, values: {},
+  getMapBlocksObj(floorId) { return runtimeBlocks[floorId]; } };
+  const cache = {};
+  const models = [lab.collectEngineModel(core, {}, { cache, currentFloorId: "MT4" })];
+  for (let index = 0; index < 3; index += 1) {
+    models.push(lab.collectEngineModel(core, {}, { cache, currentFloorId: "MT4" }));
+  }
+  for (const model of models) model.solver_model = lab.buildSolverModel(model, []);
+  const expected = JSON.parse(JSON.stringify(models[0]));
+  for (const model of models.slice(1)) assert.deepEqual(JSON.parse(JSON.stringify(model)), expected);
+  const mt4 = expected.floors.find((floor) => floor.floor_id === "MT4");
+  assert.deepEqual(mt4.change_floor.map((change) => ({ floor_id: change.floor_id, loc: change.loc })), [
+    { floor_id: "MT5", loc: { x: 1, y: 10 } },
+    { floor_id: "MT3", loc: { x: 11, y: 10 } },
+  ]);
+});
+
 test("完整 engine_model 采集多地图、13x13、异形拓扑和动态 blocks", () => {
   const core = fakeCore();
   const model = lab.collectEngineModel(core, {

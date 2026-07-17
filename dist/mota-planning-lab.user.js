@@ -1696,6 +1696,32 @@
     };
   };
 
+  MotaLab.normalizeEngineFloorTransitions = function normalizeEngineFloorTransitions(
+    floors, floorIds, floorDefinitions,
+  ) {
+    const floorIndex = new Map(floorIds.map((id, index) => [id, index]));
+    const collectedFloorById = new Map(floors.map((floor) => [floor.floor_id, floor]));
+    return floors.map((floor) => ({ ...floor, change_floor: floor.change_floor.map((change) => {
+      let targetId = change.floor_id;
+      const index = floorIndex.get(floor.floor_id);
+      if (targetId === ":next") targetId = index === undefined ? null : floorIds[index + 1] || null;
+      if (targetId === ":before") targetId = index === undefined ? null : floorIds[index - 1] || null;
+      const targetDefinition = targetId && floorDefinitions[targetId];
+      const rawLanding = targetDefinition && change.stair && targetDefinition[change.stair];
+      const definedLanding = Array.isArray(rawLanding) && rawLanding.length >= 2
+        && MotaLab.isFiniteInteger(rawLanding[0]) && MotaLab.isFiniteInteger(rawLanding[1])
+        ? { x: rawLanding[0], y: rawLanding[1] } : null;
+      const targetFloor = targetId && collectedFloorById.get(targetId);
+      const stairMatches = targetFloor && change.stair
+        ? (targetFloor.blocks || []).filter((block) => block.id === change.stair) : [];
+      const inferredLanding = stairMatches.length === 1
+        ? { x: stairMatches[0].x, y: stairMatches[0].y } : null;
+      const landing = change.loc || definedLanding || inferredLanding;
+      return { ...change, floor_id: targetId, loc: landing,
+        opaque: !targetId || !landing };
+    }) }));
+  };
+
   MotaLab.collectEngineModel = function collectEngineModel(engine, keySlotIds = {}, options = {}) {
     const fail = (code, details = {}) => {
       throw MotaLab.createPauseError("ENGINE_API_INCOMPATIBLE", code, details);
@@ -1729,27 +1755,7 @@
     let floors = floorIds.map((floorId) => MotaLab.collectEngineFloor(
       engine, floorId, floorDefinitions[floorId] || {}, statusMaps[floorId] || {}, fail,
     ));
-    const floorIndex = new Map(floorIds.map((id, index) => [id, index]));
-    const collectedFloorById = new Map(floors.map((floor) => [floor.floor_id, floor]));
-    floors = floors.map((floor) => ({ ...floor, change_floor: floor.change_floor.map((change) => {
-      let targetId = change.floor_id;
-      const index = floorIndex.get(floor.floor_id);
-      if (targetId === ":next") targetId = index === undefined ? null : floorIds[index + 1] || null;
-      if (targetId === ":before") targetId = index === undefined ? null : floorIds[index - 1] || null;
-      const targetDefinition = targetId && floorDefinitions[targetId];
-      const rawLanding = targetDefinition && change.stair && targetDefinition[change.stair];
-      const definedLanding = Array.isArray(rawLanding) && rawLanding.length >= 2
-        && MotaLab.isFiniteInteger(rawLanding[0]) && MotaLab.isFiniteInteger(rawLanding[1])
-        ? { x: rawLanding[0], y: rawLanding[1] } : null;
-      const targetFloor = targetId && collectedFloorById.get(targetId);
-      const stairMatches = targetFloor && change.stair
-        ? (targetFloor.blocks || []).filter((block) => block.id === change.stair) : [];
-      const inferredLanding = stairMatches.length === 1
-        ? { x: stairMatches[0].x, y: stairMatches[0].y } : null;
-      const landing = change.loc || definedLanding || inferredLanding;
-      return { ...change, floor_id: targetId, loc: landing,
-        opaque: !targetId || !landing };
-    }) }));
+    floors = MotaLab.normalizeEngineFloorTransitions(floors, floorIds, floorDefinitions);
 
     const blockSource = detach(engine.maps && engine.maps.blocksInfo || {});
     const blockPairs = Array.isArray(blockSource)
@@ -1837,7 +1843,9 @@
     if (unescape(encodeURIComponent(JSON.stringify(model))).length > MotaLab.MAX_ENGINE_MODEL_BYTES) {
       fail("ENGINE_MODEL_SIZE_LIMIT_EXCEEDED");
     }
-    if (cache) MotaLab.storeEngineModelCache(cache, engine, model, floorHashes);
+    if (cache) MotaLab.storeEngineModelCache(
+      cache, engine, model, floorHashes, floorIds, floorDefinitions,
+    );
     return model;
   };
 
@@ -1879,7 +1887,9 @@
     });
   };
 
-  MotaLab.storeEngineModelCache = function storeEngineModelCache(cache, engine, model, floorHashes) {
+  MotaLab.storeEngineModelCache = function storeEngineModelCache(
+    cache, engine, model, floorHashes, floorIds, floorDefinitions,
+  ) {
     const sources = MotaLab.engineModelSources(engine);
     cache.invalidated = false;
     cache.sources = sources;
@@ -1890,6 +1900,8 @@
     );
     cache.model = model;
     cache.floor_hashes = Object.assign({}, floorHashes);
+    cache.floor_ids = floorIds.slice();
+    cache.floor_definitions = floorDefinitions;
   };
 
   MotaLab.refreshEngineModel = function refreshEngineModel(
@@ -1907,16 +1919,20 @@
       cache.invalidated = true;
       return MotaLab.collectEngineModel(engine, keySlotIds, { cache, currentFloorId });
     }
-    const floor = MotaLab.collectEngineFloor(
+    const rawFloor = MotaLab.collectEngineFloor(
       engine, currentFloorId, definition, dynamic, fail,
     );
     const inventory = MotaLab.collectEngineInventory(engine, keySlotIds);
+    const rawFloors = cache.model.floors.map((item) => (
+      item.floor_id === currentFloorId ? rawFloor : item
+    ));
+    const floors = MotaLab.normalizeEngineFloorTransitions(
+      rawFloors, cache.floor_ids, cache.floor_definitions,
+    );
+    const floor = floors.find((item) => item.floor_id === currentFloorId);
     const floorHashes = Object.assign({}, cache.floor_hashes, {
       [currentFloorId]: `sha256:${MotaLab.sha256(MotaLab.canonicalize(floor))}`,
     });
-    const floors = cache.model.floors.map((item) => (
-      item.floor_id === currentFloorId ? floor : item
-    ));
     const model = Object.assign({}, cache.model, { floors, inventory });
     model.model_hash = `sha256:${MotaLab.sha256(MotaLab.canonicalize({
       protocol: model.protocol,
