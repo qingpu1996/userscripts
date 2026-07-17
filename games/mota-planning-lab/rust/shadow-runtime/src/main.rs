@@ -764,14 +764,14 @@ enum RouteAction {
 
 struct RouteLink {
     parent: Option<usize>,
-    action: Option<RouteAction>,
+    actions: Vec<RouteAction>,
 }
 
 #[derive(Clone)]
 struct SearchNode {
     state: SolverState,
     parent: Option<usize>,
-    action: Option<RouteAction>,
+    actions: Vec<RouteAction>,
     depth: usize,
 }
 
@@ -812,19 +812,26 @@ fn route_action_json(action: &RouteAction, blocks: &[SolverBlock]) -> Value {
 }
 
 fn reconstruct_steps(arena: &[RouteLink], mut index: usize, blocks: &[SolverBlock]) -> Vec<Value> {
-    let mut actions = Vec::new();
+    let mut groups = Vec::new();
     loop {
         let link = &arena[index];
-        if let Some(action) = &link.action {
-            actions.push(route_action_json(action, blocks));
+        if !link.actions.is_empty() {
+            groups.push(&link.actions);
         }
         match link.parent {
             Some(parent) => index = parent,
             None => break,
         }
     }
-    actions.reverse();
-    actions
+    groups.reverse();
+    groups
+        .into_iter()
+        .flat_map(|actions| {
+            actions
+                .iter()
+                .map(|action| route_action_json(action, blocks))
+        })
+        .collect()
 }
 
 fn terminal_route_is_better(candidate: &TerminalRoute, current: &TerminalRoute) -> bool {
@@ -1021,6 +1028,200 @@ fn adjacent(reachable: &HashSet<(u64, u64)>, x: u64, y: u64) -> bool {
             let ny = y as i64 + dy;
             nx >= 0 && ny >= 0 && reachable.contains(&(nx as u64, ny as u64))
         })
+}
+
+#[derive(Clone)]
+struct RegionComponent {
+    floor: String,
+    reachable: HashSet<(u64, u64)>,
+    witness: Vec<usize>,
+}
+
+struct ReversibleRegion {
+    components: Vec<RegionComponent>,
+    representative: (String, u64, u64),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RegionCacheKey {
+    floor: String,
+    x: u64,
+    y: u64,
+    consumed: Arc<Vec<bool>>,
+}
+
+impl From<&SolverState> for RegionCacheKey {
+    fn from(state: &SolverState) -> Self {
+        Self {
+            floor: state.floor.clone(),
+            x: state.x,
+            y: state.y,
+            consumed: state.consumed.clone(),
+        }
+    }
+}
+
+fn transition_target(block: &SolverBlock) -> Option<(&str, u64, u64)> {
+    let target = block.data.get("target")?.as_object()?;
+    Some((
+        target.get("floor_id")?.as_str()?,
+        target.get("x")?.as_u64()?,
+        target.get("y")?.as_u64()?,
+    ))
+}
+
+fn transition_is_pure(block: &SolverBlock) -> bool {
+    block.kind == "transition"
+        && block.data.get("initial_active").and_then(Value::as_bool) != Some(false)
+        && block.data.as_object().is_some_and(|data| {
+            data.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "block_id"
+                        | "floor_id"
+                        | "initial_active"
+                        | "kind"
+                        | "numeric_id"
+                        | "target"
+                        | "x"
+                        | "y"
+                )
+            })
+        })
+}
+
+fn reversible_transition_candidates(index: usize, blocks: &[SolverBlock]) -> Vec<usize> {
+    let Some(block) = blocks.get(index) else {
+        return Vec::new();
+    };
+    if !transition_is_pure(block) {
+        return Vec::new();
+    }
+    let Some((target_floor, target_x, target_y)) = transition_target(block) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .enumerate()
+        .filter(|(candidate_index, candidate)| {
+            // A transition cannot be its own reverse edge.  This matters for
+            // same-floor one-way transitions whose target happens to be
+            // adjacent to their source: without excluding `index`, the
+            // candidate can spuriously satisfy both directions and disappear
+            // from the strategic boundary.
+            *candidate_index != index
+                && transition_is_pure(candidate)
+                && candidate.floor == target_floor
+                && candidate.x.abs_diff(target_x) + candidate.y.abs_diff(target_y) <= 1
+                && transition_target(candidate).is_some_and(|(floor, x, y)| {
+                    floor == block.floor && block.x.abs_diff(x) + block.y.abs_diff(y) <= 1
+                })
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn reversible_transition_partner(index: usize, blocks: &[SolverBlock]) -> Option<usize> {
+    let partners = reversible_transition_candidates(index, blocks);
+    if partners.len() != 1 {
+        return None;
+    }
+    let partner = partners[0];
+    let reverse = reversible_transition_candidates(partner, blocks);
+    (reverse.len() == 1 && reverse[0] == index).then_some(partner)
+}
+
+fn reversible_region(
+    state: &SolverState,
+    floors: &HashMap<String, SolverFloor>,
+    blocks: &[SolverBlock],
+    reversible: &[Option<usize>],
+) -> ReversibleRegion {
+    let mut queue = VecDeque::from([(state.floor.clone(), state.x, state.y, Vec::new())]);
+    let mut components: Vec<RegionComponent> = Vec::new();
+    while let Some((floor, x, y, witness)) = queue.pop_front() {
+        if components
+            .iter()
+            .any(|component| component.floor == floor && component.reachable.contains(&(x, y)))
+        {
+            continue;
+        }
+        let mut local = state.clone();
+        local.floor = floor.clone();
+        local.x = x;
+        local.y = y;
+        let reachable = reachable_cells(&local, floors, blocks);
+        for index in floors
+            .get(&floor)
+            .into_iter()
+            .flat_map(|floor| &floor.blocks)
+        {
+            let block = &blocks[*index];
+            if block.floor != floor
+                || block_is_consumed(state, block)
+                || !adjacent(&reachable, block.x, block.y)
+                || reversible.get(*index).copied().flatten().is_none()
+            {
+                continue;
+            }
+            if let Some((next_floor, next_x, next_y)) = transition_target(block) {
+                let mut next_witness = witness.clone();
+                next_witness.push(*index);
+                queue.push_back((next_floor.to_owned(), next_x, next_y, next_witness));
+            }
+        }
+        components.push(RegionComponent {
+            floor,
+            reachable,
+            witness,
+        });
+    }
+    let representative = components
+        .iter()
+        .flat_map(|component| {
+            component
+                .reachable
+                .iter()
+                .map(move |(x, y)| (component.floor.clone(), *x, *y))
+        })
+        .min()
+        .unwrap_or_else(|| (state.floor.clone(), state.x, state.y));
+    ReversibleRegion {
+        components,
+        representative,
+    }
+}
+
+fn region_boundary_blocks(
+    region: &ReversibleRegion,
+    state: &SolverState,
+    floors: &HashMap<String, SolverFloor>,
+    blocks: &[SolverBlock],
+    reversible: &[Option<usize>],
+) -> Vec<(usize, usize)> {
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for (component_index, component) in region.components.iter().enumerate() {
+        for index in floors
+            .get(&component.floor)
+            .into_iter()
+            .flat_map(|floor| &floor.blocks)
+        {
+            let block = &blocks[*index];
+            if block.floor != component.floor
+                || block_is_consumed(state, block)
+                || block.kind == "opaque"
+                || block.kind == "terrain"
+                || !adjacent(&component.reachable, block.x, block.y)
+                || (block.kind == "transition" && reversible[*index].is_some())
+                || !seen.insert(*index)
+            {
+                continue;
+            }
+            result.push((component_index, *index));
+        }
+    }
+    result
 }
 
 fn add_delta(state: &mut SolverState, delta: &Value) -> Result<(), String> {
@@ -1370,6 +1571,9 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         return json!({"scope":"global_terminal_route","proof":"unsupported","reason":parsed.unwrap_err(),
             "truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null});
     };
+    let reversible: Vec<_> = (0..blocks.len())
+        .map(|index| reversible_transition_partner(index, &blocks))
+        .collect();
     if !blockers.is_empty() {
         return json!({"scope":"global_terminal_route","proof":"unsupported","reason":"unsupported_solver_blocker",
             "truncated":false,"explored_states":0,"blockers":blockers,"route":null,"first_suggestion":null});
@@ -1503,20 +1707,41 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
     let mut queue = VecDeque::from([SearchNode {
         state: initial,
         parent: None,
-        action: None,
+        actions: Vec::new(),
         depth: 0,
     }]);
     let mut route_arena = Vec::new();
     let mut seen = HashSet::new();
     let mut dominance: HashMap<StructuralKey, Vec<[f64; 8]>> = HashMap::new();
+    // Region expansion depends only on the mutable block bitmap and the entry
+    // point. Attribute and shop-only branches can therefore safely share it
+    // within this request. Keep the cache deliberately small and ephemeral.
+    let mut region_cache: HashMap<RegionCacheKey, Arc<ReversibleRegion>> = HashMap::new();
     let mut explored = 0usize;
     let mut best: Option<TerminalRoute> = None;
     let mut budget_exhausted = false;
-    while let Some(node) = queue.pop_front() {
+    while let Some(mut node) = queue.pop_front() {
         if explored >= max_states {
             budget_exhausted = true;
             break;
         }
+        let cache_key = RegionCacheKey::from(&node.state);
+        let region = if let Some(region) = region_cache.get(&cache_key) {
+            region.clone()
+        } else {
+            let region = Arc::new(reversible_region(
+                &node.state,
+                &floors,
+                &blocks,
+                &reversible,
+            ));
+            if region_cache.len() >= 128 {
+                region_cache.clear();
+            }
+            region_cache.insert(cache_key, region.clone());
+            region
+        };
+        (node.state.floor, node.state.x, node.state.y) = region.representative.clone();
         if !seen.insert(node.state.clone()) {
             continue;
         }
@@ -1550,14 +1775,29 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         let route_index = route_arena.len();
         route_arena.push(RouteLink {
             parent: node.parent,
-            action: node.action.clone(),
+            actions: node.actions.clone(),
         });
-        let reachable = reachable_cells(&node.state, &floors, &blocks);
-        if let Some((terminal_floor, terminal_pos)) = terminals
-            .iter()
-            .find(|(floor, position)| node.state.floor == *floor && reachable.contains(position))
+        if let Some((terminal_floor, terminal_pos, component)) =
+            terminals.iter().find_map(|(floor, position)| {
+                region
+                    .components
+                    .iter()
+                    .find(|component| {
+                        component.floor == *floor && component.reachable.contains(position)
+                    })
+                    .map(|component| (*floor, *position, component))
+            })
         {
             let mut steps = reconstruct_steps(&route_arena, route_index, &blocks);
+            steps.extend(component.witness.iter().map(|index| {
+                route_action_json(
+                    &RouteAction::Block {
+                        index: *index,
+                        action: BlockRouteAction::Transition,
+                    },
+                    &blocks,
+                )
+            }));
             steps.push(json!({"step_kind":"terminal","floor_id":terminal_floor,"x":terminal_pos.0,"y":terminal_pos.1,"details":{}}));
             let won = TerminalRoute {
                 state: node.state.clone(),
@@ -1571,21 +1811,35 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
             }
             continue;
         }
-        for (index, block) in blocks.iter().enumerate() {
-            if block.floor != node.state.floor
-                || block_is_consumed(&node.state, block)
-                || block.kind == "opaque"
-                || block.kind == "terrain"
-                || !adjacent(&reachable, block.x, block.y)
-            {
-                continue;
-            }
+        for (component_index, index) in
+            region_boundary_blocks(&region, &node.state, &floors, &blocks, &reversible)
+        {
+            let component = &region.components[component_index];
+            let block = &blocks[index];
             let mut next = SearchNode {
                 state: node.state.clone(),
                 parent: Some(route_index),
-                action: None,
+                actions: component
+                    .witness
+                    .iter()
+                    .map(|index| RouteAction::Block {
+                        index: *index,
+                        action: BlockRouteAction::Transition,
+                    })
+                    .collect(),
                 depth: node.depth + 1,
             };
+            next.state.floor = component.floor.clone();
+            if let Some((x, y)) = component
+                .reachable
+                .iter()
+                .filter(|(x, y)| x.abs_diff(block.x) + y.abs_diff(block.y) == 1)
+                .min()
+                .copied()
+            {
+                next.state.x = x;
+                next.state.y = y;
+            }
             match block.kind.as_str() {
                 "door" => {
                     let cost = &block.data["key_cost"];
@@ -1626,7 +1880,7 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     if !set_block_consumed(&mut next.state, block, true) {
                         continue;
                     }
-                    next.action = Some(RouteAction::Block {
+                    next.actions.push(RouteAction::Block {
                         index,
                         action: BlockRouteAction::Door {
                             yellow: y,
@@ -1642,7 +1896,7 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     if !set_block_consumed(&mut next.state, block, true) {
                         continue;
                     }
-                    next.action = Some(RouteAction::Block {
+                    next.actions.push(RouteAction::Block {
                         index,
                         action: BlockRouteAction::Resource,
                     });
@@ -1661,7 +1915,7 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     if !set_block_consumed(&mut next.state, block, true) {
                         continue;
                     }
-                    next.action = Some(RouteAction::Block {
+                    next.actions.push(RouteAction::Block {
                         index,
                         action: BlockRouteAction::Enemy {
                             hp_loss: F64Bits::new(loss).unwrap(),
@@ -1673,7 +1927,7 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     next.state.floor = target["floor_id"].as_str().unwrap_or_default().to_owned();
                     next.state.x = target["x"].as_u64().unwrap_or(0);
                     next.state.y = target["y"].as_u64().unwrap_or(0);
-                    next.action = Some(RouteAction::Block {
+                    next.actions.push(RouteAction::Block {
                         index,
                         action: BlockRouteAction::Transition,
                     });
@@ -1684,7 +1938,7 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     else {
                         continue;
                     };
-                    next.action = Some(RouteAction::Block {
+                    next.actions.push(RouteAction::Block {
                         index,
                         action: BlockRouteAction::Event {
                             event_id: event_details["event_id"]
@@ -1705,18 +1959,20 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                 .get("shop_id")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let accessible = blocks.iter().any(|block| {
-                block.floor == node.state.floor
-                    && block.kind == "shop"
-                    && block.data.get("shop_id").and_then(Value::as_str) == Some(shop_id)
-                    && adjacent(&reachable, block.x, block.y)
+            let accessible = region.components.iter().find(|component| {
+                blocks.iter().any(|block| {
+                    block.floor == component.floor
+                        && block.kind == "shop"
+                        && block.data.get("shop_id").and_then(Value::as_str) == Some(shop_id)
+                        && adjacent(&component.reachable, block.x, block.y)
+                })
             });
             let choices = shop
                 .get("choices")
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            if accessible {
+            if let Some(component) = accessible {
                 for (local, choice) in choices.iter().enumerate() {
                     let purchase_count = node.state.shop_counts[choice_offset + local];
                     let Some(cost) = choice["base_cost"].as_u64().and_then(|base| {
@@ -1733,9 +1989,36 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     let mut next = SearchNode {
                         state: node.state.clone(),
                         parent: Some(route_index),
-                        action: None,
+                        actions: component
+                            .witness
+                            .iter()
+                            .map(|index| RouteAction::Block {
+                                index: *index,
+                                action: BlockRouteAction::Transition,
+                            })
+                            .collect(),
                         depth: node.depth + 1,
                     };
+                    next.state.floor = component.floor.clone();
+                    if let Some(shop_block) = blocks.iter().find(|block| {
+                        block.floor == component.floor
+                            && block.kind == "shop"
+                            && block.data.get("shop_id").and_then(Value::as_str) == Some(shop_id)
+                            && adjacent(&component.reachable, block.x, block.y)
+                    }) {
+                        if let Some((x, y)) = component
+                            .reachable
+                            .iter()
+                            .filter(|(x, y)| {
+                                x.abs_diff(shop_block.x) + y.abs_diff(shop_block.y) == 1
+                            })
+                            .min()
+                            .copied()
+                        {
+                            next.state.x = x;
+                            next.state.y = y;
+                        }
+                    }
                     let currency = choice
                         .get("currency")
                         .and_then(Value::as_str)
@@ -1796,8 +2079,8 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                         continue;
                     }
                     Arc::make_mut(&mut next.state.shop_counts)[choice_offset + local] += 1;
-                    next.action = Some(RouteAction::Shop {
-                        floor: node.state.floor.clone(),
+                    next.actions.push(RouteAction::Shop {
+                        floor: component.floor.clone(),
                         shop_id: shop_id.to_owned(),
                         choice_id: choice["choice_id"].as_str().unwrap_or_default().to_owned(),
                         currency: currency.to_owned(),
@@ -2080,25 +2363,25 @@ mod tests {
         let arena = vec![
             RouteLink {
                 parent: None,
-                action: None,
+                actions: Vec::new(),
             },
             RouteLink {
                 parent: Some(0),
-                action: Some(RouteAction::Block {
+                actions: vec![RouteAction::Block {
                     index: 0,
                     action: BlockRouteAction::Door {
                         yellow: 1,
                         blue: 0,
                         red: 0,
                     },
-                }),
+                }],
             },
             RouteLink {
                 parent: Some(1),
-                action: Some(RouteAction::Block {
+                actions: vec![RouteAction::Block {
                     index: 1,
                     action: BlockRouteAction::Resource,
-                }),
+                }],
             },
         ];
         assert_eq!(
@@ -2295,6 +2578,213 @@ mod tests {
         assert!(block_is_consumed(&state, &blocks[2]));
         blocks[2].state_slot = None;
         assert!(!set_block_consumed(&mut state, &blocks[2], false));
+    }
+
+    #[test]
+    fn same_floor_one_way_transition_remains_a_strategic_boundary() {
+        let block = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "one-way".into(),
+            kind: "transition".into(),
+            data: json!({
+                "block_id":"one-way",
+                "floor_id":"F",
+                "initial_active":true,
+                "kind":"transition",
+                "numeric_id":1,
+                "x":1,
+                "y":0,
+                "target":{"floor_id":"F","x":2,"y":0}
+            }),
+            state_slot: None,
+        };
+        let blocks = vec![block];
+        let floors = HashMap::from([(
+            "F".into(),
+            SolverFloor {
+                width: 3,
+                height: 1,
+                cells: HashSet::from([(0, 0), (1, 0), (2, 0)]),
+                blocks: vec![0],
+            },
+        )]);
+        let mut state = terminal_node(10, 10, 100, "x").state;
+        state.floor = "F".into();
+        state.x = 0;
+        state.y = 0;
+
+        assert_eq!(reversible_transition_partner(0, &blocks), None);
+        let reversible = vec![None];
+        let region = reversible_region(&state, &floors, &blocks, &reversible);
+        assert_eq!(region.components.len(), 1);
+        assert_eq!(
+            region_boundary_blocks(&region, &state, &floors, &blocks, &reversible),
+            vec![(0, 0)]
+        );
+    }
+
+    #[test]
+    fn reversible_region_folds_only_unique_pure_round_trips_and_recomputes_after_door() {
+        let transition = |floor: &str, x, target_floor: &str, target_x| SolverBlock {
+            floor: floor.into(),
+            x,
+            y: 0,
+            id: "stairs".into(),
+            kind: "transition".into(),
+            data: json!({"block_id":"stairs","floor_id":floor,"initial_active":true,
+                "kind":"transition","numeric_id":1,"x":x,"y":0,
+                "target":{"floor_id":target_floor,"x":target_x,"y":0}}),
+            state_slot: None,
+        };
+        let mut blocks = vec![transition("A", 2, "B", 0), transition("B", 0, "A", 1)];
+        blocks.push(SolverBlock {
+            floor: "B".into(),
+            x: 2,
+            y: 0,
+            id: "door".into(),
+            kind: "door".into(),
+            data: json!({}),
+            state_slot: Some(0),
+        });
+        let floors = HashMap::from([
+            (
+                "A".into(),
+                SolverFloor {
+                    width: 3,
+                    height: 1,
+                    cells: HashSet::from([(0, 0), (1, 0), (2, 0)]),
+                    blocks: vec![0],
+                },
+            ),
+            (
+                "B".into(),
+                SolverFloor {
+                    width: 4,
+                    height: 1,
+                    cells: HashSet::from([(0, 0), (1, 0), (2, 0), (3, 0)]),
+                    blocks: vec![1, 2],
+                },
+            ),
+        ]);
+        let mut state = terminal_node(10, 10, 100, "x").state;
+        state.floor = "A".into();
+        state.x = 0;
+        state.y = 0;
+        state.consumed = Arc::new(vec![false]);
+        assert_eq!(reversible_transition_partner(0, &blocks), Some(1));
+        let reversible: Vec<_> = (0..blocks.len())
+            .map(|index| reversible_transition_partner(index, &blocks))
+            .collect();
+        let closed = reversible_region(&state, &floors, &blocks, &reversible);
+        assert_eq!(closed.components.len(), 2);
+        let remote = closed
+            .components
+            .iter()
+            .find(|component| component.floor == "B")
+            .unwrap();
+        assert_eq!(remote.witness, vec![0]);
+        assert!(!remote.reachable.contains(&(3, 0)));
+        let witness_steps = reconstruct_steps(
+            &[
+                RouteLink {
+                    parent: None,
+                    actions: vec![],
+                },
+                RouteLink {
+                    parent: Some(0),
+                    actions: vec![
+                        RouteAction::Block {
+                            index: 0,
+                            action: BlockRouteAction::Transition,
+                        },
+                        RouteAction::Block {
+                            index: 2,
+                            action: BlockRouteAction::Door {
+                                yellow: 0,
+                                blue: 0,
+                                red: 0,
+                            },
+                        },
+                    ],
+                },
+            ],
+            1,
+            &blocks,
+        );
+        assert_eq!(witness_steps[0]["step_kind"], "transition");
+        assert_eq!(witness_steps[1]["step_kind"], "door");
+        assert!(set_block_consumed(&mut state, &blocks[2], true));
+        let opened = reversible_region(&state, &floors, &blocks, &reversible);
+        assert!(
+            opened
+                .components
+                .iter()
+                .find(|component| component.floor == "B")
+                .unwrap()
+                .reachable
+                .contains(&(3, 0))
+        );
+
+        let mut side_effect = blocks.clone();
+        side_effect[1].data["event"] = json!({"id":"x"});
+        assert_eq!(reversible_transition_partner(0, &side_effect), None);
+        assert_eq!(reversible_transition_partner(0, &blocks[..1]), None);
+
+        let mut reverse_ambiguous = blocks.clone();
+        reverse_ambiguous.push(transition("A", 0, "B", 0));
+        assert_eq!(
+            reversible_transition_partner(0, &reverse_ambiguous),
+            None,
+            "a unique forward match is not reversible when the reverse endpoint is ambiguous"
+        );
+    }
+
+    #[test]
+    fn region_boundary_blocks_deduplicate_a_block_adjacent_to_multiple_components() {
+        let block = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "door".into(),
+            kind: "door".into(),
+            data: json!({"key_cost":{"yellow":0,"blue":0,"red":0}}),
+            state_slot: Some(0),
+        };
+        let floors = HashMap::from([(
+            "F".into(),
+            SolverFloor {
+                width: 3,
+                height: 1,
+                cells: HashSet::from([(0, 0), (1, 0), (2, 0)]),
+                blocks: vec![0],
+            },
+        )]);
+        let region = ReversibleRegion {
+            components: vec![
+                RegionComponent {
+                    floor: "F".into(),
+                    reachable: HashSet::from([(0, 0)]),
+                    witness: vec![],
+                },
+                RegionComponent {
+                    floor: "F".into(),
+                    reachable: HashSet::from([(2, 0)]),
+                    witness: vec![],
+                },
+            ],
+            representative: ("F".into(), 0, 0),
+        };
+        let mut state = terminal_node(10, 10, 100, "x").state;
+        state.floor = "F".into();
+        state.x = 0;
+        state.y = 0;
+        state.consumed = Arc::new(vec![false]);
+        assert_eq!(
+            region_boundary_blocks(&region, &state, &floors, &[block], &[None]),
+            vec![(0, 0)]
+        );
     }
 
     #[test]
@@ -2656,6 +3146,17 @@ mod tests {
         value
     }
 
+    fn with_reversible_floor_pair(mut observation: Value) -> Value {
+        observation["engine_model"]["solver_model"]["floors"][1]["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "floor_id":"F2","x":0,"y":0,"block_id":"upFloor","numeric_id":15,
+                "kind":"transition","target":{"floor_id":"F1","x":2,"y":0}
+            }));
+        observation
+    }
+
     #[test]
     fn valid_cycle_is_idle_and_read_only() {
         let state = Mutex::new(ShadowState::default());
@@ -2721,6 +3222,46 @@ mod tests {
         ] {
             assert!(!serialized.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn remote_region_shop_and_terminal_keep_their_floor_and_transition_witnesses() {
+        let response = shadow_response(
+            &request_with(with_reversible_floor_pair(global_observation(None))),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        let global = &response["shadow"]["analysis"]["global"];
+        assert_eq!(global["proof"], "proven");
+        let steps = global["route"]["steps"].as_array().unwrap();
+        let shop = steps
+            .iter()
+            .find(|step| step["step_kind"] == "shop")
+            .unwrap();
+        assert_eq!(shop["floor_id"], "F2");
+
+        let mut terminal_observation = with_reversible_floor_pair(global_observation(None));
+        terminal_observation["engine_model"]["solver_model"]["terminal"] =
+            json!({"kind":"location","floor_id":"F2","x":0,"y":0});
+        let terminal_response = shadow_response(
+            &request_with(terminal_observation),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        let steps = terminal_response["shadow"]["analysis"]["global"]["route"]["steps"]
+            .as_array()
+            .unwrap();
+        let terminal_index = steps
+            .iter()
+            .position(|step| step["step_kind"] == "terminal")
+            .unwrap();
+        assert_eq!(steps[terminal_index]["floor_id"], "F2");
+        assert_eq!(
+            steps[terminal_index - 1]["step_kind"],
+            "transition",
+            "a terminal in a remote reversible component keeps its physical witness"
+        );
+        assert_eq!(steps[terminal_index - 1]["floor_id"], "F1");
     }
 
     #[test]
