@@ -654,10 +654,10 @@ struct SolverState {
     yellow: u64,
     blue: u64,
     red: u64,
-    inventory: Vec<(String, u64)>,
-    consumed: Vec<bool>,
-    shop_counts: Vec<u64>,
-    flags: Vec<(String, u64)>,
+    inventory: Arc<Vec<(String, u64)>>,
+    consumed: Arc<Vec<bool>>,
+    shop_counts: Arc<Vec<u64>>,
+    flags: Arc<Vec<(String, u64)>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -665,11 +665,11 @@ struct StructuralKey {
     floor: String,
     x: u64,
     y: u64,
-    inventory: Vec<(String, u64)>,
-    consumed: Vec<bool>,
-    shop_counts: Vec<u64>,
+    inventory: Arc<Vec<(String, u64)>>,
+    consumed: Arc<Vec<bool>>,
+    shop_counts: Arc<Vec<u64>>,
     level: u64,
-    flags: Vec<(String, u64)>,
+    flags: Arc<Vec<(String, u64)>>,
 }
 
 impl From<&SolverState> for StructuralKey {
@@ -1040,7 +1040,7 @@ fn add_delta(state: &mut SolverState, delta: &Value) -> Result<(), String> {
             *inventory.entry(id.clone()).or_default() += count.as_u64().unwrap_or(0);
         }
     }
-    state.inventory = inventory.into_iter().collect();
+    state.inventory = Arc::new(inventory.into_iter().collect());
     Ok(())
 }
 
@@ -1070,20 +1070,24 @@ fn state_count(entries: &[(String, u64)], id: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn state_set(entries: &mut Vec<(String, u64)>, id: &str, value: u64) {
+fn state_set(entries: &mut Arc<Vec<(String, u64)>>, id: &str, value: u64) {
     let mut map: BTreeMap<String, u64> = entries.iter().cloned().collect();
     if value == 0 {
         map.remove(id);
     } else {
         map.insert(id.to_owned(), value);
     }
-    *entries = map.into_iter().collect();
+    *entries = Arc::new(map.into_iter().collect());
+}
+
+fn set_consumed(state: &mut SolverState, index: usize, value: bool) {
+    Arc::make_mut(&mut state.consumed)[index] = value;
 }
 
 fn consume_at(state: &mut SolverState, blocks: &[SolverBlock], floor: &str, x: u64, y: u64) {
     for (index, block) in blocks.iter().enumerate() {
         if block.floor == floor && block.x == x && block.y == y {
-            state.consumed[index] = true;
+            set_consumed(state, index, true);
         }
     }
 }
@@ -1091,7 +1095,7 @@ fn consume_at(state: &mut SolverState, blocks: &[SolverBlock], floor: &str, x: u
 fn activate_at(state: &mut SolverState, blocks: &[SolverBlock], floor: &str, x: u64, y: u64) {
     for (index, block) in blocks.iter().enumerate() {
         if block.floor == floor && block.x == x && block.y == y {
-            state.consumed[index] = false;
+            set_consumed(state, index, false);
         }
     }
 }
@@ -1107,14 +1111,14 @@ fn replace_at(
     let mut replacement = None;
     for (index, block) in blocks.iter().enumerate() {
         if block.floor == floor && block.x == x && block.y == y {
-            state.consumed[index] = true;
+            set_consumed(state, index, true);
             if block.data.get("numeric_id").and_then(Value::as_u64) == Some(numeric_id) {
                 replacement = Some(index);
             }
         }
     }
     if let Some(index) = replacement {
-        state.consumed[index] = false;
+        set_consumed(state, index, false);
         true
     } else {
         false
@@ -1149,7 +1153,7 @@ fn apply_audited_event(
                 state.hp = state.hp.mul(4.0)?.div(3.0)?;
                 state.attack = state.attack.mul(4.0)?.div(3.0)?;
                 state.defense = state.defense.mul(4.0)?.div(3.0)?;
-                state.consumed[block_index] = true;
+                set_consumed(state, block_index, true);
                 activate_at(state, blocks, "MT20", 6, 8);
             } else {
                 return None;
@@ -1157,29 +1161,29 @@ fn apply_audited_event(
         }
         "book_reward" => {
             add_item(state, "book", 1);
-            state.consumed[block_index] = true;
+            set_consumed(state, block_index, true);
         }
         "sword2_reward" => {
             state.attack = state.attack.add(70.0)?;
-            state.consumed[block_index] = true;
+            set_consumed(state, block_index, true);
         }
         "shield2_reward" => {
             state.defense = state.defense.add(30.0)?;
-            state.consumed[block_index] = true;
+            set_consumed(state, block_index, true);
         }
         "cross_reward" => {
             add_item(state, "cross", 1);
-            state.consumed[block_index] = true;
+            set_consumed(state, block_index, true);
             consume_at(state, blocks, "MT16", 5, 5);
         }
         "fly_reward" => {
             add_item(state, "fly", 1);
             state_set(&mut state.flags, "fly", 1);
-            state.consumed[block_index] = true;
+            set_consumed(state, block_index, true);
         }
         "ice_pickaxe_reward" => {
             add_item(state, "icePickaxe", 1);
-            state.consumed[block_index] = true;
+            set_consumed(state, block_index, true);
         }
         "exp_sword_trade" => {
             if state.experience < 500 {
@@ -1187,7 +1191,7 @@ fn apply_audited_event(
             }
             state.experience -= 500;
             state.attack = state.attack.add(120.0)?;
-            state.consumed[block_index] = true;
+            set_consumed(state, block_index, true);
         }
         "gold_shield_trade" => {
             if state.gold < 500 {
@@ -1195,14 +1199,14 @@ fn apply_audited_event(
             }
             state.gold -= 500;
             state.defense = state.defense.add(120.0)?;
-            state.consumed[block_index] = true;
+            set_consumed(state, block_index, true);
         }
         "ice_wand_reward" => {
             state_set(&mut state.flags, "16", 1);
-            state.consumed[block_index] = true;
+            set_consumed(state, block_index, true);
         }
         "dialogue_once" => {
-            state.consumed[block_index] = true;
+            set_consumed(state, block_index, true);
         }
         "thief_quest" => {
             if state_count(&state.flags, "switch:MT4:6,1:A") == 0 {
@@ -1211,7 +1215,7 @@ fn apply_audited_event(
             } else if consume_item(state, "icePickaxe", 1) {
                 consume_at(state, blocks, "MT18", 6, 9);
                 consume_at(state, blocks, "MT18", 6, 10);
-                state.consumed[block_index] = true;
+                set_consumed(state, block_index, true);
             } else {
                 return None;
             }
@@ -1231,13 +1235,13 @@ fn apply_audited_event(
             });
             if missing {
                 if id == "wand_gate_remove_on_failure" {
-                    state.consumed[block_index] = true;
+                    set_consumed(state, block_index, true);
                 } else {
                     return None;
                 }
             } else {
                 state_set(&mut state.flags, "final_wand_gate", 1);
-                state.consumed[block_index] = true;
+                set_consumed(state, block_index, true);
                 for (x, y, numeric_id) in [
                     (5, 2, 181),
                     (6, 2, 182),
@@ -1324,45 +1328,54 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         yellow: keys.get("yellow").and_then(Value::as_u64).unwrap_or(0),
         blue: keys.get("blue").and_then(Value::as_u64).unwrap_or(0),
         red: keys.get("red").and_then(Value::as_u64).unwrap_or(0),
-        inventory,
-        consumed: blocks
-            .iter()
-            .map(|block| block.data.get("initial_active").and_then(Value::as_bool) == Some(false))
-            .collect(),
-        shop_counts: shops
-            .iter()
-            .flat_map(|shop| {
-                shop.get("choices")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-            })
-            .map(|choice| {
-                choice
-                    .get("purchase_count")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-            })
-            .collect(),
-        flags: observation
-            .get("engine_model")
-            .and_then(Value::as_object)
-            .and_then(|m| m.get("solver_model"))
-            .and_then(Value::as_object)
-            .and_then(|m| m.get("initial"))
-            .and_then(Value::as_object)
-            .and_then(|i| i.get("flags"))
-            .and_then(Value::as_object)
-            .map(|flags| {
-                flags
-                    .iter()
-                    .filter_map(|(name, value)| {
-                        let number = value.as_u64().or_else(|| value.as_bool().map(u64::from))?;
-                        Some((name.clone(), number))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        inventory: Arc::new(inventory),
+        consumed: Arc::new(
+            blocks
+                .iter()
+                .map(|block| {
+                    block.data.get("initial_active").and_then(Value::as_bool) == Some(false)
+                })
+                .collect(),
+        ),
+        shop_counts: Arc::new(
+            shops
+                .iter()
+                .flat_map(|shop| {
+                    shop.get("choices")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .map(|choice| {
+                    choice
+                        .get("purchase_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                })
+                .collect(),
+        ),
+        flags: Arc::new(
+            observation
+                .get("engine_model")
+                .and_then(Value::as_object)
+                .and_then(|m| m.get("solver_model"))
+                .and_then(Value::as_object)
+                .and_then(|m| m.get("initial"))
+                .and_then(Value::as_object)
+                .and_then(|i| i.get("flags"))
+                .and_then(Value::as_object)
+                .map(|flags| {
+                    flags
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            let number =
+                                value.as_u64().or_else(|| value.as_bool().map(u64::from))?;
+                            Some((name.clone(), number))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
     };
     let terminal_object = terminal.as_object().unwrap();
     let terminal_values: Vec<&Value> =
@@ -1511,11 +1524,13 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                             *inventory.entry(id.clone()).or_default() -= count.as_u64().unwrap();
                         }
                     }
-                    next.state.inventory = inventory
-                        .into_iter()
-                        .filter(|(_, count)| *count > 0)
-                        .collect();
-                    next.state.consumed[index] = true;
+                    next.state.inventory = Arc::new(
+                        inventory
+                            .into_iter()
+                            .filter(|(_, count)| *count > 0)
+                            .collect(),
+                    );
+                    set_consumed(&mut next.state, index, true);
                     next.action = Some(RouteAction::Block {
                         index,
                         action: BlockRouteAction::Door {
@@ -1529,7 +1544,7 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     if add_delta(&mut next.state, &block.data["delta"]).is_err() {
                         continue;
                     }
-                    next.state.consumed[index] = true;
+                    set_consumed(&mut next.state, index, true);
                     next.action = Some(RouteAction::Block {
                         index,
                         action: BlockRouteAction::Resource,
@@ -1546,7 +1561,7 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     next.state.gold += block.data["enemy"]["gold"].as_u64().unwrap_or(0);
                     next.state.experience +=
                         block.data["enemy"]["experience"].as_u64().unwrap_or(0);
-                    next.state.consumed[index] = true;
+                    set_consumed(&mut next.state, index, true);
                     next.action = Some(RouteAction::Block {
                         index,
                         action: BlockRouteAction::Enemy {
@@ -1681,7 +1696,7 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
                     if !valid {
                         continue;
                     }
-                    next.state.shop_counts[choice_offset + local] += 1;
+                    Arc::make_mut(&mut next.state.shop_counts)[choice_offset + local] += 1;
                     next.action = Some(RouteAction::Shop {
                         floor: node.state.floor.clone(),
                         shop_id: shop_id.to_owned(),
@@ -1907,10 +1922,10 @@ mod tests {
                 yellow: 0,
                 blue: 0,
                 red: 0,
-                inventory: Vec::new(),
-                consumed: Vec::new(),
-                shop_counts: Vec::new(),
-                flags: Vec::new(),
+                inventory: Arc::new(Vec::new()),
+                consumed: Arc::new(Vec::new()),
+                shop_counts: Arc::new(Vec::new()),
+                flags: Arc::new(Vec::new()),
             },
             steps: vec![json!({"route": route})],
         }
@@ -2002,24 +2017,24 @@ mod tests {
         state.floor = "F1".into();
         state.x = 2;
         state.y = 3;
-        state.inventory = vec![("book".into(), 1)];
-        state.consumed = vec![false, true];
-        state.shop_counts = vec![2];
+        state.inventory = Arc::new(vec![("book".into(), 1)]);
+        state.consumed = Arc::new(vec![false, true]);
+        state.shop_counts = Arc::new(vec![2]);
         state.level = 4;
-        state.flags = vec![("quest".into(), 1)];
+        state.flags = Arc::new(vec![("quest".into(), 1)]);
         let key = StructuralKey::from(&state);
         let legacy = json!({"floor":state.floor,"x":state.x,"y":state.y,
-            "inventory":state.inventory,"consumed":state.consumed,"shops":state.shop_counts,
-            "level":state.level,"flags":state.flags});
+            "inventory":&*state.inventory,"consumed":&*state.consumed,
+            "shops":&*state.shop_counts,"level":state.level,"flags":&*state.flags});
         assert_eq!(legacy.as_object().unwrap().len(), 8);
         assert_eq!(legacy["floor"], key.floor);
         assert_eq!(legacy["x"], key.x);
         assert_eq!(legacy["y"], key.y);
-        assert_eq!(legacy["inventory"], json!(key.inventory));
-        assert_eq!(legacy["consumed"], json!(key.consumed));
-        assert_eq!(legacy["shops"], json!(key.shop_counts));
+        assert_eq!(legacy["inventory"], json!(&*key.inventory));
+        assert_eq!(legacy["consumed"], json!(&*key.consumed));
+        assert_eq!(legacy["shops"], json!(&*key.shop_counts));
         assert_eq!(legacy["level"], key.level);
-        assert_eq!(legacy["flags"], json!(key.flags));
+        assert_eq!(legacy["flags"], json!(&*key.flags));
 
         let mut variants = Vec::new();
         let mut changed = state.clone();
@@ -2032,23 +2047,54 @@ mod tests {
         changed.y += 1;
         variants.push(changed);
         let mut changed = state.clone();
-        changed.inventory.push(("cross".into(), 1));
+        Arc::make_mut(&mut changed.inventory).push(("cross".into(), 1));
         variants.push(changed);
         let mut changed = state.clone();
-        changed.consumed[0] = true;
+        Arc::make_mut(&mut changed.consumed)[0] = true;
         variants.push(changed);
         let mut changed = state.clone();
-        changed.shop_counts[0] += 1;
+        Arc::make_mut(&mut changed.shop_counts)[0] += 1;
         variants.push(changed);
         let mut changed = state.clone();
         changed.level += 1;
         variants.push(changed);
         let mut changed = state.clone();
-        changed.flags[0].1 += 1;
+        Arc::make_mut(&mut changed.flags)[0].1 += 1;
         variants.push(changed);
         for changed in variants {
             assert_ne!(StructuralKey::from(&changed), key);
         }
+    }
+
+    #[test]
+    fn solver_state_large_collections_share_until_branch_mutation() {
+        let mut parent = terminal_node(10, 10, 100, "x").state;
+        parent.inventory = Arc::new(vec![("book".into(), 1)]);
+        parent.consumed = Arc::new(vec![false, false]);
+        parent.shop_counts = Arc::new(vec![0]);
+        parent.flags = Arc::new(vec![("quest".into(), 1)]);
+        let mut child = parent.clone();
+        assert!(Arc::ptr_eq(&parent.inventory, &child.inventory));
+        assert!(Arc::ptr_eq(&parent.consumed, &child.consumed));
+        assert!(Arc::ptr_eq(&parent.shop_counts, &child.shop_counts));
+        assert!(Arc::ptr_eq(&parent.flags, &child.flags));
+
+        state_set(&mut child.inventory, "cross", 1);
+        set_consumed(&mut child, 0, true);
+        Arc::make_mut(&mut child.shop_counts)[0] = 1;
+        state_set(&mut child.flags, "quest", 2);
+        assert!(!Arc::ptr_eq(&parent.inventory, &child.inventory));
+        assert!(!Arc::ptr_eq(&parent.consumed, &child.consumed));
+        assert!(!Arc::ptr_eq(&parent.shop_counts, &child.shop_counts));
+        assert!(!Arc::ptr_eq(&parent.flags, &child.flags));
+        assert_eq!(&*parent.inventory, &[("book".into(), 1)]);
+        assert_eq!(&*parent.consumed, &[false, false]);
+        assert_eq!(&*parent.shop_counts, &[0]);
+        assert_eq!(&*parent.flags, &[("quest".into(), 1)]);
+        assert_eq!(state_count(&child.inventory, "cross"), 1);
+        assert!(child.consumed[0]);
+        assert_eq!(child.shop_counts[0], 1);
+        assert_eq!(state_count(&child.flags, "quest"), 2);
     }
 
     #[test]
@@ -2073,7 +2119,7 @@ mod tests {
             kind: "event".into(),
             data: json!({"event":{"id":"fairy_mt0"}}),
         };
-        state.consumed = vec![false];
+        state.consumed = Arc::new(vec![false]);
         let details =
             apply_audited_event(&mut state, &block, 0, std::slice::from_ref(&block)).unwrap();
         assert_eq!(details["event_id"], "fairy_mt0");
@@ -2109,11 +2155,11 @@ mod tests {
         };
         let blocks = vec![gate_once.clone(), gate_retry.clone(), wand];
         let mut once = terminal_node(10, 10, 100, "x").state;
-        once.consumed = vec![false; 3];
+        once.consumed = Arc::new(vec![false; 3]);
         assert!(apply_audited_event(&mut once, &gate_once, 0, &blocks).is_some());
         assert!(once.consumed[0]);
         let mut retry = terminal_node(10, 10, 100, "x").state;
-        retry.consumed = vec![false; 3];
+        retry.consumed = Arc::new(vec![false; 3]);
         assert!(apply_audited_event(&mut retry, &gate_retry, 1, &blocks).is_none());
         assert!(!retry.consumed[1]);
     }
@@ -2136,7 +2182,7 @@ mod tests {
         };
         let mut state = terminal_node(10, 10, 100, "x").state;
         state.floor = "F".into();
-        state.consumed = vec![true];
+        state.consumed = Arc::new(vec![true]);
         assert!(
             reachable_cells(&state, &HashMap::from([("F".into(), floor)]), &[block])
                 .contains(&(2, 0))
@@ -2196,9 +2242,11 @@ mod tests {
         state.floor = "MT_1".into();
         state.x = 6;
         state.y = 5;
-        state.consumed = (0..blocks.len())
-            .map(|index| index > 0 && index % 2 == 0)
-            .collect();
+        state.consumed = Arc::new(
+            (0..blocks.len())
+                .map(|index| index > 0 && index % 2 == 0)
+                .collect(),
+        );
         assert!(apply_audited_event(&mut state, &gate, 0, &blocks).is_some());
         for (x, y, _, new) in positions {
             let active: Vec<_> = blocks
@@ -2227,7 +2275,7 @@ mod tests {
             .position(|block| block.data["numeric_id"] == 258)
             .unwrap();
         assert!(enemy_loss(&state, &blocks[octopus].data["enemy"]).is_some());
-        state.consumed[octopus] = true;
+        Arc::make_mut(&mut state.consumed)[octopus] = true;
         assert!(reachable_cells(&state, &floors, &blocks).contains(&(6, 4)));
     }
 
@@ -2267,9 +2315,9 @@ mod tests {
         };
         let blocks = vec![thief.clone(), mt2_door, road_a, road_b];
         let mut state = terminal_node(10, 10, 100, "x").state;
-        state.flags = vec![("switch:MT4:6,1:A".into(), 2)];
-        state.inventory = vec![("icePickaxe".into(), 1)];
-        state.consumed = vec![false; blocks.len()];
+        state.flags = Arc::new(vec![("switch:MT4:6,1:A".into(), 2)]);
+        state.inventory = Arc::new(vec![("icePickaxe".into(), 1)]);
+        state.consumed = Arc::new(vec![false; blocks.len()]);
         assert!(apply_audited_event(&mut state, &thief, 0, &blocks).is_some());
         assert!(!state.consumed[1]);
         assert!(state.consumed[2]);
@@ -2284,8 +2332,8 @@ mod tests {
             kind: "event".into(),
             data: json!({"event":{"id":"princess_quest"}}),
         };
-        state.flags = vec![("switch:MT18:6,5:A".into(), 1)];
-        state.consumed.push(false);
+        state.flags = Arc::new(vec![("switch:MT18:6,5:A".into(), 1)]);
+        Arc::make_mut(&mut state.consumed).push(false);
         let princess_blocks = [blocks, vec![princess.clone()]].concat();
         assert!(apply_audited_event(&mut state, &princess, 4, &princess_blocks).is_none());
     }
