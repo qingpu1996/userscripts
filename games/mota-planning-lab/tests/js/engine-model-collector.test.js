@@ -450,3 +450,44 @@ test("core.floorIds 展开 :next/:before 并使用目标层 stair 落点", () =>
   });
   assert.deepEqual(JSON.parse(JSON.stringify(model.floors[1].change_floor[0].loc)), { x: 9, y: 8 });
 });
+
+function transitionLandingCore(targetStairs) {
+  const core = fakeCore();
+  core.floorIds = ["MT0", "MT1B", "MT1A", "MT2"];
+  core.floors.MT0.changeFloor = { "10,10": { floorId: ":next", stair: "upFloor" } };
+  const originalBlocks = core.getMapBlocksObj.bind(core);
+  core.getMapBlocksObj = (floorId, includeDisabled) => {
+    if (floorId === "MT0") return [{ x: 10, y: 10, id: 88,
+      event: { id: "downFloor", cls: "terrains", trigger: "changeFloor" } }];
+    if (floorId === "MT1B") return targetStairs.map((loc) => ({ x: loc.x, y: loc.y, id: 88,
+      event: { id: "upFloor", cls: "terrains", trigger: "changeFloor" } }));
+    return originalBlocks(floorId, includeDisabled);
+  };
+  core.maps.blocksInfo[88] = { id: "downFloor", cls: "terrains", trigger: "changeFloor" };
+  return core;
+}
+
+test("换层定义无 loc 时从目标层唯一 stair block 推导落点", () => {
+  const model = lab.collectEngineModel(transitionLandingCore([{ x: 2, y: 1 }]), {});
+  const transition = model.floors.find((floor) => floor.floor_id === "MT0").change_floor[0];
+  assert.deepEqual(JSON.parse(JSON.stringify(transition)), {
+    x: 10, y: 10, floor_id: "MT1B", loc: { x: 2, y: 1 }, direction: null,
+    stair: "upFloor", time: null, ignore_change_floor: false, opaque: false,
+  });
+  const solver = lab.buildSolverModel(model, []);
+  assert.equal(solver.blockers.some((blocker) => blocker.code === "TRANSITION_UNSUPPORTED"
+    && blocker.detail === "MT0:10,10"), false);
+});
+
+test("目标层 stair block 缺失或不唯一时换层仍 fail closed", () => {
+  for (const stairs of [[], [{ x: 1, y: 1 }, { x: 2, y: 1 }]]) {
+    const model = lab.collectEngineModel(transitionLandingCore(stairs), {});
+    const transition = model.floors.find((floor) => floor.floor_id === "MT0").change_floor[0];
+    assert.equal(transition.loc, null);
+    assert.equal(transition.opaque, true);
+    const solver = lab.buildSolverModel(model, []);
+    assert.deepEqual(JSON.parse(JSON.stringify(solver.blockers.filter(
+      (blocker) => blocker.code === "TRANSITION_UNSUPPORTED" && blocker.detail === "MT0:10,10",
+    ))), [{ code: "TRANSITION_UNSUPPORTED", detail: "MT0:10,10" }]);
+  }
+});

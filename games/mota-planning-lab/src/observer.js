@@ -458,10 +458,12 @@ MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = []) {
         let landing = transition && transition.loc;
         if (!landing && transition && transition.floor_id && transition.stair) {
           const targetFloor = floorById.get(transition.floor_id);
-          const targetBlock = targetFloor && (targetFloor.blocks || []).find(
+          const targetBlocks = targetFloor && (targetFloor.blocks || []).filter(
             (candidate) => candidate.id === transition.stair,
           );
-          if (targetBlock) landing = { x: targetBlock.x, y: targetBlock.y };
+          if (targetBlocks && targetBlocks.length === 1) {
+            landing = { x: targetBlocks[0].x, y: targetBlocks[0].y };
+          }
         }
         if (!transition || transition.opaque || !transition.floor_id || !landing) {
           blockers.push({ code: "TRANSITION_UNSUPPORTED", detail: `${floor.floor_id}:${block.x},${block.y}` });
@@ -580,6 +582,7 @@ MotaLab.collectEngineModel = function collectEngineModel(engine, keySlotIds = {}
     engine, floorId, floorDefinitions[floorId] || {}, statusMaps[floorId] || {}, fail,
   ));
   const floorIndex = new Map(floorIds.map((id, index) => [id, index]));
+  const collectedFloorById = new Map(floors.map((floor) => [floor.floor_id, floor]));
   floors = floors.map((floor) => ({ ...floor, change_floor: floor.change_floor.map((change) => {
     let targetId = change.floor_id;
     const index = floorIndex.get(floor.floor_id);
@@ -590,8 +593,14 @@ MotaLab.collectEngineModel = function collectEngineModel(engine, keySlotIds = {}
     const definedLanding = Array.isArray(rawLanding) && rawLanding.length >= 2
       && MotaLab.isFiniteInteger(rawLanding[0]) && MotaLab.isFiniteInteger(rawLanding[1])
       ? { x: rawLanding[0], y: rawLanding[1] } : null;
-    return { ...change, floor_id: targetId, loc: change.loc || definedLanding,
-      opaque: !targetId || !(change.loc || definedLanding) };
+    const targetFloor = targetId && collectedFloorById.get(targetId);
+    const stairMatches = targetFloor && change.stair
+      ? (targetFloor.blocks || []).filter((block) => block.id === change.stair) : [];
+    const inferredLanding = stairMatches.length === 1
+      ? { x: stairMatches[0].x, y: stairMatches[0].y } : null;
+    const landing = change.loc || definedLanding || inferredLanding;
+    return { ...change, floor_id: targetId, loc: landing,
+      opaque: !targetId || !landing };
   }) }));
 
   const blockSource = detach(engine.maps && engine.maps.blocksInfo || {});
