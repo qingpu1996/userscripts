@@ -1,0 +1,30 @@
+{
+  "request_bytes": 2576604,
+  "elapsed_ms": 3310.960708,
+  "status": 200,
+  "profile": {
+    "candidate_materialization": {
+      "calls": 678693,
+      "max_ns": "70042",
+      "median_ns": "291",
+      "total_ns": "174141871"
+    },
+    "connectivity_view_bfs": {
+      "calls": 50000,
+      "max_ns": "289416",
+      "median_ns": "6083",
+      "total_ns": "311615099"
+    },
+    "materialize_calls": 678693,
+    "pareto_accepted": 108376,
+    "pareto_rejected": 285872,
+    "pops": 73502,
+    "representative_bfs": {
+      "calls": 394248,
+      "max_ns": "201291",
+      "median_ns": "5167",
+      "total_ns": "2086708896"
+    },
+    "stale_pops": 23501
+  }
+}
