@@ -558,8 +558,13 @@ MotaLab.createController = function createController(dependencies, options = {})
 
     if (response.status === "idle") {
       state = "OBSERVING";
-      lastReason = response.shadow
-        ? `Shadow（只读）：${response.shadow.reason}` : response.reason;
+      if (response.shadow) {
+        const global = response.shadow.analysis && response.shadow.analysis.global;
+        const first = global && global.first_suggestion;
+        lastReason = global
+          ? `Shadow（只读）${global.proof}${first ? `：${first.step_kind}@${first.floor_id}` : `：${global.reason}`}`
+          : `Shadow（只读）：${response.shadow.reason}`;
+      } else lastReason = response.reason;
       refreshPanel({ connected: true });
       if (journal.snapshot().pending_action || completedActionId) {
         resetIdleBackoff();

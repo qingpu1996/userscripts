@@ -257,6 +257,9 @@ MotaLab.collectEngineFloor = function collectEngineFloor(
     const id = event.id !== undefined ? event.id : raw.id;
     const cls = event.cls !== undefined ? event.cls : raw.cls;
     const trigger = event.trigger !== undefined ? event.trigger : raw.trigger;
+    const eventActions = Array.isArray(event.data) ? event.data : [];
+    const shopActions = eventActions.filter((action) => action && typeof action === "object"
+      && action.type === "openShop" && typeof action.id === "string" && action.open === true);
     if (!MotaLab.isFiniteInteger(raw.x) || !MotaLab.isFiniteInteger(raw.y)
       || !MotaLab.isFiniteInteger(numericId) || numericId < 0 || id == null || cls == null) {
       fail("ENGINE_MODEL_BLOCK_INVALID", { x: raw && raw.x, y: raw && raw.y });
@@ -264,6 +267,9 @@ MotaLab.collectEngineFloor = function collectEngineFloor(
     return {
       x: raw.x, y: raw.y, numeric_id: numericId, id: String(id), cls: String(cls),
       trigger: trigger == null ? null : String(trigger),
+      ...(shopActions.length === 1 ? {
+        shop_id: shopActions[0].id,
+      } : {}),
       no_pass: Boolean(event.noPass !== undefined ? event.noPass
         : raw.noPass !== undefined ? raw.noPass : raw.no_pass),
       disabled: false,
@@ -292,6 +298,35 @@ MotaLab.collectEngineFloor = function collectEngineFloor(
       opaque: target == null,
     };
   });
+  const terminal_goals = [];
+  const opaque_events = [];
+  const staticEvents = definition.events && typeof definition.events === "object"
+    ? definition.events : {};
+  const runtimeEvents = dynamic.events && typeof dynamic.events === "object"
+    ? dynamic.events : {};
+  const eventActions = (rawEvent) => (Array.isArray(rawEvent) ? rawEvent
+    : rawEvent && Array.isArray(rawEvent.data) ? rawEvent.data : [rawEvent])
+    .filter((action) => action && typeof action === "object");
+  const goalCoordinates = new Set();
+  for (const [coordinate, rawEvent] of Object.entries({ ...staticEvents, ...runtimeEvents })) {
+    const match = coordinate.match(/^(\d+)\s*,\s*(\d+)$/u);
+    if (!match) continue;
+    if (eventActions(rawEvent).some((action) => action.type === "win")) {
+      goalCoordinates.add(coordinate);
+      terminal_goals.push({
+        kind: "location", floor_id: floorId, x: Number(match[1]), y: Number(match[2]),
+      });
+    }
+  }
+  // Ordinary events are authoritative only while present in the detached runtime map.
+  // Static definitions are consulted above solely for the explicit win terminal.
+  for (const [coordinate, rawEvent] of Object.entries(runtimeEvents)) {
+    const match = coordinate.match(/^(\d+)\s*,\s*(\d+)$/u);
+    if (!match || goalCoordinates.has(coordinate)) continue;
+    if (eventActions(rawEvent).some((action) => typeof action.type === "string")) {
+      opaque_events.push({ x: Number(match[1]), y: Number(match[2]), reason: "event_script" });
+    }
+  }
   return {
     floor_id: floorId,
     title: String(dynamic.title || dynamic.name || definition.title || definition.name || floorId),
@@ -301,10 +336,140 @@ MotaLab.collectEngineFloor = function collectEngineFloor(
       ? { kind: "rectangle" } : { kind: "valid_cells", valid_cells: validCells },
     map,
     blocks,
-    change_floor,
+    change_floor, terminal_goals, opaque_events,
     ratio: Number.isFinite(dynamic.ratio) ? dynamic.ratio
       : Number.isFinite(definition.ratio) ? definition.ratio : 1,
   };
+};
+
+MotaLab.parseSolverItemDelta = function parseSolverItemDelta(item, values, keySlots) {
+  const zero = { hp: 0, attack: 0, defense: 0, gold: 0, experience: 0,
+    keys: { yellow: 0, blue: 0, red: 0 }, inventory: {} };
+  if (!item || typeof item.item_effect !== "string" || item.complex === true) {
+    return { supported: false, reason: "resource_effect_opaque" };
+  }
+  const statements = item.item_effect.split(";").map((value) => value.trim()).filter(Boolean);
+  if (!statements.length) return { supported: false, reason: "resource_effect_empty" };
+  const result = MotaLab.cloneJsonValue(zero);
+  const heroFields = { hp: "hp", atk: "attack", attack: "attack", def: "defense",
+    defense: "defense", money: "gold", gold: "gold", exp: "experience", experience: "experience" };
+  const slotColors = Object.fromEntries(Object.entries(keySlots || {})
+    .filter(([, id]) => typeof id === "string").map(([color, id]) => [id, color]));
+  function amount(raw) {
+    if (/^\d+$/u.test(raw)) return Number(raw);
+    const match = raw.match(/^[c]ore\.values\.([A-Za-z_$][\w$]*)$/u);
+    return match && Number.isFinite(values[match[1]]) ? values[match[1]] : null;
+  }
+  for (const statement of statements) {
+    let match = statement.match(/^[c]ore\.status\.hero\.(hp|atk|attack|def|defense|money|gold|exp|experience)\s*\+=\s*(.+)$/u);
+    if (match) {
+      const value = amount(match[2].trim());
+      if (!Number.isInteger(value) || value < 0) return { supported: false, reason: "resource_effect_opaque" };
+      result[heroFields[match[1]]] += value;
+      continue;
+    }
+    match = statement.match(/^[c]ore\.status\.hero\.items\.[A-Za-z_$][\w$]*\.([A-Za-z_$][\w$]*)(\+\+|\s*\+=\s*(\d+))$/u);
+    if (match) {
+      const value = match[2] === "++" ? 1 : Number(match[3]);
+      const color = slotColors[match[1]];
+      if (color) result.keys[color] += value;
+      else result.inventory[match[1]] = (result.inventory[match[1]] || 0) + value;
+      continue;
+    }
+    return { supported: false, reason: "resource_effect_opaque" };
+  }
+  return { supported: true, delta: result };
+};
+
+MotaLab.buildSolverModel = function buildSolverModel(engineModel, shops = []) {
+  if (!engineModel || typeof engineModel !== "object") return null;
+  const blockCatalog = new Map((engineModel.blocks || []).map((block) => [block.numeric_id, block]));
+  const items = new Map((engineModel.items || []).map((item) => [item.id, item]));
+  const enemies = new Map((engineModel.enemies || []).map((enemy) => [enemy.id, enemy]));
+  const blockers = [];
+  for (const shop of shops.filter((item) => item && item.supported !== true)) {
+    blockers.push({ code: shop.reason || "SHOP_UNSUPPORTED",
+      detail: `${shop.shop_id || "unknown"}:${shop.details && shop.details.index !== undefined ? shop.details.index : "shop"}` });
+  }
+  const goals = (engineModel.floors || []).flatMap((floor) => floor.terminal_goals || []);
+  const floorById = new Map((engineModel.floors || []).map((floor) => [floor.floor_id, floor]));
+  if (goals.length !== 1) blockers.push({ code: "TERMINAL_UNSUPPORTED", detail: `expected_one_goal:${goals.length}` });
+  const floors = (engineModel.floors || []).map((floor) => {
+    const transitions = new Map((floor.change_floor || []).map((item) => [`${item.x},${item.y}`, item]));
+    const blocks = (floor.blocks || []).map((block) => {
+      const catalog = blockCatalog.get(block.numeric_id) || {};
+      const trigger = block.trigger || catalog.trigger;
+      const base = { floor_id: floor.floor_id, x: block.x, y: block.y,
+        block_id: block.id, numeric_id: block.numeric_id };
+      if (trigger === "changeFloor") {
+        const transition = transitions.get(`${block.x},${block.y}`);
+        let landing = transition && transition.loc;
+        if (!landing && transition && transition.floor_id && transition.stair) {
+          const targetFloor = floorById.get(transition.floor_id);
+          const targetBlock = targetFloor && (targetFloor.blocks || []).find(
+            (candidate) => candidate.id === transition.stair,
+          );
+          if (targetBlock) landing = { x: targetBlock.x, y: targetBlock.y };
+        }
+        if (!transition || transition.opaque || !transition.floor_id || !landing) {
+          blockers.push({ code: "TRANSITION_UNSUPPORTED", detail: `${floor.floor_id}:${block.x},${block.y}` });
+          return { ...base, kind: "opaque", reason: "transition_target_unknown" };
+        }
+        return { ...base, kind: "transition", target: {
+          floor_id: transition.floor_id, x: landing.x, y: landing.y,
+        } };
+      }
+      if (trigger === "openDoor") {
+        const costs = { yellow: 0, blue: 0, red: 0 };
+        for (const [slot, count] of Object.entries(catalog.door_info && catalog.door_info.keys || {})) {
+          const color = Object.entries(engineModel.inventory.key_slots || {})
+            .find(([, id]) => id === slot)?.[0];
+          if (!color || !Object.hasOwn(costs, color)) {
+            blockers.push({ code: "DOOR_UNSUPPORTED", detail: block.id });
+            return { ...base, kind: "opaque", reason: "door_key_unknown" };
+          }
+          costs[color] += count;
+        }
+        return { ...base, kind: "door", key_cost: costs };
+      }
+      if (trigger === "battle") {
+        const enemy = enemies.get(block.id);
+        if (!enemy || enemy.attack === null || enemy.defense === null || (enemy.special || []).length) {
+          blockers.push({ code: "ENEMY_UNSUPPORTED", detail: block.id });
+          return { ...base, kind: "opaque", reason: "enemy_special_or_stats_unknown" };
+        }
+        return { ...base, kind: "enemy", enemy: MotaLab.cloneJsonValue(enemy) };
+      }
+      if (trigger === "getItem") {
+        const effect = MotaLab.parseSolverItemDelta(
+          items.get(block.id), engineModel.values || {}, engineModel.inventory.key_slots || {},
+        );
+        if (!effect.supported) {
+          blockers.push({ code: "RESOURCE_UNSUPPORTED", detail: block.id });
+          return { ...base, kind: "opaque", reason: effect.reason };
+        }
+        return { ...base, kind: "resource", delta: effect.delta };
+      }
+      if (typeof block.shop_id === "string") return { ...base, kind: "shop", shop_id: block.shop_id };
+      if (block.no_pass && !trigger) {
+        return { ...base, kind: "opaque", reason: "wall" };
+      }
+      if (trigger) {
+        blockers.push({ code: "EVENT_UNSUPPORTED", detail: `${floor.floor_id}:${block.x},${block.y}` });
+        return { ...base, kind: "opaque", reason: "event_unsupported" };
+      }
+      return { ...base, kind: "terrain" };
+    });
+    for (const event of floor.opaque_events || []) {
+      blockers.push({ code: "EVENT_UNSUPPORTED", detail: `${floor.floor_id}:${event.x},${event.y}` });
+      blocks.push({ floor_id: floor.floor_id, x: event.x, y: event.y, block_id: "opaqueEvent",
+        numeric_id: 0, kind: "opaque", reason: event.reason });
+    }
+    return { floor_id: floor.floor_id, width: floor.width, height: floor.height,
+      topology: MotaLab.cloneJsonValue(floor.topology), blocks };
+  });
+  return { protocol: 1, terminal: goals.length === 1 ? goals[0] : null, floors,
+    shops: MotaLab.cloneJsonValue(shops.filter((shop) => shop && shop.supported === true)), blockers };
 };
 
 MotaLab.collectEngineInventory = function collectEngineInventory(engine, keySlotIds) {

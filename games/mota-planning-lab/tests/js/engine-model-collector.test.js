@@ -311,3 +311,92 @@ test("非面板 inventory 资源差分可由浏览器执行层校验", () => {
   lab.validateExpectedDelta(expected, { dimensions: before.dimensions, topology: before.topology });
   assert.equal(lab.compareExpectedDelta(before, after, expected, { allowPositionChange: true }).ok, true);
 });
+
+test("solver 投影只接受可证明的资源增量并保留未知脚本 blocker", () => {
+  const keySlots = { yellow: "yellowKey", blue: "blueKey", red: "redKey" };
+  assert.deepEqual(JSON.parse(JSON.stringify(lab.parseSolverItemDelta({
+    item_effect: "core.status.hero.atk += core.values.redGem; core.status.hero.items.tools.yellowKey++",
+    complex: false,
+  }, { redGem: 3 }, keySlots))), {
+    supported: true,
+    delta: { hp: 0, attack: 3, defense: 0, gold: 0, experience: 0,
+      keys: { yellow: 1, blue: 0, red: 0 }, inventory: {} },
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(lab.parseSolverItemDelta(
+    { item_effect: "evil()", complex: false }, {}, keySlots,
+  ))), {
+    supported: false, reason: "resource_effect_opaque",
+  });
+});
+
+test("solver 投影结构化终局、资源、换层和门，未知 special fail closed", () => {
+  const model = {
+    floors: [{ floor_id: "F1", width: 3, height: 1, topology: { kind: "rectangle" },
+      terminal_goals: [], opaque_events: [], change_floor: [{ x: 2, y: 0, floor_id: "F2", loc: { x: 0, y: 0 }, opaque: false }],
+      blocks: [{ x: 1, y: 0, numeric_id: 1, id: "redGem", trigger: "getItem", no_pass: false },
+        { x: 2, y: 0, numeric_id: 2, id: "downFloor", trigger: "changeFloor", no_pass: false }] },
+    { floor_id: "F2", width: 3, height: 1, topology: { kind: "rectangle" },
+      terminal_goals: [{ kind: "location", floor_id: "F2", x: 2, y: 0 }], opaque_events: [], change_floor: [],
+      blocks: [{ x: 0, y: 0, numeric_id: 4, id: "wall", trigger: null, no_pass: true },
+        { x: 1, y: 0, numeric_id: 3, id: "yellowDoor", trigger: "openDoor", no_pass: true }] }],
+    blocks: [{ numeric_id: 1, id: "redGem", trigger: "getItem" },
+      { numeric_id: 2, id: "downFloor", trigger: "changeFloor" },
+      { numeric_id: 3, id: "yellowDoor", trigger: "openDoor", door_info: { keys: { yellowKey: 1 } } },
+      { numeric_id: 4, id: "wall", trigger: null }],
+    items: [{ id: "redGem", item_effect: "core.status.hero.atk += core.values.redGem", complex: false }],
+    enemies: [], values: { redGem: 3 }, inventory: { key_slots: { yellow: "yellowKey" } },
+  };
+  const solver = lab.buildSolverModel(model, []);
+  assert.deepEqual(JSON.parse(JSON.stringify(solver.terminal)), { kind: "location", floor_id: "F2", x: 2, y: 0 });
+  assert.equal(solver.floors[0].blocks[0].delta.attack, 3);
+  assert.deepEqual(JSON.parse(JSON.stringify(solver.floors[0].blocks[1].target)), { floor_id: "F2", x: 0, y: 0 });
+  assert.equal(solver.floors[1].blocks[0].reason, "wall");
+  assert.equal(solver.floors[1].blocks[1].key_cost.yellow, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(solver.blockers)), []);
+});
+
+test("solver 商店仅绑定运行态 event.data 的唯一严格 openShop", () => {
+  const definition = { width: 3, height: 1, map: [[0, 0, 0]], events: {} };
+  const dynamic = { width: 3, height: 1, map: [[0, 0, 0]], events: {} };
+  const rawBlocks = [
+    { x: 1, y: 0, id: 1, event: { id: "shopNpc", cls: "npc", trigger: "action", noPass: true,
+      data: [{ type: "openShop", id: "moneyShop", open: true }] } },
+    { x: 2, y: 0, id: 2, event: { id: "badShop", cls: "npc", trigger: "action", noPass: true,
+      data: [{ type: "openShop", id: "a", open: true }, { type: "openShop", id: "b", open: true }] } },
+  ];
+  const floor = lab.collectEngineFloor({ getMapBlocksObj: () => rawBlocks }, "F", definition, dynamic,
+    (code) => { throw new Error(code); });
+  assert.equal(floor.blocks[0].shop_id, "moneyShop");
+  assert.equal(floor.blocks[1].shop_id, undefined);
+  const shop = { supported: true, shop_id: "moneyShop", repeatable: true, choices: [{
+    choice_id: "moneyShop:0:attack:4:25", index: 0, text: "attack+4", cost: 25,
+    base_cost: 25, increment_per_purchase: 0,
+    effect: { field: "attack", amount: 4 }, counter_flag: "shop_atk", purchase_count: 2,
+  }] };
+  const solver = lab.buildSolverModel({ floors: [{ ...floor, terminal_goals: [{
+    kind: "location", floor_id: "F", x: 0, y: 0,
+  }] }], blocks: [], items: [], enemies: [], values: {}, inventory: { key_slots: {} } }, [shop]);
+  assert.equal(solver.floors[0].blocks[0].kind, "shop");
+  assert.equal(solver.floors[0].blocks[0].shop_id, "moneyShop");
+  assert.equal(solver.shops[0].choices[0].purchase_count, 2);
+  assert.equal(solver.floors[0].blocks[1].kind, "opaque");
+  assert.deepEqual(JSON.parse(JSON.stringify(solver.blockers)), [{
+    code: "EVENT_UNSUPPORTED", detail: "F:2,0",
+  }]);
+});
+
+test("普通静态历史事件不会重建 blocker，当前运行态事件仍阻路，静态 win 仍可作终局", () => {
+  const definition = { width: 3, height: 1, map: [[0, 0, 0]], events: {
+    "0,0": [{ type: "text", text: "already consumed" }],
+    "2,0": [{ type: "win" }],
+  } };
+  const dynamic = { width: 3, height: 1, map: [[0, 0, 0]], events: {
+    "1,0": [{ type: "text", text: "active" }],
+  } };
+  const floor = lab.collectEngineFloor({ getMapBlocksObj: () => [] }, "F", definition, dynamic,
+    (code) => { throw new Error(code); });
+  assert.deepEqual(JSON.parse(JSON.stringify(floor.opaque_events)), [{ x: 1, y: 0, reason: "event_script" }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(floor.terminal_goals)), [{
+    kind: "location", floor_id: "F", x: 2, y: 0,
+  }]);
+});

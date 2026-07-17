@@ -1,5 +1,5 @@
 MotaLab.parseRestrictedShop = function parseRestrictedShop(shopId, rawShop, flagValues = {}) {
-  const reject = (reason, details = {}) => ({ supported: false, reason, details });
+  const reject = (reason, details = {}) => ({ supported: false, shop_id: shopId, reason, details });
   if (typeof shopId !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/u.test(shopId)
     || !rawShop || typeof rawShop !== "object" || Array.isArray(rawShop)) {
     return reject("SHOP_IDENTITY_INVALID");
@@ -8,6 +8,24 @@ MotaLab.parseRestrictedShop = function parseRestrictedShop(shopId, rawShop, flag
     return reject("SHOP_CHOICES_INVALID");
   }
   const choices = [];
+  const parseCost = (expression) => {
+    const source = expression.replace(/\s+/gu, "");
+    if (/^\d{1,9}$/u.test(source)) {
+      return { base_cost: Number(source), increment_per_purchase: 0, counter_flag: null };
+    }
+    const terms = source.split("+");
+    if (terms.length !== 2) return null;
+    const constant = terms.find((term) => /^\d{1,9}$/u.test(term));
+    const product = terms.find((term) => term !== constant);
+    if (!constant || !product) return null;
+    const match = product.match(/^(?:flag:([A-Za-z0-9_.:-]{1,128})\*(\d{1,9})|(\d{1,9})\*flag:([A-Za-z0-9_.:-]{1,128}))$/u);
+    if (!match) return null;
+    return {
+      base_cost: Number(constant),
+      increment_per_purchase: Number(match[2] || match[3]),
+      counter_flag: match[1] || match[4],
+    };
+  };
   for (let index = 0; index < rawShop.choices.length; index += 1) {
     const choice = rawShop.choices[index];
     if (!choice || typeof choice !== "object" || Array.isArray(choice)
@@ -15,27 +33,34 @@ MotaLab.parseRestrictedShop = function parseRestrictedShop(shopId, rawShop, flag
       || typeof choice.need !== "string" || !Array.isArray(choice.action)) {
       return reject("SHOP_CHOICE_SHAPE_UNSUPPORTED", { index });
     }
-    const need = choice.need.trim().match(/^status:money\s*>=\s*(\d{1,9})$/u);
-    if (!need) return reject("SHOP_COST_EXPRESSION_UNSUPPORTED", { index });
-    const cost = Number(need[1]);
+    const need = choice.need.match(/^\s*status:money\s*>=\s*(.+?)\s*$/u);
+    const price = need && parseCost(need[1]);
+    if (!price || price.base_cost < 1 || price.increment_per_purchase < 0) {
+      return reject("SHOP_COST_EXPRESSION_UNSUPPORTED", { index });
+    }
     if (choice.action.length !== 3) {
       return reject("SHOP_EFFECT_UNSUPPORTED", { index });
     }
     const parsedActions = [];
-    for (const action of choice.action) {
+    for (let actionIndex = 0; actionIndex < choice.action.length; actionIndex += 1) {
+      const action = choice.action[actionIndex];
       if (!action || action.type !== "setValue" || typeof action.name !== "string"
         || typeof action.operator !== "string" || typeof action.value !== "string"
-        || !/^\d{1,9}$/u.test(action.value)) {
+        || (actionIndex !== 0 && !/^\d{1,9}$/u.test(action.value))) {
         return reject("SHOP_EFFECT_UNSUPPORTED", { index });
       }
-      parsedActions.push({ name: action.name, operator: action.operator, amount: Number(action.value) });
+      parsedActions.push({ name: action.name, operator: action.operator,
+        amount: actionIndex === 0 ? null : Number(action.value), value: action.value });
     }
     const [debitAction, effectAction, counterAction] = parsedActions;
     const effectFields = {
       "status:hp": "hp", "status:atk": "attack", "status:def": "defense",
     };
+    const debitPrice = parseCost(debitAction.value);
     if (debitAction.name !== "status:money" || debitAction.operator !== "-="
-      || debitAction.amount !== cost
+      || !debitPrice || debitPrice.base_cost !== price.base_cost
+      || debitPrice.increment_per_purchase !== price.increment_per_purchase
+      || debitPrice.counter_flag !== price.counter_flag
       || !Object.prototype.hasOwnProperty.call(effectFields, effectAction.name)
       || effectAction.operator !== "+="
       || !/^flag:[A-Za-z0-9_.:-]{1,128}$/u.test(counterAction.name)
@@ -44,16 +69,21 @@ MotaLab.parseRestrictedShop = function parseRestrictedShop(shopId, rawShop, flag
     }
     const effect = { field: effectFields[effectAction.name], amount: effectAction.amount };
     const counter = counterAction.name.slice(5);
-    if (cost < 1 || effect.amount < 1) {
+    if ((price.counter_flag !== null && price.counter_flag !== counter) || effect.amount < 1) {
       return reject("SHOP_EFFECT_INCOMPLETE", { index });
     }
     const count = Object.prototype.hasOwnProperty.call(flagValues, counter) ? flagValues[counter] : 0;
     if (!MotaLab.isFiniteInteger(count) || count < 0) {
       return reject("SHOP_COUNTER_INVALID", { index, counter });
     }
+    const cost = price.base_cost + count * price.increment_per_purchase;
+    if (!Number.isSafeInteger(cost) || cost < 1) return reject("SHOP_COST_EXPRESSION_UNSUPPORTED", { index });
     choices.push({
-      choice_id: `${shopId}:${index}:${effect.field}:${effect.amount}:${cost}`,
-      index, text: choice.text, cost, effect, counter_flag: counter,
+      choice_id: price.increment_per_purchase === 0
+        ? `${shopId}:${index}:${effect.field}:${effect.amount}:${price.base_cost}`
+        : `${shopId}:${index}:${effect.field}:${effect.amount}:${price.base_cost}:${price.increment_per_purchase}`,
+      index, text: choice.text, cost, base_cost: price.base_cost,
+      increment_per_purchase: price.increment_per_purchase, effect, counter_flag: counter,
       purchase_count: count,
     });
   }
@@ -76,7 +106,9 @@ MotaLab.readRestrictedShopMenu = function readRestrictedShopMenu(runtime, expect
     if (!Array.isArray(choice.action) || choice.action[0] == null
       || choice.action[0].type !== "playSound" || choice.action[0].name !== "商店") return null;
     const expected = expectedShop.choices[index];
-    const normalized = { text: choice.text, need: `status:money>=${expected.cost}`,
+    const priceExpression = expected.increment_per_purchase === 0 ? String(expected.base_cost)
+      : `${expected.base_cost}+flag:${expected.counter_flag}*${expected.increment_per_purchase}`;
+    const normalized = { text: choice.text, need: `status:money>=${priceExpression}`,
       action: choice.action.slice(1) };
     const parsed = MotaLab.parseRestrictedShop(expectedShop.shop_id, { choices: [normalized] }, {
       [expected.counter_flag]: expected.purchase_count,

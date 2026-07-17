@@ -356,7 +356,7 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
   if (value.analysis !== undefined) {
     MotaLab.assertProtocolShape(value.analysis, [
       "scope", "reachable_cell_count", "candidate_limit", "total_candidate_count", "truncated", "candidates",
-    ], [], "shadow.analysis");
+    ], ["global"], "shadow.analysis");
     if (value.analysis.scope !== "current_floor_immediate"
       || !MotaLab.isFiniteInteger(value.analysis.reachable_cell_count)
       || value.analysis.reachable_cell_count < 1
@@ -395,6 +395,107 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
       const keyCost = MotaLab.validateResponseKeys(candidate.key_cost, "shadow candidate key_cost");
       if ([keyCost.yellow, keyCost.blue, keyCost.red].some((cost) => cost > 1)) {
         throw new TypeError("Invalid shadow candidate key_cost");
+      }
+    }
+    if (value.analysis.global !== undefined) {
+      const global = value.analysis.global;
+      MotaLab.assertProtocolShape(global, [
+        "scope", "proof", "reason", "truncated", "explored_states", "blockers", "route", "first_suggestion",
+      ], ["terminal_hp"], "shadow.analysis.global");
+      if (global.scope !== "global_terminal_route"
+        || !new Set(["proven", "unproven", "unsupported"]).has(global.proof)
+        || typeof global.reason !== "string" || global.reason.length < 1 || global.reason.length > 512
+        || typeof global.truncated !== "boolean"
+        || !MotaLab.isFiniteInteger(global.explored_states) || global.explored_states < 0
+        || !Array.isArray(global.blockers) || global.blockers.length > 65536
+        || !(global.terminal_hp === undefined
+          || (MotaLab.isFiniteInteger(global.terminal_hp) && global.terminal_hp > 0))) {
+        throw new TypeError("Invalid global shadow analysis");
+      }
+      for (const blocker of global.blockers) {
+        MotaLab.assertProtocolShape(blocker, ["code", "detail"], [], "global shadow blocker");
+        MotaLab.validateProtocolString(blocker.code, "global shadow blocker.code", 1, 256);
+        MotaLab.validateProtocolString(blocker.detail, "global shadow blocker.detail", 1, 512);
+      }
+      const forbidden = new Set(["action", "action_id", "execute", "operation", "operations", "guard"]);
+      const inspect = (item) => {
+        if (!item || typeof item !== "object") return;
+        for (const [key, child] of Object.entries(item)) {
+          if (forbidden.has(key)) throw new TypeError("Executable field in global shadow analysis");
+          inspect(child);
+        }
+      };
+      inspect(global);
+      const validateStep = (step) => {
+        if (!MotaLab.isProtocolObject(step) || typeof step.step_kind !== "string"
+          || typeof step.floor_id !== "string" || step.floor_id.length < 1) {
+          throw new TypeError("Invalid global shadow step");
+        }
+        const positioned = ["door", "enemy", "resource", "transition"].includes(step.step_kind);
+        const required = positioned
+          ? ["step_kind", "floor_id", "x", "y", "block_id", "details"]
+          : step.step_kind === "shop"
+            ? ["step_kind", "floor_id", "shop_id", "choice_id", "details"]
+            : step.step_kind === "terminal"
+              ? ["step_kind", "floor_id", "x", "y", "details"] : null;
+        if (!required) throw new TypeError("Invalid global shadow step kind");
+        MotaLab.assertProtocolShape(step, required, [], "global shadow step");
+        if (positioned || step.step_kind === "terminal") {
+          if (!MotaLab.isFiniteInteger(step.x) || step.x < 0 || step.x > 255
+            || !MotaLab.isFiniteInteger(step.y) || step.y < 0 || step.y > 255
+            || (positioned && (typeof step.block_id !== "string" || step.block_id.length < 1))) {
+            throw new TypeError("Invalid global shadow step position");
+          }
+        }
+        if (!MotaLab.isProtocolObject(step.details)) throw new TypeError("Invalid global step details");
+        if (step.step_kind === "door") {
+          MotaLab.assertProtocolShape(step.details, ["key_cost"], [], "door details");
+          MotaLab.validateResponseKeys(step.details.key_cost, "door key_cost");
+        } else if (step.step_kind === "enemy") {
+          MotaLab.assertProtocolShape(step.details, ["hp_loss"], [], "enemy details");
+          if (!MotaLab.isFiniteInteger(step.details.hp_loss) || step.details.hp_loss < 0) throw new TypeError("Invalid enemy details");
+        } else if (step.step_kind === "resource") {
+          MotaLab.assertProtocolShape(step.details,
+            ["hp", "attack", "defense", "gold", "experience", "keys", "inventory"], [], "resource details");
+          for (const field of ["hp", "attack", "defense", "gold", "experience"]) {
+            if (!MotaLab.isFiniteInteger(step.details[field]) || step.details[field] < 0) throw new TypeError("Invalid resource details");
+          }
+          MotaLab.validateResponseKeys(step.details.keys, "resource keys");
+          if (!MotaLab.isProtocolObject(step.details.inventory)
+            || Object.values(step.details.inventory).some((count) => !MotaLab.isFiniteInteger(count) || count < 0)) {
+            throw new TypeError("Invalid resource inventory");
+          }
+        } else if (step.step_kind === "shop") {
+          MotaLab.assertProtocolShape(step.details,
+            ["cost", "purchase_count_before", "field", "amount"], [], "shop details");
+          if (typeof step.shop_id !== "string" || typeof step.choice_id !== "string"
+            || !MotaLab.isFiniteInteger(step.details.cost) || step.details.cost < 1
+            || !MotaLab.isFiniteInteger(step.details.purchase_count_before)
+            || step.details.purchase_count_before < 0
+            || !new Set(["hp", "attack", "defense"]).has(step.details.field)
+            || !MotaLab.isFiniteInteger(step.details.amount) || step.details.amount < 1) {
+            throw new TypeError("Invalid shop step");
+          }
+        } else if (Object.keys(step.details).length !== 0) {
+          throw new TypeError("Invalid empty global step details");
+        }
+      };
+      if ((global.proof === "proven") !== (global.route !== null)
+        || (global.route === null) !== (global.first_suggestion === null)
+        || (global.proof === "proven") !== (global.terminal_hp !== undefined)
+        || global.truncated !== (global.proof === "unproven" && global.reason === "search_budget_exhausted")
+        || (global.reason === "search_budget_exhausted")
+          !== (global.proof === "unproven" && global.truncated)) {
+        throw new TypeError("Invalid global proof contract");
+      }
+      if (global.route !== null) {
+        MotaLab.assertProtocolShape(global.route, ["step_count", "steps"], [], "global route");
+        if (!Array.isArray(global.route.steps) || global.route.steps.length < 1
+          || global.route.step_count !== global.route.steps.length) throw new TypeError("Invalid global route");
+        global.route.steps.forEach(validateStep);
+        validateStep(global.first_suggestion);
+        if (MotaLab.canonicalize(global.first_suggestion)
+          !== MotaLab.canonicalize(global.route.steps[0])) throw new TypeError("Invalid first suggestion");
       }
     }
   }

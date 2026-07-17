@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
@@ -11,8 +11,9 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 9 * 1024 * 1024;
 const MAX_SHADOW_CYCLE: u64 = 9_007_199_254_740_991;
 const MAX_SHADOW_CANDIDATES: usize = 256;
+const MAX_GLOBAL_STATES: usize = 50_000;
 const SHADOW_REASON: &str =
-    "Stage2B Rust shadow runtime analyzed current-floor boundaries; execution remains disabled.";
+    "Stage3 Rust shadow runtime analyzed bounded global routes; execution remains disabled.";
 const ALLOWED_ORIGIN: &str = "https://h5mota.com";
 const ALLOWED_REQUEST_HEADERS: [&str; 2] = ["content-type", "x-mota-lab"];
 
@@ -621,6 +622,536 @@ fn analyze_current_floor(
     }))
 }
 
+#[derive(Clone, Debug)]
+struct SolverBlock {
+    floor: String,
+    x: u64,
+    y: u64,
+    id: String,
+    kind: String,
+    data: Value,
+}
+
+#[derive(Clone, Debug)]
+struct SolverFloor {
+    width: u64,
+    height: u64,
+    cells: HashSet<(u64, u64)>,
+    blocks: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SolverState {
+    floor: String,
+    x: u64,
+    y: u64,
+    hp: u64,
+    attack: u64,
+    defense: u64,
+    gold: u64,
+    experience: u64,
+    yellow: u64,
+    blue: u64,
+    red: u64,
+    inventory: Vec<(String, u64)>,
+    consumed: Vec<bool>,
+    shop_counts: Vec<u64>,
+}
+
+#[derive(Clone)]
+struct SearchNode {
+    state: SolverState,
+    steps: Vec<Value>,
+}
+
+fn solver_u64(object: &serde_json::Map<String, Value>, name: &str) -> Result<u64, String> {
+    object
+        .get(name)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("invalid {name}"))
+}
+
+fn parse_solver_world(
+    observation: &serde_json::Map<String, Value>,
+) -> Result<
+    (
+        HashMap<String, SolverFloor>,
+        Vec<SolverBlock>,
+        Value,
+        Vec<Value>,
+        Vec<Value>,
+    ),
+    String,
+> {
+    let model = observation
+        .get("engine_model")
+        .and_then(Value::as_object)
+        .and_then(|model| model.get("solver_model"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| "solver_model_missing".to_owned())?;
+    let terminal = model
+        .get("terminal")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .ok_or_else(|| "terminal_unsupported".to_owned())?;
+    let blockers = model
+        .get("blockers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let shops = model
+        .get("shops")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut floors = HashMap::new();
+    let mut blocks = Vec::new();
+    for floor in model
+        .get("floors")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "floors_missing".to_owned())?
+    {
+        let floor = floor
+            .as_object()
+            .ok_or_else(|| "floor_invalid".to_owned())?;
+        let floor_id = required_string(floor, "floor_id")
+            .map_err(|_| "floor_id_invalid".to_owned())?
+            .to_owned();
+        let width = solver_u64(floor, "width")?;
+        let height = solver_u64(floor, "height")?;
+        let topology = floor
+            .get("topology")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "topology_missing".to_owned())?;
+        let cells = match topology.get("kind").and_then(Value::as_str) {
+            Some("rectangle") => (0..height)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .collect(),
+            Some("valid_cells") => topology
+                .get("valid_cells")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "valid_cells_missing".to_owned())?
+                .iter()
+                .map(|cell| {
+                    let cell = cell
+                        .as_object()
+                        .ok_or_else(|| "valid_cell_invalid".to_owned())?;
+                    Ok((solver_u64(cell, "x")?, solver_u64(cell, "y")?))
+                })
+                .collect::<Result<HashSet<_>, String>>()?,
+            _ => return Err("topology_unsupported".to_owned()),
+        };
+        let mut indices = Vec::new();
+        for block in floor
+            .get("blocks")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "blocks_missing".to_owned())?
+        {
+            let object = block
+                .as_object()
+                .ok_or_else(|| "block_invalid".to_owned())?;
+            let index = blocks.len();
+            blocks.push(SolverBlock {
+                floor: floor_id.clone(),
+                x: solver_u64(object, "x")?,
+                y: solver_u64(object, "y")?,
+                id: required_string(object, "block_id")
+                    .map_err(|_| "block_id_invalid".to_owned())?
+                    .to_owned(),
+                kind: required_string(object, "kind")
+                    .map_err(|_| "block_kind_invalid".to_owned())?
+                    .to_owned(),
+                data: block.clone(),
+            });
+            indices.push(index);
+        }
+        floors.insert(
+            floor_id,
+            SolverFloor {
+                width,
+                height,
+                cells,
+                blocks: indices,
+            },
+        );
+    }
+    Ok((floors, blocks, terminal, shops, blockers))
+}
+
+fn reachable_cells(
+    state: &SolverState,
+    floors: &HashMap<String, SolverFloor>,
+    blocks: &[SolverBlock],
+) -> HashSet<(u64, u64)> {
+    let Some(floor) = floors.get(&state.floor) else {
+        return HashSet::new();
+    };
+    let blocked: HashSet<(u64, u64)> = floor
+        .blocks
+        .iter()
+        .filter_map(|index| {
+            let block = &blocks[*index];
+            let consumed = state.consumed.get(*index).copied().unwrap_or(false);
+            ((!consumed && block.kind != "terrain" && block.kind != "shop")
+                || block.kind == "opaque")
+                .then_some((block.x, block.y))
+        })
+        .collect();
+    let mut seen = HashSet::from([(state.x, state.y)]);
+    let mut queue = VecDeque::from([(state.x, state.y)]);
+    while let Some((x, y)) = queue.pop_front() {
+        for (dx, dy) in [(0_i64, -1_i64), (-1, 0), (1, 0), (0, 1)] {
+            let nx = x as i64 + dx;
+            let ny = y as i64 + dy;
+            if nx < 0 || ny < 0 {
+                continue;
+            }
+            let position = (nx as u64, ny as u64);
+            if position.0 >= floor.width
+                || position.1 >= floor.height
+                || !floor.cells.contains(&position)
+                || blocked.contains(&position)
+            {
+                continue;
+            }
+            if seen.insert(position) {
+                queue.push_back(position);
+            }
+        }
+    }
+    seen
+}
+
+fn adjacent(reachable: &HashSet<(u64, u64)>, x: u64, y: u64) -> bool {
+    [(0_i64, -1_i64), (-1, 0), (1, 0), (0, 1)]
+        .iter()
+        .any(|(dx, dy)| {
+            let nx = x as i64 + dx;
+            let ny = y as i64 + dy;
+            nx >= 0 && ny >= 0 && reachable.contains(&(nx as u64, ny as u64))
+        })
+}
+
+fn add_delta(state: &mut SolverState, delta: &Value) -> Result<(), String> {
+    let delta = delta
+        .as_object()
+        .ok_or_else(|| "resource_delta_invalid".to_owned())?;
+    for (name, target) in [
+        ("hp", &mut state.hp),
+        ("attack", &mut state.attack),
+        ("defense", &mut state.defense),
+        ("gold", &mut state.gold),
+        ("experience", &mut state.experience),
+    ] {
+        *target = target
+            .checked_add(delta.get(name).and_then(Value::as_u64).unwrap_or(0))
+            .ok_or_else(|| "stat_overflow".to_owned())?;
+    }
+    if let Some(keys) = delta.get("keys").and_then(Value::as_object) {
+        state.yellow += keys.get("yellow").and_then(Value::as_u64).unwrap_or(0);
+        state.blue += keys.get("blue").and_then(Value::as_u64).unwrap_or(0);
+        state.red += keys.get("red").and_then(Value::as_u64).unwrap_or(0);
+    }
+    let mut inventory: BTreeMap<String, u64> = state.inventory.iter().cloned().collect();
+    if let Some(items) = delta.get("inventory").and_then(Value::as_object) {
+        for (id, count) in items {
+            *inventory.entry(id.clone()).or_default() += count.as_u64().unwrap_or(0);
+        }
+    }
+    state.inventory = inventory.into_iter().collect();
+    Ok(())
+}
+
+fn enemy_loss(state: &SolverState, enemy: &Value) -> Option<u64> {
+    let enemy = enemy.as_object()?;
+    let hp = enemy.get("hp")?.as_u64()?;
+    let attack = enemy.get("attack")?.as_u64()?;
+    let defense = enemy.get("defense")?.as_u64()?;
+    let hero_damage = state.attack.checked_sub(defense)?;
+    if hero_damage == 0 {
+        return None;
+    }
+    let rounds = (hp + hero_damage - 1) / hero_damage;
+    Some(
+        rounds
+            .saturating_sub(1)
+            .saturating_mul(attack.saturating_sub(state.defense)),
+    )
+}
+
+fn step_json(kind: &str, block: &SolverBlock, details: Value) -> Value {
+    json!({"step_kind":kind,"floor_id":block.floor,"x":block.x,"y":block.y,
+        "block_id":block.id,"details":details})
+}
+
+fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
+    let parsed = parse_solver_world(observation);
+    let Ok((floors, blocks, terminal, shops, blockers)) = parsed else {
+        return json!({"scope":"global_terminal_route","proof":"unsupported","reason":parsed.unwrap_err(),
+            "truncated":false,"explored_states":0,"blockers":[],"route":null,"first_suggestion":null});
+    };
+    if !blockers.is_empty() {
+        return json!({"scope":"global_terminal_route","proof":"unsupported","reason":"unsupported_solver_blocker",
+            "truncated":false,"explored_states":0,"blockers":blockers,"route":null,"first_suggestion":null});
+    }
+    let hero = observation.get("hero").and_then(Value::as_object).unwrap();
+    let loc = hero.get("loc").and_then(Value::as_object).unwrap();
+    let keys = observation.get("keys").and_then(Value::as_object).unwrap();
+    let inventory = observation
+        .get("engine_model")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get("inventory"))
+        .and_then(Value::as_object)
+        .and_then(|i| i.get("classes"))
+        .and_then(Value::as_object)
+        .map(|classes| {
+            classes
+                .values()
+                .filter_map(Value::as_object)
+                .flat_map(|items| items.iter())
+                .filter_map(|(id, count)| count.as_u64().map(|count| (id.clone(), count)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let initial = SolverState {
+        floor: observation
+            .get("floor_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        x: loc.get("x").and_then(Value::as_u64).unwrap_or(0),
+        y: loc.get("y").and_then(Value::as_u64).unwrap_or(0),
+        hp: hero.get("hp").and_then(Value::as_u64).unwrap_or(0),
+        attack: hero.get("attack").and_then(Value::as_u64).unwrap_or(0),
+        defense: hero.get("defense").and_then(Value::as_u64).unwrap_or(0),
+        gold: hero.get("gold").and_then(Value::as_u64).unwrap_or(0),
+        experience: hero.get("experience").and_then(Value::as_u64).unwrap_or(0),
+        yellow: keys.get("yellow").and_then(Value::as_u64).unwrap_or(0),
+        blue: keys.get("blue").and_then(Value::as_u64).unwrap_or(0),
+        red: keys.get("red").and_then(Value::as_u64).unwrap_or(0),
+        inventory,
+        consumed: vec![false; blocks.len()],
+        shop_counts: shops
+            .iter()
+            .flat_map(|shop| {
+                shop.get("choices")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .map(|choice| {
+                choice
+                    .get("purchase_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            })
+            .collect(),
+    };
+    let terminal_object = terminal.as_object().unwrap();
+    let terminal_floor = terminal_object
+        .get("floor_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let terminal_pos = (
+        terminal_object
+            .get("x")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX),
+        terminal_object
+            .get("y")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX),
+    );
+    let max_states = observation
+        .get("engine_model")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get("solver_model"))
+        .and_then(Value::as_object)
+        .and_then(|m| m.get("search_budget"))
+        .and_then(Value::as_u64)
+        .map(|value| value.clamp(1, MAX_GLOBAL_STATES as u64) as usize)
+        .unwrap_or(MAX_GLOBAL_STATES);
+    let mut queue = VecDeque::from([SearchNode {
+        state: initial,
+        steps: Vec::new(),
+    }]);
+    let mut seen = HashSet::new();
+    let mut dominance: HashMap<String, Vec<[u64; 8]>> = HashMap::new();
+    let mut explored = 0usize;
+    let mut best: Option<SearchNode> = None;
+    let mut budget_exhausted = false;
+    while let Some(node) = queue.pop_front() {
+        if explored >= max_states {
+            budget_exhausted = true;
+            break;
+        }
+        if !seen.insert(node.state.clone()) {
+            continue;
+        }
+        let structural=json!({"floor":node.state.floor,"x":node.state.x,"y":node.state.y,
+            "inventory":node.state.inventory,"consumed":node.state.consumed,"shops":node.state.shop_counts}).to_string();
+        let resources = [
+            node.state.hp,
+            node.state.attack,
+            node.state.defense,
+            node.state.gold,
+            node.state.experience,
+            node.state.yellow,
+            node.state.blue,
+            node.state.red,
+        ];
+        let frontier = dominance.entry(structural).or_default();
+        if frontier.iter().any(|old| {
+            old.iter()
+                .zip(resources)
+                .all(|(left, right)| *left >= right)
+        }) {
+            continue;
+        }
+        frontier.retain(|old| {
+            !resources
+                .iter()
+                .zip(old)
+                .all(|(left, right)| *left >= *right)
+        });
+        frontier.push(resources);
+        explored += 1;
+        let reachable = reachable_cells(&node.state, &floors, &blocks);
+        if node.state.floor == terminal_floor && reachable.contains(&terminal_pos) {
+            if best.as_ref().is_none_or(|old| {
+                node.state.hp > old.state.hp
+                    || (node.state.hp == old.state.hp
+                        && serde_json::to_string(&node.steps).unwrap()
+                            < serde_json::to_string(&old.steps).unwrap())
+            }) {
+                let mut won = node.clone();
+                won.steps.push(json!({"step_kind":"terminal","floor_id":terminal_floor,"x":terminal_pos.0,"y":terminal_pos.1,"details":{}}));
+                best = Some(won);
+            }
+            continue;
+        }
+        for (index, block) in blocks.iter().enumerate() {
+            if block.floor != node.state.floor
+                || node.state.consumed[index]
+                || block.kind == "opaque"
+                || block.kind == "terrain"
+                || !adjacent(&reachable, block.x, block.y)
+            {
+                continue;
+            }
+            let mut next = node.clone();
+            let mut details = json!({});
+            match block.kind.as_str() {
+                "door" => {
+                    let cost = &block.data["key_cost"];
+                    let (y, b, r) = (
+                        cost["yellow"].as_u64().unwrap_or(0),
+                        cost["blue"].as_u64().unwrap_or(0),
+                        cost["red"].as_u64().unwrap_or(0),
+                    );
+                    if next.state.yellow < y || next.state.blue < b || next.state.red < r {
+                        continue;
+                    }
+                    next.state.yellow -= y;
+                    next.state.blue -= b;
+                    next.state.red -= r;
+                    next.state.consumed[index] = true;
+                    details = json!({"key_cost":{"yellow":y,"blue":b,"red":r}});
+                }
+                "resource" => {
+                    if add_delta(&mut next.state, &block.data["delta"]).is_err() {
+                        continue;
+                    }
+                    next.state.consumed[index] = true;
+                    details = block.data["delta"].clone();
+                }
+                "enemy" => {
+                    let Some(loss) = enemy_loss(&next.state, &block.data["enemy"]) else {
+                        continue;
+                    };
+                    if loss >= next.state.hp {
+                        continue;
+                    }
+                    next.state.hp -= loss;
+                    next.state.gold += block.data["enemy"]["gold"].as_u64().unwrap_or(0);
+                    next.state.experience +=
+                        block.data["enemy"]["experience"].as_u64().unwrap_or(0);
+                    next.state.consumed[index] = true;
+                    details = json!({"hp_loss":loss});
+                }
+                "transition" => {
+                    let target = &block.data["target"];
+                    next.state.floor = target["floor_id"].as_str().unwrap_or_default().to_owned();
+                    next.state.x = target["x"].as_u64().unwrap_or(0);
+                    next.state.y = target["y"].as_u64().unwrap_or(0);
+                }
+                _ => continue,
+            }
+            next.steps.push(step_json(&block.kind, block, details));
+            queue.push_back(next);
+        }
+        // A restricted shop can be used whenever its bound block is adjacent. Each purchase is a separate state.
+        let mut choice_offset = 0usize;
+        for shop in &shops {
+            let shop_id = shop
+                .get("shop_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let accessible = blocks.iter().any(|block| {
+                block.floor == node.state.floor
+                    && block.kind == "shop"
+                    && block.data.get("shop_id").and_then(Value::as_str) == Some(shop_id)
+                    && adjacent(&reachable, block.x, block.y)
+            });
+            let choices = shop
+                .get("choices")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if accessible {
+                for (local, choice) in choices.iter().enumerate() {
+                    let purchase_count = node.state.shop_counts[choice_offset + local];
+                    let Some(cost) = choice["base_cost"]
+                        .as_u64()
+                        .and_then(|base| choice["increment_per_purchase"].as_u64()
+                            .and_then(|increment| increment.checked_mul(purchase_count)
+                                .and_then(|extra| base.checked_add(extra)))) else {
+                        continue;
+                    };
+                    if node.state.gold < cost {
+                        continue;
+                    }
+                    let mut next = node.clone();
+                    next.state.gold -= cost;
+                    let field = choice["effect"]["field"].as_str().unwrap_or_default();
+                    let amount = choice["effect"]["amount"].as_u64().unwrap_or(0);
+                    match field {
+                        "hp" => next.state.hp += amount,
+                        "attack" => next.state.attack += amount,
+                        "defense" => next.state.defense += amount,
+                        _ => continue,
+                    };
+                    next.state.shop_counts[choice_offset + local] += 1;
+                    next.steps.push(json!({"step_kind":"shop","floor_id":node.state.floor,"shop_id":shop_id,"choice_id":choice["choice_id"],"details":{"cost":cost,"purchase_count_before":purchase_count,"field":field,"amount":amount}}));
+                    queue.push_back(next);
+                }
+            }
+            choice_offset += choices.len();
+        }
+    }
+    if budget_exhausted {
+        json!({"scope":"global_terminal_route","proof":"unproven","reason":"search_budget_exhausted",
+        "truncated":true,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null})
+    } else if let Some(best) = best {
+        let first = best.steps.first().cloned();
+        json!({"scope":"global_terminal_route","proof":"proven","reason":"complete terminal route found","truncated":false,
+        "explored_states":explored,"terminal_hp":best.state.hp,"blockers":blockers,"route":{"step_count":best.steps.len(),"steps":best.steps},"first_suggestion":first})
+    } else {
+        json!({"scope":"global_terminal_route","proof":if blockers.is_empty(){"unproven"}else{"unsupported"},"reason":"no_complete_supported_route",
+        "truncated":false,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null})
+    }
+}
+
 fn shadow_response(body: &[u8], state: &Mutex<ShadowState>) -> Result<Value, Value> {
     let request: Value = serde_json::from_slice(body)
         .map_err(|_| error("INVALID_JSON", "Request body must be JSON."))?;
@@ -649,7 +1180,10 @@ fn shadow_response(body: &[u8], state: &Mutex<ShadowState>) -> Result<Value, Val
     let session_id = required_string(observation, "session_id")?;
     let floor_id = required_string(observation, "floor_id")?;
     let map_instance_id = required_string(observation, "map_instance_id")?;
-    let analysis = analyze_current_floor(observation, floor_id)?;
+    let mut analysis = analyze_current_floor(observation, floor_id)?;
+    if let Some(object) = analysis.as_object_mut() {
+        object.insert("global".to_owned(), global_analysis(observation));
+    }
     let session = request
         .get("session")
         .and_then(Value::as_object)
@@ -822,6 +1356,74 @@ mod tests {
         .expect("test request JSON")
     }
 
+    fn global_observation(search_budget: Option<u64>) -> Value {
+        let mut solver = json!({
+            "protocol": 1,
+            "terminal": {"kind":"location","floor_id":"F2","x":4,"y":0},
+            "blockers": [], "shops": [{"supported":true,"shop_id":"moneyShop","repeatable":true,"choices":[
+                {"choice_id":"moneyShop:0:attack:5:10","index":0,"text":"attack+5","cost":10,
+                 "base_cost":10,"increment_per_purchase":0,
+                 "effect":{"field":"attack","amount":5},"counter_flag":"shop_atk","purchase_count":0}
+            ]}],
+            "floors": [
+                {"floor_id":"F1","width":4,"height":1,"topology":{"kind":"rectangle"},"blocks":[
+                    {"floor_id":"F1","x":1,"y":0,"block_id":"redGem","numeric_id":1,"kind":"resource",
+                     "delta":{"hp":0,"attack":5,"defense":0,"gold":10,"experience":0,"keys":{"yellow":1,"blue":0,"red":0},"inventory":{}}},
+                    {"floor_id":"F1","x":2,"y":0,"block_id":"guard","numeric_id":2,"kind":"enemy",
+                     "enemy":{"hp":10,"attack":8,"defense":7,"gold":0,"experience":0,"special":[]}},
+                    {"floor_id":"F1","x":3,"y":0,"block_id":"downFloor","numeric_id":3,"kind":"transition",
+                     "target":{"floor_id":"F2","x":0,"y":0}}
+                ]},
+                {"floor_id":"F2","width":5,"height":3,"topology":{"kind":"rectangle"},"blocks":[
+                    {"floor_id":"F2","x":1,"y":0,"block_id":"moneyShop","numeric_id":4,"kind":"shop","shop_id":"moneyShop"},
+                    {"floor_id":"F2","x":2,"y":0,"block_id":"boss","numeric_id":5,"kind":"enemy",
+                     "enemy":{"hp":10,"attack":8,"defense":12,"gold":0,"experience":0,"special":[]}},
+                    {"floor_id":"F2","x":3,"y":0,"block_id":"yellowDoor","numeric_id":6,"kind":"door",
+                     "key_cost":{"yellow":1,"blue":0,"red":0}},
+                    {"floor_id":"F2","x":0,"y":1,"block_id":"sideEnemy","numeric_id":7,"kind":"enemy",
+                     "enemy":{"hp":20,"attack":8,"defense":0,"gold":0,"experience":0,"special":[]}},
+                    {"floor_id":"F2","x":0,"y":2,"block_id":"sidePotion","numeric_id":8,"kind":"resource",
+                     "delta":{"hp":10,"attack":0,"defense":0,"gold":0,"experience":0,"keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}},
+                    {"floor_id":"F2","x":1,"y":1,"block_id":"wall1","numeric_id":9,"kind":"opaque","reason":"wall"},
+                    {"floor_id":"F2","x":1,"y":2,"block_id":"wall1b","numeric_id":14,"kind":"opaque","reason":"wall"},
+                    {"floor_id":"F2","x":2,"y":1,"block_id":"deadBranchDoor","numeric_id":10,"kind":"door",
+                     "key_cost":{"yellow":1,"blue":0,"red":0}},
+                    {"floor_id":"F2","x":2,"y":2,"block_id":"jackpot","numeric_id":13,"kind":"resource",
+                     "delta":{"hp":100,"attack":0,"defense":0,"gold":0,"experience":0,"keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}},
+                    {"floor_id":"F2","x":3,"y":1,"block_id":"wall3","numeric_id":11,"kind":"opaque","reason":"wall"},
+                    {"floor_id":"F2","x":4,"y":1,"block_id":"wall4","numeric_id":12,"kind":"opaque","reason":"wall"}
+                ]}
+            ]
+        });
+        if let Some(budget) = search_budget {
+            solver["search_budget"] = Value::from(budget);
+        }
+        json!({
+            "session_id":"S","floor_id":"F1","map_instance_id":"M",
+            "dimensions":{"width":4,"height":1},"topology":{"kind":"rectangle"},
+            "hero":{"hp":30,"attack":5,"defense":5,"gold":0,"experience":0,"loc":{"x":0,"y":0}},
+            "keys":{"yellow":0,"blue":0,"red":0},"blocks":[],
+            "engine_model":{"inventory":{"classes":{},"key_slots":{"yellow":"yellowKey","blue":"blueKey","red":"redKey"}},"solver_model":solver}
+        })
+    }
+
+    fn two_terminal_routes(search_budget: u64) -> Value {
+        let mut value: Value = serde_json::from_str(r#"{
+          "session_id":"S","floor_id":"F","map_instance_id":"M",
+          "dimensions":{"width":3,"height":2},"topology":{"kind":"rectangle"},
+          "hero":{"hp":10,"attack":1,"defense":1,"gold":0,"experience":0,"loc":{"x":0,"y":0}},
+          "keys":{"yellow":0,"blue":0,"red":0},"blocks":[],
+          "engine_model":{"inventory":{"classes":{},"key_slots":{"yellow":"yellowKey","blue":"blueKey","red":"redKey"}},
+            "solver_model":{"protocol":1,"terminal":{"kind":"location","floor_id":"F","x":2,"y":0},"blockers":[],"shops":[],
+              "floors":[{"floor_id":"F","width":3,"height":2,"topology":{"kind":"valid_cells","valid_cells":[{"x":0,"y":0},{"x":1,"y":0},{"x":2,"y":0},{"x":0,"y":1}]},"blocks":[
+                {"floor_id":"F","x":1,"y":0,"block_id":"smallPotion","numeric_id":1,"kind":"resource","delta":{"hp":1,"attack":0,"defense":0,"gold":0,"experience":0,"keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}},
+                {"floor_id":"F","x":0,"y":1,"block_id":"largePotion","numeric_id":2,"kind":"resource","delta":{"hp":10,"attack":0,"defense":0,"gold":0,"experience":0,"keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}
+              ]}]}}
+        }"#).unwrap();
+        value["engine_model"]["solver_model"]["search_budget"] = json!(search_budget);
+        value
+    }
+
     #[test]
     fn valid_cycle_is_idle_and_read_only() {
         let state = Mutex::new(ShadowState::default());
@@ -835,6 +1437,147 @@ mod tests {
         );
         assert!(response.get("action_id").is_none());
         assert!(response.get("operations").is_none());
+    }
+
+    #[test]
+    fn global_route_replays_resource_fight_transition_door_and_terminal() {
+        let response = shadow_response(
+            &request_with(global_observation(None)),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        let global = &response["shadow"]["analysis"]["global"];
+        assert_eq!(global["proof"], "proven");
+        assert_eq!(global["terminal_hp"], 19);
+        let kinds: Vec<_> = global["route"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["step_kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "resource",
+                "enemy",
+                "transition",
+                "enemy",
+                "resource",
+                "shop",
+                "enemy",
+                "door",
+                "terminal"
+            ]
+        );
+        assert_eq!(global["first_suggestion"]["step_kind"], "resource");
+        assert!(
+            !global["route"]["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["block_id"] == "jackpot"),
+            "a locally valuable branch that consumes the only terminal key is rejected"
+        );
+        let serialized = serde_json::to_string(global).unwrap();
+        for forbidden in [
+            "\"action\":",
+            "\"execute\":",
+            "\"operation\":",
+            "\"guard\":",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn global_route_fails_closed_for_unknown_blocker_but_not_known_walls() {
+        let wall_only = shadow_response(
+            &request_with(global_observation(None)),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        assert_eq!(wall_only["shadow"]["analysis"]["global"]["proof"], "proven");
+
+        let mut unknown = global_observation(None);
+        unknown["engine_model"]["solver_model"]["terminal"] =
+            json!({"kind":"location","floor_id":"F1","x":0,"y":0});
+        unknown["engine_model"]["solver_model"]["floors"][0]["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"floor_id":"F1","x":0,"y":0,"block_id":"opaqueEvent",
+                "numeric_id":99,"kind":"opaque","reason":"event_unsupported"}));
+        unknown["engine_model"]["solver_model"]["blockers"] =
+            json!([{"code":"EVENT_UNSUPPORTED","detail":"F1:0,0"}]);
+        let response = shadow_response(
+            &request_with(unknown),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        let global = &response["shadow"]["analysis"]["global"];
+        assert_eq!(global["proof"], "unsupported");
+        assert_eq!(global["truncated"], false);
+        assert_eq!(global["route"], Value::Null);
+        assert_eq!(global["first_suggestion"], Value::Null);
+        assert!(global.get("terminal_hp").is_none());
+        assert_eq!(global["blockers"][0]["code"], "EVENT_UNSUPPORTED");
+    }
+
+    #[test]
+    fn global_search_budget_exhaustion_is_unproven_and_deterministic() {
+        for budget in [2, 3] {
+            let request = request_with(two_terminal_routes(budget));
+            let first = shadow_response(&request, &Mutex::new(ShadowState::default())).unwrap();
+            let second = shadow_response(&request, &Mutex::new(ShadowState::default())).unwrap();
+            let global = &first["shadow"]["analysis"]["global"];
+            assert_eq!(
+                global["proof"], "unproven",
+                "budget={budget} global={global}"
+            );
+            assert_eq!(global["reason"], "search_budget_exhausted");
+            assert_eq!(global["route"], Value::Null);
+            assert_eq!(global["first_suggestion"], Value::Null);
+            assert!(global.get("terminal_hp").is_none());
+            assert_eq!(global, &second["shadow"]["analysis"]["global"]);
+        }
+        let complete = shadow_response(
+            &request_with(two_terminal_routes(4)),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        assert_eq!(complete["shadow"]["analysis"]["global"]["proof"], "proven");
+        assert_eq!(complete["shadow"]["analysis"]["global"]["terminal_hp"], 21);
+    }
+
+    #[test]
+    fn global_shop_purchase_count_is_part_of_state_and_allows_repeated_choices() {
+        let mut observation = global_observation(None);
+        observation["engine_model"]["solver_model"]["floors"][0]["blocks"][0]["delta"]["gold"] =
+            json!(30);
+        observation["engine_model"]["solver_model"]["floors"][1]["blocks"][1]["enemy"]["defense"] =
+            json!(17);
+        let choice = &mut observation["engine_model"]["solver_model"]["shops"][0]["choices"][0];
+        choice["base_cost"] = json!(5);
+        choice["increment_per_purchase"] = json!(5);
+        choice["purchase_count"] = json!(1);
+        choice["cost"] = json!(10);
+        let response = shadow_response(
+            &request_with(observation),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        let global = &response["shadow"]["analysis"]["global"];
+        assert_eq!(global["proof"], "proven");
+        let shop_steps: Vec<_> = global["route"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|step| step["step_kind"] == "shop")
+            .collect();
+        assert_eq!(shop_steps.len(), 2);
+        assert_eq!(shop_steps[0]["details"]["purchase_count_before"], 1);
+        assert_eq!(shop_steps[0]["details"]["cost"], 10);
+        assert_eq!(shop_steps[1]["details"]["purchase_count_before"], 2);
+        assert_eq!(shop_steps[1]["details"]["cost"], 15);
     }
 
     #[test]

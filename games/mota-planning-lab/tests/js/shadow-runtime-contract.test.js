@@ -151,7 +151,7 @@ test("Rust Stage2B shadow runtime returns current-floor candidates without execu
   assert.equal(response.status, "idle");
   assert.deepEqual(JSON.parse(JSON.stringify(response.shadow)), {
     mode: "read_only",
-    reason: "Stage2B Rust shadow runtime analyzed current-floor boundaries; execution remains disabled.",
+    reason: "Stage3 Rust shadow runtime analyzed bounded global routes; execution remains disabled.",
     cycle: 1,
     analysis: {
       scope: "current_floor_immediate",
@@ -159,6 +159,10 @@ test("Rust Stage2B shadow runtime returns current-floor candidates without execu
       candidate_limit: 256,
       total_candidate_count: 4,
       truncated: false,
+      global: {
+        scope: "global_terminal_route", proof: "unsupported", reason: "solver_model_missing",
+        truncated: false, explored_states: 0, blockers: [], route: null, first_suggestion: null,
+      },
       candidates: [
         {
           candidate_id: "synthetic-floor-4:door:8,2:9002:syntheticRedDoor",

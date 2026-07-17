@@ -1,5 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const {
@@ -165,12 +166,120 @@ test("browser protocol parser accepts fixtures and rejects nested shape drift", 
           numeric_id: 1, x: 1, y: 0, distance: 1, feasibility: "unknown_cost",
           hp_loss: null, key_cost: { yellow: 0, blue: 0, red: 0 },
         }],
+        global: {
+          scope: "global_terminal_route", proof: "proven", reason: "complete terminal route found",
+          truncated: false, explored_states: 4, terminal_hp: 90, blockers: [],
+          route: { step_count: 1, steps: [{ step_kind: "terminal", floor_id: "F", x: 2, y: 0, details: {} }] },
+          first_suggestion: { step_kind: "terminal", floor_id: "F", x: 2, y: 0, details: {} },
+        },
       },
     },
   };
   assert.doesNotThrow(() => lab.validateCycleResponse(shadowAnalysis));
+  shadowAnalysis.shadow.analysis.global.first_suggestion.action = "forbidden";
+  assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
+  delete shadowAnalysis.shadow.analysis.global.first_suggestion.action;
+  const global = shadowAnalysis.shadow.analysis.global;
+  global.route.step_count = 2;
+  assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
+  global.route.step_count = 1;
+  global.first_suggestion = { ...global.first_suggestion, x: 1 };
+  assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
+  global.first_suggestion = structuredClone(global.route.steps[0]);
+  global.route.steps[0].details = { action: "forbidden" };
+  assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
+  global.route.steps[0].details = {};
+  global.proof = "unproven";
+  global.reason = "search_budget_exhausted";
+  global.truncated = true;
+  assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
+  Object.assign(global, { proof: "unsupported", reason: "search_budget_exhausted", truncated: false });
+  assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
+  Object.assign(global, { proof: "proven", reason: "complete terminal route found", truncated: false });
+  global.blockers = [{ code: "opaque_event", detail: "requires an unsupported event model" }];
+  assert.doesNotThrow(() => lab.validateCycleResponse(shadowAnalysis));
+  global.blockers = [{ code: "opaque_event" }];
+  assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
+  global.blockers = [{ code: "opaque_event", detail: 1 }];
+  assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
+  global.blockers = [];
+  global.route.steps[0] = {
+    step_kind: "resource", floor_id: "F", x: 2, y: 0, block_id: "redPotion",
+    details: {
+      hp: 100, attack: 0, defense: 0, gold: 0, experience: 0,
+      keys: { yellow: 0, blue: 0, red: 0 }, inventory: { action: 1 },
+    },
+  };
+  global.first_suggestion = structuredClone(global.route.steps[0]);
+  assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
+  global.route.steps[0] = { step_kind: "terminal", floor_id: "F", x: 2, y: 0, details: {} };
+  global.first_suggestion = structuredClone(global.route.steps[0]);
+  global.blockers = Array.from({ length: 65537 }, () => ({ code: "opaque_event", detail: "unsupported" }));
+  assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
+  global.blockers = [];
   shadowAnalysis.shadow.analysis.candidates[0].operation = { type: "grid", x: 1, y: 0 };
   assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
+});
+
+test("JS and Draft schema agree on global shadow proof, limits, and non-executable details", () => {
+  const base = {
+    status: "idle", reason: "synthetic",
+    shadow: {
+      mode: "read_only", reason: "synthetic", cycle: 1,
+      analysis: {
+        scope: "current_floor_immediate", reachable_cell_count: 1,
+        candidate_limit: 256, total_candidate_count: 0, truncated: false, candidates: [],
+        global: {
+          scope: "global_terminal_route", proof: "unsupported", reason: "solver_model_missing",
+          truncated: false, explored_states: 0, blockers: [], route: null, first_suggestion: null,
+        },
+      },
+    },
+  };
+  const cases = [
+    { name: "valid unsupported", value: structuredClone(base), accepted: true },
+    { name: "unsupported budget reason", value: structuredClone(base), accepted: false },
+    { name: "too many blockers", value: structuredClone(base), accepted: false },
+    { name: "nested executable inventory field", value: structuredClone(base), accepted: false },
+  ];
+  cases[1].value.shadow.analysis.global.reason = "search_budget_exhausted";
+  cases[2].value.shadow.analysis.global.blockers = Array.from(
+    { length: 65537 }, () => ({ code: "opaque_event", detail: "unsupported" }),
+  );
+  Object.assign(cases[3].value.shadow.analysis.global, {
+    proof: "proven", reason: "complete terminal route found", terminal_hp: 100,
+    route: {
+      step_count: 1,
+      steps: [{
+        step_kind: "resource", floor_id: "F", x: 1, y: 0, block_id: "redPotion",
+        details: {
+          hp: 100, attack: 0, defense: 0, gold: 0, experience: 0,
+          keys: { yellow: 0, blue: 0, red: 0 }, inventory: { action: 1 },
+        },
+      }],
+    },
+  });
+  cases[3].value.shadow.analysis.global.first_suggestion = structuredClone(
+    cases[3].value.shadow.analysis.global.route.steps[0],
+  );
+
+  const schemaPath = path.join(projectDir, "protocol/cycle-response.schema.json");
+  const python = childProcess.spawnSync("python3", ["-c", [
+    "import json, sys, jsonschema",
+    "schema=json.load(open(sys.argv[1], encoding='utf-8'))",
+    "values=json.load(sys.stdin)",
+    "print(json.dumps([not list(jsonschema.Draft202012Validator(schema).iter_errors(v)) for v in values]))",
+  ].join("; "), schemaPath], {
+    input: JSON.stringify(cases.map(({ value }) => value)), encoding: "utf8",
+  });
+  assert.equal(python.status, 0, python.stderr);
+  const schemaResults = JSON.parse(python.stdout);
+  cases.forEach(({ name, value, accepted }, index) => {
+    let jsAccepted = true;
+    try { lab.validateCycleResponse(value); } catch { jsAccepted = false; }
+    assert.equal(jsAccepted, accepted, `${name}: JS`);
+    assert.equal(schemaResults[index], accepted, `${name}: Draft schema`);
+  });
 });
 
 test("controller requires explicit baseline, start, and stop in the current page instance", async () => {

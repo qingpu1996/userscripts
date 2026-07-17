@@ -23,6 +23,19 @@ test("restricted shop parses the observed money shop without evaluation", () => 
     [{ field: "defense", amount: 4 }, 0],
   ]);
   assert.equal(shop.choices[1].choice_id, "moneyShop1:1:attack:4:25");
+  assert.deepEqual([shop.choices[1].base_cost, shop.choices[1].increment_per_purchase,
+    shop.choices[1].cost], [25, 0, 25]);
+});
+
+test("restricted shop parses only the bounded linear counter price", () => {
+  const dynamic = choice("atk", 4, "shop_atk", 10);
+  dynamic.need = " status:money >= flag:shop_atk * 5 + 10 ";
+  dynamic.action[0].value = "10 + 5 * flag:shop_atk";
+  const shop = lab.parseRestrictedShop("moneyShop1", { choices: [dynamic] }, { shop_atk: 2 });
+  assert.equal(shop.supported, true);
+  assert.deepEqual([shop.choices[0].base_cost, shop.choices[0].increment_per_purchase,
+    shop.choices[0].counter_flag, shop.choices[0].purchase_count, shop.choices[0].cost],
+  [10, 5, "shop_atk", 2, 20]);
 });
 
 test("restricted shop fails closed for dynamic cost, unknown effects and missing counter", () => {
@@ -34,6 +47,16 @@ test("restricted shop fails closed for dynamic cost, unknown effects and missing
       { type: "setValue", name: "status:experience", operator: "+=", value: "1" }] }] },
   ];
   for (const item of cases) assert.equal(lab.parseRestrictedShop("s", item).supported, false);
+  const rejected = lab.parseRestrictedShop("s", cases[0]);
+  const solver = lab.buildSolverModel({
+    floors: [{ floor_id: "F", width: 1, height: 1, topology: { kind: "rectangle" },
+      terminal_goals: [{ kind: "location", floor_id: "F", x: 0, y: 0 }], blocks: [],
+      opaque_events: [], change_floor: [] }],
+    blocks: [], items: [], enemies: [], values: {}, inventory: { key_slots: {} },
+  }, [rejected]);
+  assert.deepEqual(JSON.parse(JSON.stringify(solver.blockers)), [{
+    code: "SHOP_COST_EXPRESSION_UNSUPPORTED", detail: "s:0",
+  }]);
 });
 
 test("restricted shop verifies exact debit and authoritative nonnegative count", () => {
