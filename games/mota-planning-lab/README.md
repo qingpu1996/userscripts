@@ -31,3 +31,5 @@ games/mota-planning-lab/scripts/run-stage0-bench.sh
 ```
 
 见 [安装与运行](docs/install-and-run.md)、[前端到 Rust 的最小协议边界](docs/protocol.md)、[Stage 0 与验证](docs/qa-runbook.md) 和 [求解器方向](docs/solver-architecture.md)。
+
+当前实现的架构、状态模型、决策流程与外部评审问题见[当前 Shadow 求解器技术方案](docs/current-solver-architecture.md)。
