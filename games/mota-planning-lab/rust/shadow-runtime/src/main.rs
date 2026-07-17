@@ -664,6 +664,20 @@ struct SearchNode {
     steps: Vec<Value>,
 }
 
+fn terminal_route_is_better(candidate: &SearchNode, current: &SearchNode) -> bool {
+    let score = |node: &SearchNode| {
+        (
+            u128::from(node.state.attack) + u128::from(node.state.defense),
+            node.state.attack.min(node.state.defense),
+            node.state.hp,
+        )
+    };
+    score(candidate) > score(current)
+        || (score(candidate) == score(current)
+            && serde_json::to_string(&candidate.steps).unwrap()
+                < serde_json::to_string(&current.steps).unwrap())
+}
+
 fn solver_u64(object: &serde_json::Map<String, Value>, name: &str) -> Result<u64, String> {
     object
         .get(name)
@@ -1018,12 +1032,10 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
         explored += 1;
         let reachable = reachable_cells(&node.state, &floors, &blocks);
         if node.state.floor == terminal_floor && reachable.contains(&terminal_pos) {
-            if best.as_ref().is_none_or(|old| {
-                node.state.hp > old.state.hp
-                    || (node.state.hp == old.state.hp
-                        && serde_json::to_string(&node.steps).unwrap()
-                            < serde_json::to_string(&old.steps).unwrap())
-            }) {
+            if best
+                .as_ref()
+                .is_none_or(|old| terminal_route_is_better(&node, old))
+            {
                 let mut won = node.clone();
                 won.steps.push(json!({"step_kind":"terminal","floor_id":terminal_floor,"x":terminal_pos.0,"y":terminal_pos.1,"details":{}}));
                 best = Some(won);
@@ -1145,7 +1157,8 @@ fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
     } else if let Some(best) = best {
         let first = best.steps.first().cloned();
         json!({"scope":"global_terminal_route","proof":"proven","reason":"complete terminal route found","truncated":false,
-        "explored_states":explored,"terminal_hp":best.state.hp,"blockers":blockers,"route":{"step_count":best.steps.len(),"steps":best.steps},"first_suggestion":first})
+        "explored_states":explored,"terminal_hp":best.state.hp,"terminal_attack":best.state.attack,
+        "terminal_defense":best.state.defense,"blockers":blockers,"route":{"step_count":best.steps.len(),"steps":best.steps},"first_suggestion":first})
     } else {
         json!({"scope":"global_terminal_route","proof":if blockers.is_empty(){"unproven"}else{"unsupported"},"reason":"no_complete_supported_route",
         "truncated":false,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null})
@@ -1327,6 +1340,52 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn terminal_node(attack: u64, defense: u64, hp: u64, route: &str) -> SearchNode {
+        SearchNode {
+            state: SolverState {
+                floor: "F".to_owned(),
+                x: 0,
+                y: 0,
+                hp,
+                attack,
+                defense,
+                gold: 0,
+                experience: 0,
+                yellow: 0,
+                blue: 0,
+                red: 0,
+                inventory: Vec::new(),
+                consumed: Vec::new(),
+                shop_counts: Vec::new(),
+            },
+            steps: vec![json!({"route": route})],
+        }
+    }
+
+    #[test]
+    fn terminal_route_order_is_attributes_then_balance_then_hp_then_route() {
+        let hp_rich = terminal_node(10, 10, 10_000, "b");
+        let stronger = terminal_node(11, 10, 1, "z");
+        assert!(terminal_route_is_better(&stronger, &hp_rich));
+
+        let unbalanced = terminal_node(19, 1, 10_000, "a");
+        let balanced = terminal_node(10, 10, 1, "z");
+        assert!(terminal_route_is_better(&balanced, &unbalanced));
+
+        let low_hp = terminal_node(10, 10, 5, "a");
+        let high_hp = terminal_node(10, 10, 6, "z");
+        assert!(terminal_route_is_better(&high_hp, &low_hp));
+
+        let later = terminal_node(10, 10, 6, "z");
+        let earlier = terminal_node(10, 10, 6, "a");
+        assert!(terminal_route_is_better(&earlier, &later));
+        assert!(!terminal_route_is_better(&later, &earlier));
+        assert!(!terminal_route_is_better(&earlier, &earlier));
+
+        let overflow_safe = terminal_node(u64::MAX, u64::MAX, 1, "a");
+        assert!(terminal_route_is_better(&overflow_safe, &stronger));
+    }
+
     fn request() -> Vec<u8> {
         serde_json::to_vec(&json!({
             "source": "mota-planning-lab-userscript",
@@ -1449,6 +1508,8 @@ mod tests {
         let global = &response["shadow"]["analysis"]["global"];
         assert_eq!(global["proof"], "proven");
         assert_eq!(global["terminal_hp"], 19);
+        assert_eq!(global["terminal_attack"], 15);
+        assert_eq!(global["terminal_defense"], 5);
         let kinds: Vec<_> = global["route"]["steps"]
             .as_array()
             .unwrap()
@@ -1519,6 +1580,8 @@ mod tests {
         assert_eq!(global["route"], Value::Null);
         assert_eq!(global["first_suggestion"], Value::Null);
         assert!(global.get("terminal_hp").is_none());
+        assert!(global.get("terminal_attack").is_none());
+        assert!(global.get("terminal_defense").is_none());
         assert_eq!(global["blockers"][0]["code"], "EVENT_UNSUPPORTED");
     }
 
@@ -1537,6 +1600,8 @@ mod tests {
             assert_eq!(global["route"], Value::Null);
             assert_eq!(global["first_suggestion"], Value::Null);
             assert!(global.get("terminal_hp").is_none());
+            assert!(global.get("terminal_attack").is_none());
+            assert!(global.get("terminal_defense").is_none());
             assert_eq!(global, &second["shadow"]["analysis"]["global"]);
         }
         let complete = shadow_response(
@@ -1546,6 +1611,14 @@ mod tests {
         .unwrap();
         assert_eq!(complete["shadow"]["analysis"]["global"]["proof"], "proven");
         assert_eq!(complete["shadow"]["analysis"]["global"]["terminal_hp"], 21);
+        assert_eq!(
+            complete["shadow"]["analysis"]["global"]["terminal_attack"],
+            1
+        );
+        assert_eq!(
+            complete["shadow"]["analysis"]["global"]["terminal_defense"],
+            1
+        );
     }
 
     #[test]

@@ -168,7 +168,8 @@ test("browser protocol parser accepts fixtures and rejects nested shape drift", 
         }],
         global: {
           scope: "global_terminal_route", proof: "proven", reason: "complete terminal route found",
-          truncated: false, explored_states: 4, terminal_hp: 90, blockers: [],
+          truncated: false, explored_states: 4, terminal_hp: 90,
+          terminal_attack: 20, terminal_defense: 15, blockers: [],
           route: { step_count: 1, steps: [{ step_kind: "terminal", floor_id: "F", x: 2, y: 0, details: {} }] },
           first_suggestion: { step_kind: "terminal", floor_id: "F", x: 2, y: 0, details: {} },
         },
@@ -189,6 +190,12 @@ test("browser protocol parser accepts fixtures and rejects nested shape drift", 
   global.route.steps[0].details = { action: "forbidden" };
   assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
   global.route.steps[0].details = {};
+  delete global.terminal_attack;
+  assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
+  global.terminal_attack = 20;
+  delete global.terminal_defense;
+  assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
+  global.terminal_defense = 15;
   global.proof = "unproven";
   global.reason = "search_budget_exhausted";
   global.truncated = true;
@@ -248,6 +255,7 @@ test("JS and Draft schema agree on global shadow proof, limits, and non-executab
   );
   Object.assign(cases[3].value.shadow.analysis.global, {
     proof: "proven", reason: "complete terminal route found", terminal_hp: 100,
+    terminal_attack: 20, terminal_defense: 15,
     route: {
       step_count: 1,
       steps: [{

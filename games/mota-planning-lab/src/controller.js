@@ -561,8 +561,11 @@ MotaLab.createController = function createController(dependencies, options = {})
       if (response.shadow) {
         const global = response.shadow.analysis && response.shadow.analysis.global;
         const first = global && global.first_suggestion;
+        const terminal = global && global.proof === "proven"
+          ? `，终局攻防 ${global.terminal_attack}/${global.terminal_defense}，HP ${global.terminal_hp}`
+          : "";
         lastReason = global
-          ? `Shadow（只读）${global.proof}${first ? `：${first.step_kind}@${first.floor_id}` : `：${global.reason}`}`
+          ? `Shadow（只读）${global.proof}${terminal}${first ? `：${first.step_kind}@${first.floor_id}` : `：${global.reason}`}`
           : `Shadow（只读）：${response.shadow.reason}`;
       } else lastReason = response.reason;
       refreshPanel({ connected: true });

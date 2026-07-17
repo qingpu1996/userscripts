@@ -2378,7 +2378,7 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
       const global = value.analysis.global;
       MotaLab.assertProtocolShape(global, [
         "scope", "proof", "reason", "truncated", "explored_states", "blockers", "route", "first_suggestion",
-      ], ["terminal_hp"], "shadow.analysis.global");
+      ], ["terminal_hp", "terminal_attack", "terminal_defense"], "shadow.analysis.global");
       if (global.scope !== "global_terminal_route"
         || !new Set(["proven", "unproven", "unsupported"]).has(global.proof)
         || typeof global.reason !== "string" || global.reason.length < 1 || global.reason.length > 512
@@ -2386,7 +2386,11 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
         || !MotaLab.isFiniteInteger(global.explored_states) || global.explored_states < 0
         || !Array.isArray(global.blockers) || global.blockers.length > 65536
         || !(global.terminal_hp === undefined
-          || (MotaLab.isFiniteInteger(global.terminal_hp) && global.terminal_hp > 0))) {
+          || (MotaLab.isFiniteInteger(global.terminal_hp) && global.terminal_hp > 0))
+        || !(global.terminal_attack === undefined
+          || (MotaLab.isFiniteInteger(global.terminal_attack) && global.terminal_attack >= 0))
+        || !(global.terminal_defense === undefined
+          || (MotaLab.isFiniteInteger(global.terminal_defense) && global.terminal_defense >= 0))) {
         throw new TypeError("Invalid global shadow analysis");
       }
       for (const blocker of global.blockers) {
@@ -2460,6 +2464,8 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
       if ((global.proof === "proven") !== (global.route !== null)
         || (global.route === null) !== (global.first_suggestion === null)
         || (global.proof === "proven") !== (global.terminal_hp !== undefined)
+        || (global.proof === "proven") !== (global.terminal_attack !== undefined)
+        || (global.proof === "proven") !== (global.terminal_defense !== undefined)
         || global.truncated !== (global.proof === "unproven" && global.reason === "search_budget_exhausted")
         || (global.reason === "search_budget_exhausted")
           !== (global.proof === "unproven" && global.truncated)) {
@@ -4612,8 +4618,11 @@ MotaLab.createController = function createController(dependencies, options = {})
       if (response.shadow) {
         const global = response.shadow.analysis && response.shadow.analysis.global;
         const first = global && global.first_suggestion;
+        const terminal = global && global.proof === "proven"
+          ? `，终局攻防 ${global.terminal_attack}/${global.terminal_defense}，HP ${global.terminal_hp}`
+          : "";
         lastReason = global
-          ? `Shadow（只读）${global.proof}${first ? `：${first.step_kind}@${first.floor_id}` : `：${global.reason}`}`
+          ? `Shadow（只读）${global.proof}${terminal}${first ? `：${first.step_kind}@${first.floor_id}` : `：${global.reason}`}`
           : `Shadow（只读）：${response.shadow.reason}`;
       } else lastReason = response.reason;
       refreshPanel({ connected: true });
