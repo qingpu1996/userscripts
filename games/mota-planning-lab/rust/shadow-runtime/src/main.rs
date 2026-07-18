@@ -691,6 +691,10 @@ struct ProfileStats {
     connectivity_view_ns: u64,
     local_reachable_calls: u64,
     local_reachable_ns: u64,
+    region_graph_view_calls: u64,
+    region_graph_fallback_calls: u64,
+    region_graph_region_traversals: u64,
+    region_graph_portal_traversals: u64,
     structural_hash_calls: u64,
     structural_hash_ns: u64,
     structural_equality_checks: u64,
@@ -869,6 +873,12 @@ fn profile_finish_json(stats: &ProfileStats) -> Value {
         },
         "local_reachable_calls": stats.local_reachable_calls,
         "local_reachable_ns": stats.local_reachable_ns,
+        "region_graph": {
+            "view_calls": stats.region_graph_view_calls,
+            "bfs_fallback_calls": stats.region_graph_fallback_calls,
+            "region_traversals": stats.region_graph_region_traversals,
+            "portal_traversals": stats.region_graph_portal_traversals,
+        },
         "structural_hash": {
             "calls": stats.structural_hash_calls,
             "ns": stats.structural_hash_ns,
@@ -2809,6 +2819,35 @@ struct ConnectivityFloor {
     // Profile-only identity. It is interned from the exact static topology
     // (including block-index layout) and is otherwise just zero.
     topology_id: usize,
+    region_graph: Option<StaticRegionGraph>,
+}
+
+#[derive(Clone)]
+struct StaticRegion {
+    representative: usize,
+    portals: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct StaticPortal {
+    cell: usize,
+    blockers: Vec<usize>,
+    regions: Vec<usize>,
+    portals: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct StaticRegionGraph {
+    region_by_cell: Vec<usize>,
+    portal_by_cell: Vec<usize>,
+    regions: Vec<StaticRegion>,
+    portals: Vec<StaticPortal>,
+}
+
+struct RegionReach {
+    regions: Vec<bool>,
+    portals: Vec<bool>,
+    representative: usize,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2822,6 +2861,7 @@ struct TopologyDescriptor {
 struct ConnectivityIndex {
     floors: HashMap<String, ConnectivityFloor>,
     reversible: Vec<Option<usize>>,
+    region_graph_safe: bool,
     // Compiled from the exact blocked predicate in local_reachable_inner.
     // Slot ordering is stable for this parsed world and excludes consumed
     // state that can never affect passability (notably shop/terrain slots).
@@ -3098,6 +3138,205 @@ fn reversible_transition_partner(index: usize, blocks: &[SolverBlock]) -> Option
     (reverse.len() == 1 && reverse[0] == index).then_some(partner)
 }
 
+fn connectivity_neighbors(width: usize, height: usize, cell: usize) -> impl Iterator<Item = usize> {
+    let x = cell % width;
+    let y = cell / width;
+    [(0_i64, -1_i64), (-1, 0), (1, 0), (0, 1)]
+        .into_iter()
+        .filter_map(move |(dx, dy)| {
+            let nx = i64::try_from(x).ok()?.checked_add(dx)?;
+            let ny = i64::try_from(y).ok()?.checked_add(dy)?;
+            let (nx, ny) = (usize::try_from(nx).ok()?, usize::try_from(ny).ok()?);
+            (nx < width && ny < height).then_some(ny * width + nx)
+        })
+}
+
+impl StaticRegionGraph {
+    fn compile(floor: &ConnectivityFloor, blocks: &[SolverBlock]) -> Option<Self> {
+        if floor.width == 0
+            || floor.height == 0
+            || floor.width.checked_mul(floor.height)? != floor.cells.len()
+            || floor.blocks_by_cell.len() != floor.cells.len()
+        {
+            return None;
+        }
+        let barrier = |cell: usize| {
+            floor.blocks_by_cell[cell].iter().any(|&index| {
+                blocks
+                    .get(index)
+                    .is_none_or(|block| block.kind != "terrain" && block.kind != "shop")
+            })
+        };
+        let mut region_by_cell = vec![usize::MAX; floor.cells.len()];
+        let mut regions = Vec::<StaticRegion>::new();
+        for seed in 0..floor.cells.len() {
+            if !floor.cells[seed] || barrier(seed) || region_by_cell[seed] != usize::MAX {
+                continue;
+            }
+            let region = regions.len();
+            let mut representative = seed;
+            region_by_cell[seed] = region;
+            let mut queue = VecDeque::from([seed]);
+            while let Some(cell) = queue.pop_front() {
+                representative = representative.min(cell);
+                for next in connectivity_neighbors(floor.width, floor.height, cell) {
+                    if floor.cells[next] && !barrier(next) && region_by_cell[next] == usize::MAX {
+                        region_by_cell[next] = region;
+                        queue.push_back(next);
+                    }
+                }
+            }
+            regions.push(StaticRegion {
+                representative,
+                portals: Vec::new(),
+            });
+        }
+
+        let mut portal_by_cell = vec![usize::MAX; floor.cells.len()];
+        let mut portals = Vec::<StaticPortal>::new();
+        for cell in 0..floor.cells.len() {
+            if !floor.cells[cell] || !barrier(cell) {
+                continue;
+            }
+            let blockers = floor.blocks_by_cell[cell]
+                .iter()
+                .copied()
+                .filter(|&index| {
+                    blocks
+                        .get(index)
+                        .is_none_or(|block| block.kind != "terrain" && block.kind != "shop")
+                })
+                .collect();
+            portal_by_cell[cell] = portals.len();
+            portals.push(StaticPortal {
+                cell,
+                blockers,
+                regions: Vec::new(),
+                portals: Vec::new(),
+            });
+        }
+        for portal_index in 0..portals.len() {
+            let cell = portals[portal_index].cell;
+            for next in connectivity_neighbors(floor.width, floor.height, cell) {
+                if !floor.cells[next] {
+                    continue;
+                }
+                let region = region_by_cell[next];
+                if region != usize::MAX {
+                    if !portals[portal_index].regions.contains(&region) {
+                        portals[portal_index].regions.push(region);
+                    }
+                    if !regions[region].portals.contains(&portal_index) {
+                        regions[region].portals.push(portal_index);
+                    }
+                } else {
+                    let neighbor_portal = portal_by_cell[next];
+                    if neighbor_portal != usize::MAX
+                        && !portals[portal_index].portals.contains(&neighbor_portal)
+                    {
+                        portals[portal_index].portals.push(neighbor_portal);
+                    }
+                }
+            }
+        }
+        Some(Self {
+            region_by_cell,
+            portal_by_cell,
+            regions,
+            portals,
+        })
+    }
+
+    fn portal_open(&self, portal: usize, state: &SolverState, blocks: &[SolverBlock]) -> bool {
+        self.portals[portal].blockers.iter().all(|&index| {
+            blocks
+                .get(index)
+                .is_some_and(|block| block_is_consumed(state, block))
+        })
+    }
+
+    fn reachable(
+        &self,
+        floor: &ConnectivityFloor,
+        state: &SolverState,
+        start: (u64, u64),
+        blocks: &[SolverBlock],
+    ) -> Option<RegionReach> {
+        let (x, y) = (
+            usize::try_from(start.0).ok()?,
+            usize::try_from(start.1).ok()?,
+        );
+        if x >= floor.width || y >= floor.height {
+            return None;
+        }
+        let start = y * floor.width + x;
+        if !floor.cells.get(start).copied().unwrap_or(false) {
+            return None;
+        }
+        let mut reachable_regions = vec![false; self.regions.len()];
+        let mut reachable_portals = vec![false; self.portals.len()];
+        let mut queue = VecDeque::<(bool, usize)>::new();
+        let start_region = self.region_by_cell[start];
+        if start_region != usize::MAX {
+            reachable_regions[start_region] = true;
+            queue.push_back((false, start_region));
+        } else {
+            let start_portal = *self.portal_by_cell.get(start)?;
+            if start_portal == usize::MAX {
+                return None;
+            }
+            // The legacy BFS always admits its valid start cell, even if an
+            // active blocker occupies it. Preserve that exact entry behavior.
+            reachable_portals[start_portal] = true;
+            queue.push_back((true, start_portal));
+        }
+        let mut representative = start;
+        while let Some((is_portal, index)) = queue.pop_front() {
+            if is_portal {
+                profile_with_stats(|stats| stats.region_graph_portal_traversals += 1);
+                let portal = &self.portals[index];
+                representative = representative.min(portal.cell);
+                for &region in &portal.regions {
+                    if !reachable_regions[region] {
+                        reachable_regions[region] = true;
+                        queue.push_back((false, region));
+                    }
+                }
+                for &neighbor in &portal.portals {
+                    if !reachable_portals[neighbor] && self.portal_open(neighbor, state, blocks) {
+                        reachable_portals[neighbor] = true;
+                        queue.push_back((true, neighbor));
+                    }
+                }
+            } else {
+                profile_with_stats(|stats| stats.region_graph_region_traversals += 1);
+                let region = &self.regions[index];
+                representative = representative.min(region.representative);
+                for &portal in &region.portals {
+                    if !reachable_portals[portal] && self.portal_open(portal, state, blocks) {
+                        reachable_portals[portal] = true;
+                        queue.push_back((true, portal));
+                    }
+                }
+            }
+        }
+        Some(RegionReach {
+            regions: reachable_regions,
+            portals: reachable_portals,
+            representative,
+        })
+    }
+
+    fn contains(&self, reachable: &RegionReach, cell: usize) -> bool {
+        let region = self.region_by_cell.get(cell).copied().unwrap_or(usize::MAX);
+        if region != usize::MAX {
+            return reachable.regions.get(region).copied().unwrap_or(false);
+        }
+        let portal = self.portal_by_cell.get(cell).copied().unwrap_or(usize::MAX);
+        portal != usize::MAX && reachable.portals.get(portal).copied().unwrap_or(false)
+    }
+}
+
 impl ConnectivityIndex {
     fn new(floors: &HashMap<String, SolverFloor>, blocks: &[SolverBlock]) -> Self {
         let profile_topology = profiling_enabled();
@@ -3145,18 +3384,32 @@ impl ConnectivityIndex {
                 } else {
                     0
                 };
-                (
-                    id.clone(),
-                    ConnectivityFloor {
-                        width,
-                        height,
-                        cells,
-                        blocks_by_cell,
-                        topology_id,
-                    },
-                )
+                let mut indexed = ConnectivityFloor {
+                    width,
+                    height,
+                    cells,
+                    blocks_by_cell,
+                    topology_id,
+                    region_graph: None,
+                };
+                indexed.region_graph = StaticRegionGraph::compile(&indexed, blocks);
+                (id.clone(), indexed)
             })
-            .collect();
+            .collect::<HashMap<_, _>>();
+        let region_graph_safe = floors.values().all(|floor| floor.region_graph.is_some())
+            && blocks.iter().all(|block| {
+                matches!(
+                    block.kind.as_str(),
+                    "door"
+                        | "resource"
+                        | "enemy"
+                        | "transition"
+                        | "event"
+                        | "shop"
+                        | "opaque"
+                        | "terrain"
+                )
+            });
         let reversible = (0..blocks.len())
             .map(|index| reversible_transition_partner(index, blocks))
             .collect();
@@ -3172,6 +3425,7 @@ impl ConnectivityIndex {
         Self {
             floors,
             reversible,
+            region_graph_safe,
             passability_slots,
         }
     }
@@ -3299,6 +3553,165 @@ impl ConnectivityIndex {
                 .then_some((nx as u64, ny as u64))
             })
             .min()
+    }
+
+    fn adjacent_position_region(
+        floor: &ConnectivityFloor,
+        graph: &StaticRegionGraph,
+        reachable: &RegionReach,
+        x: u64,
+        y: u64,
+    ) -> Option<(u64, u64)> {
+        [(0_i64, -1_i64), (-1, 0), (1, 0), (0, 1)]
+            .into_iter()
+            .filter_map(|(dx, dy)| {
+                let nx = i64::try_from(x).ok()?.checked_add(dx)?;
+                let ny = i64::try_from(y).ok()?.checked_add(dy)?;
+                let (nx, ny) = (usize::try_from(nx).ok()?, usize::try_from(ny).ok()?);
+                (nx < floor.width
+                    && ny < floor.height
+                    && graph.contains(reachable, ny * floor.width + nx))
+                .then_some((nx as u64, ny as u64))
+            })
+            .min()
+    }
+
+    fn view_phase_a(
+        &self,
+        state: &SolverState,
+        floors: &HashMap<String, SolverFloor>,
+        blocks: &[SolverBlock],
+        terminals: &[(&str, (u64, u64))],
+    ) -> ConnectivityView {
+        let started = profile_start();
+        let result = if self.region_graph_safe {
+            profile_with_stats(|stats| stats.region_graph_view_calls += 1);
+            self.view_region_inner(state, floors, blocks, terminals)
+        } else {
+            profile_with_stats(|stats| stats.region_graph_fallback_calls += 1);
+            self.view_inner(state, floors, blocks, terminals, false)
+        };
+        profile_elapsed(started, |stats, nanos| {
+            stats.connectivity_view_calls += 1;
+            stats.connectivity_view_ns += nanos;
+        });
+        result
+    }
+
+    fn view_region_inner(
+        &self,
+        state: &SolverState,
+        floors: &HashMap<String, SolverFloor>,
+        blocks: &[SolverBlock],
+        terminals: &[(&str, (u64, u64))],
+    ) -> ConnectivityView {
+        let mut queue = VecDeque::from([(state.floor.clone(), (state.x, state.y))]);
+        let mut components = HashSet::<(String, usize)>::new();
+        let mut boundary_seen = HashSet::new();
+        let mut boundaries = Vec::new();
+        let mut shops = HashMap::new();
+        let mut terminal_seen = HashSet::new();
+        let mut reachable_terminals = Vec::new();
+        let mut representative = (state.floor.clone(), state.x, state.y);
+        while let Some((floor_id, entry)) = queue.pop_front() {
+            let Some(indexed_floor) = self.floors.get(&floor_id) else {
+                continue;
+            };
+            let Some(graph) = indexed_floor.region_graph.as_ref() else {
+                continue;
+            };
+            let Some(reachable) = graph.reachable(indexed_floor, state, entry, blocks) else {
+                continue;
+            };
+            if !components.insert((floor_id.clone(), reachable.representative)) {
+                continue;
+            }
+            let local_position = (
+                (reachable.representative % indexed_floor.width) as u64,
+                (reachable.representative / indexed_floor.width) as u64,
+            );
+            representative =
+                representative.min((floor_id.clone(), local_position.0, local_position.1));
+            for &(candidate_floor, position) in terminals {
+                if candidate_floor != floor_id {
+                    continue;
+                }
+                let (Ok(x), Ok(y)) = (usize::try_from(position.0), usize::try_from(position.1))
+                else {
+                    continue;
+                };
+                if x < indexed_floor.width
+                    && y < indexed_floor.height
+                    && graph.contains(&reachable, y * indexed_floor.width + x)
+                    && terminal_seen.insert((floor_id.clone(), position))
+                {
+                    reachable_terminals.push(ReachTerminal {
+                        floor: floor_id.clone(),
+                        position,
+                        navigation: Vec::new(),
+                    });
+                }
+            }
+            for &index in floors
+                .get(&floor_id)
+                .into_iter()
+                .flat_map(|floor| &floor.blocks)
+            {
+                let block = &blocks[index];
+                if block_is_consumed(state, block)
+                    || block.kind == "opaque"
+                    || block.kind == "terrain"
+                {
+                    continue;
+                }
+                let Some(adjacent) = Self::adjacent_position_region(
+                    indexed_floor,
+                    graph,
+                    &reachable,
+                    block.x,
+                    block.y,
+                ) else {
+                    continue;
+                };
+                if block.kind == "transition" && self.reversible[index].is_some() {
+                    if let Some((target_floor, target_x, target_y)) = transition_target(block) {
+                        queue.push_back((target_floor, (target_x, target_y)));
+                    }
+                    continue;
+                }
+                if block.kind == "shop" {
+                    if let CompiledBlockRule::Shop { shop_id, .. } = compiled_rule(block) {
+                        shops.entry(shop_id.clone()).or_insert_with(|| ReachShop {
+                            block_index: index,
+                            floor: floor_id.clone(),
+                            adjacent,
+                            navigation: Vec::new(),
+                        });
+                    }
+                    continue;
+                }
+                if boundary_seen.insert(index) {
+                    boundaries.push(ReachBoundary {
+                        index,
+                        adjacent,
+                        navigation: Vec::new(),
+                    });
+                }
+            }
+        }
+        reachable_terminals.sort_by(|left, right| {
+            left.floor
+                .cmp(&right.floor)
+                .then_with(|| left.position.0.cmp(&right.position.0))
+                .then_with(|| left.position.1.cmp(&right.position.1))
+                .then_with(|| left.navigation.cmp(&right.navigation))
+        });
+        ConnectivityView {
+            representative,
+            boundaries,
+            shops,
+            terminals: reachable_terminals,
+        }
     }
 
     fn view(
@@ -4768,7 +5181,7 @@ fn run_numeric_proof_with_stale_skip(
     // supplies the first FIFO actions. No second representative-only scan is
     // needed anywhere in Phase A.
     let mut initial = initial.clone();
-    let initial_view = connectivity.view(&initial, floors, blocks, terminals, false);
+    let initial_view = connectivity.view_phase_a(&initial, floors, blocks, terminals);
     (initial.floor, initial.x, initial.y) = initial_view.representative.clone();
     if let Some(initial_id) = store.accept(initial.clone()) {
         #[cfg(test)]
@@ -4830,7 +5243,7 @@ fn run_numeric_proof_with_stale_skip(
         // A successful candidate performs exactly one connectivity scan. Its
         // representative is reused for canonicalization, terminal detection,
         // and the next batch of compact FIFO actions.
-        let view = connectivity.view(&candidate.state, floors, blocks, terminals, false);
+        let view = connectivity.view_phase_a(&candidate.state, floors, blocks, terminals);
         (candidate.state.floor, candidate.state.x, candidate.state.y) = view.representative.clone();
         if let Some(label_id) = store.accept(candidate.state.clone()) {
             let node = candidate.state;
@@ -7242,6 +7655,175 @@ mod tests {
             cells: (0..width).map(|x| (x, 0)).collect(),
             blocks,
         }
+    }
+
+    fn assert_connectivity_views_equal(actual: &ConnectivityView, oracle: &ConnectivityView) {
+        assert_eq!(actual.representative, oracle.representative);
+        assert_eq!(
+            actual
+                .boundaries
+                .iter()
+                .map(|item| (item.index, item.adjacent, item.navigation.clone()))
+                .collect::<Vec<_>>(),
+            oracle
+                .boundaries
+                .iter()
+                .map(|item| (item.index, item.adjacent, item.navigation.clone()))
+                .collect::<Vec<_>>()
+        );
+        let shops = |view: &ConnectivityView| {
+            let mut values = view
+                .shops
+                .iter()
+                .map(|(id, shop)| {
+                    (
+                        id.clone(),
+                        shop.block_index,
+                        shop.floor.clone(),
+                        shop.adjacent,
+                        shop.navigation.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            values.sort();
+            values
+        };
+        assert_eq!(shops(actual), shops(oracle));
+        let terminals = |view: &ConnectivityView| {
+            view.terminals
+                .iter()
+                .map(|terminal| {
+                    (
+                        terminal.floor.clone(),
+                        terminal.position,
+                        terminal.navigation.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(terminals(actual), terminals(oracle));
+    }
+
+    #[test]
+    fn region_graph_matches_uncached_bfs_for_dynamic_portals_and_candidate_order() {
+        let mut blocks = vec![
+            SolverBlock {
+                floor: "F".into(),
+                x: 1,
+                y: 0,
+                id: "door".into(),
+                kind: "door".into(),
+                data: json!({"key_cost":{"yellow":1}}),
+                state_slot: Some(0),
+                ..SolverBlock::fixture_defaults()
+            },
+            SolverBlock {
+                floor: "F".into(),
+                x: 3,
+                y: 0,
+                id: "resource".into(),
+                kind: "resource".into(),
+                data: json!({"delta":{}}),
+                state_slot: Some(1),
+                ..SolverBlock::fixture_defaults()
+            },
+            SolverBlock {
+                floor: "F".into(),
+                x: 5,
+                y: 0,
+                id: "event".into(),
+                kind: "event".into(),
+                data: json!({"event":{"id":"dialogue_once"}}),
+                state_slot: Some(2),
+                ..SolverBlock::fixture_defaults()
+            },
+            SolverBlock {
+                floor: "F".into(),
+                x: 6,
+                y: 0,
+                id: "dynamic-wall".into(),
+                kind: "opaque".into(),
+                data: json!({"initial_active":false}),
+                initial_active: false,
+                state_slot: Some(3),
+                ..SolverBlock::fixture_defaults()
+            },
+            transition_block("F", 7, "up", "G", 0),
+            transition_block("G", 0, "down", "F", 6),
+            SolverBlock {
+                floor: "G".into(),
+                x: 2,
+                y: 0,
+                id: "remote-shop".into(),
+                kind: "shop".into(),
+                data: json!({"shop_id":"remote-shop"}),
+                ..SolverBlock::fixture_defaults()
+            },
+            SolverBlock {
+                floor: "G".into(),
+                x: 3,
+                y: 0,
+                id: "remote-enemy".into(),
+                kind: "enemy".into(),
+                data: json!({"enemy":{"hp":1,"attack":1,"defense":0,"gold":0,"experience":0}}),
+                state_slot: Some(4),
+                ..SolverBlock::fixture_defaults()
+            },
+        ];
+        // Keep the dynamic wall initially absent, while enumerating later
+        // event activation and ordinary consumed/unconsumed portal states.
+        blocks[3].initial_active = false;
+        let floors = HashMap::from([
+            ("F".into(), indexed_floor(8, vec![0, 1, 2, 3, 4])),
+            ("G".into(), indexed_floor(4, vec![5, 6, 7])),
+        ]);
+        let connectivity = ConnectivityIndex::new(&floors, &blocks);
+        assert!(connectivity.region_graph_safe);
+        for mask in 0_u64..32 {
+            let mut state = terminal_node(10, 10, 100, "region-differential");
+            state.floor = "F".into();
+            state.x = 0;
+            state.y = 0;
+            state.consumed = ConsumedBits::from_bools(
+                &(0..5).map(|bit| mask & (1 << bit) != 0).collect::<Vec<_>>(),
+            );
+            let terminals = [("F", (7, 0)), ("G", (1, 0))];
+            let graph = connectivity.view_phase_a(&state, &floors, &blocks, &terminals);
+            let bfs = connectivity.view(&state, &floors, &blocks, &terminals, false);
+            assert_connectivity_views_equal(&graph, &bfs);
+        }
+    }
+
+    #[test]
+    fn unsafe_region_graph_model_falls_back_to_exact_bfs() {
+        let blocks = vec![SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "future-rule".into(),
+            // This is the wire-level unknown kind: compilation rejects it,
+            // and the connectivity builder must therefore fail closed for
+            // the complete Phase-A view rather than using the static graph.
+            kind: "future_rule".into(),
+            data: json!({"kind":"future_rule"}),
+            state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
+        }];
+        assert_eq!(
+            compile_block_rule("future_rule", &blocks[0].data).unwrap_err(),
+            "block_kind_unsupported"
+        );
+        let floors = HashMap::from([("F".into(), indexed_floor(3, vec![0]))]);
+        let connectivity = ConnectivityIndex::new(&floors, &blocks);
+        assert!(!connectivity.region_graph_safe);
+        let mut state = terminal_node(10, 10, 100, "fallback");
+        state.floor = "F".into();
+        state.x = 0;
+        state.y = 0;
+        state.consumed = ConsumedBits::from_bools(&[false]);
+        let graph_entry = connectivity.view_phase_a(&state, &floors, &blocks, &[("F", (2, 0))]);
+        let bfs = connectivity.view(&state, &floors, &blocks, &[("F", (2, 0))], false);
+        assert_connectivity_views_equal(&graph_entry, &bfs);
     }
 
     #[test]
