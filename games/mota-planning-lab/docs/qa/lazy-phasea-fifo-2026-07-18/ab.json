@@ -1,0 +1,52 @@
+{
+  "schema": "mota-phasea-fifo-ab-v1",
+  "request": {
+    "sha256": "508b4d25557b0c30b649d5e923a5ec9fa3470dc8555d8d49e3dcb9bad98ba55e",
+    "bytes": 2576604,
+    "path": "/private/tmp/mota-structural-label-ab-evidence/request.json"
+  },
+  "versions": {
+    "A": "d899a8f",
+    "B": "working-tree Phase A lazy compact FIFO"
+  },
+  "binary_sha256": {
+    "A": "5d979ed4a64219d755a14f42ec50d8dceb13c19750de5f0179f296801c7d4674",
+    "B": "7a7f192d736033a6b6dcd629b8f05738e1e3782f397b4c62451d2a26b605315a"
+  },
+  "method": {
+    "warmups_per_version": 1,
+    "official_samples_per_version": 7,
+    "order": "A,B,A,B,A,B,A,B,A,B,A,B,A,B",
+    "request": "pure POST /cycle",
+    "rss": "service PID sampled every 10ms",
+    "canonical_response": "jq -cS del(.shadow.cycle)"
+  },
+  "results": {
+    "A": {
+      "median_post_ms": 4266.899,
+      "max_rss_bytes": 84541440
+    },
+    "B": {
+      "median_post_ms": 2429.033,
+      "max_rss_bytes": 53280768
+    }
+  },
+  "response_check": {
+    "canonical_sha256": "ee12e3be79bed591eece9b5a4f4aac787d0e771a7352fcbe0852787b110e4e8a",
+    "status": 200,
+    "proof": "unproven",
+    "reason": "search_budget_exhausted",
+    "explored_states": 50000,
+    "phase_b_explored": 0
+  },
+  "profile": {
+    "accepted": 50000,
+    "expanded": 50000,
+    "rejected": 147187,
+    "pending": 315033,
+    "representative_calls": 0,
+    "raw_log": "{\"address\":\"127.0.0.1:19085\",\"event\":\"ready\"}\nPHASE_A_PROFILE accepted=50000 expanded=50000 rejected=147187 pending=315033 representative_calls=0\n"
+  },
+  "raw_samples_tsv": "1\tA\t200\t4.232359\t82560\tee12e3be79bed591eece9b5a4f4aac787d0e771a7352fcbe0852787b110e4e8a\tnull\t:null\n2\tB\t200\t2.389596\t50992\tee12e3be79bed591eece9b5a4f4aac787d0e771a7352fcbe0852787b110e4e8a\tnull\t:null\n3\tA\t200\t4.227212\t76688\tee12e3be79bed591eece9b5a4f4aac787d0e771a7352fcbe0852787b110e4e8a\tnull\t:null\n4\tB\t200\t2.430872\t51200\tee12e3be79bed591eece9b5a4f4aac787d0e771a7352fcbe0852787b110e4e8a\tnull\t:null\n5\tA\t200\t4.266899\t81184\tee12e3be79bed591eece9b5a4f4aac787d0e771a7352fcbe0852787b110e4e8a\tnull\t:null\n6\tB\t200\t2.403941\t51200\tee12e3be79bed591eece9b5a4f4aac787d0e771a7352fcbe0852787b110e4e8a\tnull\t:null\n7\tA\t200\t4.336775\t81216\tee12e3be79bed591eece9b5a4f4aac787d0e771a7352fcbe0852787b110e4e8a\tnull\t:null\n8\tB\t200\t2.423259\t51216\tee12e3be79bed591eece9b5a4f4aac787d0e771a7352fcbe0852787b110e4e8a\tnull\t:null\n9\tA\t200\t4.253118\t79296\tee12e3be79bed591eece9b5a4f4aac787d0e771a7352fcbe0852787b110e4e8a\tnull\t:null\n10\tB\t200\t2.510636\t51248\tee12e3be79bed591eece9b5a4f4aac787d0e771a7352fcbe0852787b110e4e8a\tnull\t:null\n11\tA\t200\t4.640033\t82032\tee12e3be79bed591eece9b5a4f4aac787d0e771a7352fcbe0852787b110e4e8a\tnull\t:null\n12\tB\t200\t2.440990\t51936\tee12e3be79bed591eece9b5a4f4aac787d0e771a7352fcbe0852787b110e4e8a\tnull\t:null\n13\tA\t200\t4.344482\t82048\tee12e3be79bed591eece9b5a4f4aac787d0e771a7352fcbe0852787b110e4e8a\tnull\t:null\n14\tB\t200\t2.429033\t52032\tee12e3be79bed591eece9b5a4f4aac787d0e771a7352fcbe0852787b110e4e8a\tnull\t:null\n",
+  "official_samples_path": "/private/tmp/mota-phasea-fifo-ab-official.tsv"
+}

@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 #[cfg(test)]
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::env;
@@ -25,6 +25,8 @@ thread_local! {
     static PHASE2_CALLS: Cell<usize> = const { Cell::new(0) };
     static PHASE_A_DROPPED: Cell<bool> = const { Cell::new(false) };
     static PHASE2_SAW_PHASE_A_DROPPED: Cell<bool> = const { Cell::new(false) };
+    // Test-only semantic evidence: it never crosses the shadow protocol.
+    static PHASE_A_ACCEPTED_TRACE: RefCell<Vec<SolverState>> = const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Default)]
@@ -912,6 +914,7 @@ impl PhaseALabelStore {
         Some(node.with_resources(&label.resources))
     }
 
+    #[cfg(test)]
     fn is_stale(&self, id: LabelId) -> bool {
         self.labels
             .get(id.0)
@@ -1049,6 +1052,133 @@ enum PendingAction {
         floor: String,
         adjacent: (u64, u64),
     },
+}
+
+// Phase A does not need a route witness. Keep its pending work to integer
+// references only: a source label plus one stable block/shop action and the
+// reachable cell adjacent to it. The high bit distinguishes static shop
+// indexes from block indexes, leaving no String, navigation vector, or cloned
+// SolverState in the FIFO.
+const PHASE_A_SHOP_ACTION: u32 = 1 << 31;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PhaseAActionRef {
+    tagged_index: u32,
+    choice_index: u32,
+    adjacent_x: u32,
+    adjacent_y: u32,
+    shop_block_index: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PhaseAWorkItem {
+    source_label: u32,
+    action: PhaseAActionRef,
+}
+
+impl PhaseAActionRef {
+    fn block(boundary: &ReachBoundary) -> Option<Self> {
+        let index = u32::try_from(boundary.index).ok()?;
+        (index < PHASE_A_SHOP_ACTION).then_some(Self {
+            tagged_index: index,
+            choice_index: 0,
+            adjacent_x: u32::try_from(boundary.adjacent.0).ok()?,
+            adjacent_y: u32::try_from(boundary.adjacent.1).ok()?,
+            shop_block_index: 0,
+        })
+    }
+
+    fn shop(shop_index: usize, choice_index: usize, shop: &ReachShop) -> Option<Self> {
+        let shop_index = u32::try_from(shop_index).ok()?;
+        (shop_index < PHASE_A_SHOP_ACTION).then_some(Self {
+            tagged_index: PHASE_A_SHOP_ACTION | shop_index,
+            choice_index: u32::try_from(choice_index).ok()?,
+            adjacent_x: u32::try_from(shop.adjacent.0).ok()?,
+            adjacent_y: u32::try_from(shop.adjacent.1).ok()?,
+            shop_block_index: u32::try_from(shop.block_index).ok()?,
+        })
+    }
+
+    fn pending_action(self, blocks: &[SolverBlock], shops: &[Value]) -> Option<PendingAction> {
+        let adjacent = (u64::from(self.adjacent_x), u64::from(self.adjacent_y));
+        if self.tagged_index & PHASE_A_SHOP_ACTION == 0 {
+            return Some(PendingAction::Block {
+                index: usize::try_from(self.tagged_index).ok()?,
+                adjacent,
+            });
+        }
+        let shop_index = usize::try_from(self.tagged_index & !PHASE_A_SHOP_ACTION).ok()?;
+        let choice_index = usize::try_from(self.choice_index).ok()?;
+        let shop_block = blocks.get(usize::try_from(self.shop_block_index).ok()?)?;
+        let shop_id = shops.get(shop_index)?.get("shop_id")?.as_str()?;
+        (shop_block.kind == "shop"
+            && shop_block.data.get("shop_id").and_then(Value::as_str) == Some(shop_id))
+        .then_some(PendingAction::Shop {
+            shop_index,
+            choice_index,
+            choice_offset: phase_a_shop_choice_offset(shops, shop_index)?,
+            floor: shop_block.floor.clone(),
+            adjacent,
+        })
+    }
+}
+
+impl PhaseAWorkItem {
+    fn new(source_label: LabelId, action: PhaseAActionRef) -> Option<Self> {
+        Some(Self {
+            source_label: u32::try_from(source_label.0).ok()?,
+            action,
+        })
+    }
+
+    fn source_label(self) -> Option<LabelId> {
+        Some(LabelId(usize::try_from(self.source_label).ok()?))
+    }
+}
+
+fn phase_a_shop_choice_offset(shops: &[Value], shop_index: usize) -> Option<usize> {
+    shops
+        .iter()
+        .take(shop_index)
+        .try_fold(0usize, |offset, shop| {
+            offset.checked_add(shop.get("choices")?.as_array()?.len())
+        })
+}
+
+fn enqueue_phase_a_actions(
+    queue: &mut VecDeque<PhaseAWorkItem>,
+    source_label: LabelId,
+    view: &ConnectivityView,
+    shops: &[Value],
+) {
+    for boundary in &view.boundaries {
+        if let Some(action) = PhaseAActionRef::block(boundary)
+            && let Some(item) = PhaseAWorkItem::new(source_label, action)
+        {
+            queue.push_back(item);
+        }
+    }
+    for (shop_index, shop_value) in shops.iter().enumerate() {
+        let Some(shop_id) = shop_value.get("shop_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(shop) = view.shops.get(shop_id) else {
+            continue;
+        };
+        let choice_count = shop_value
+            .get("choices")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        for choice_index in 0..choice_count {
+            if let Some(action) = PhaseAActionRef::shop(shop_index, choice_index, shop)
+                && let Some(item) = PhaseAWorkItem::new(source_label, action)
+            {
+                queue.push_back(item);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1383,8 +1513,18 @@ struct ReachTerminal {
 struct ConnectivityView {
     representative: (String, u64, u64),
     boundaries: Vec<ReachBoundary>,
-    shops: HashMap<String, (String, (u64, u64), Vec<usize>)>,
+    shops: HashMap<String, ReachShop>,
     terminals: Vec<ReachTerminal>,
+}
+
+#[derive(Clone)]
+struct ReachShop {
+    // This is the stable solver-block index for the visible shop tile. Phase A
+    // carries it instead of a floor String in its compact work queue.
+    block_index: usize,
+    floor: String,
+    adjacent: (u64, u64),
+    navigation: Vec<usize>,
 }
 
 fn solver_u64(object: &serde_json::Map<String, Value>, name: &str) -> Result<u64, String> {
@@ -1790,7 +1930,12 @@ impl ConnectivityIndex {
                     if let Some(shop_id) = block.data.get("shop_id").and_then(Value::as_str) {
                         shops
                             .entry(shop_id.to_owned())
-                            .or_insert_with(|| (floor_id.clone(), adjacent, navigation.clone()));
+                            .or_insert_with(|| ReachShop {
+                                block_index: index,
+                                floor: floor_id.clone(),
+                                adjacent,
+                                navigation: navigation.clone(),
+                            });
                     }
                     continue;
                 }
@@ -1818,6 +1963,7 @@ impl ConnectivityIndex {
         }
     }
 
+    #[cfg(test)]
     // Canonical identity needs only the reachable-component representative.
     // Keep this separate from `view`: candidate admission must not allocate
     // boundaries, shops, terminals, or navigation vectors that are used only
@@ -2708,19 +2854,19 @@ fn extract_route_witness(
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            if let Some((floor, adjacent, navigation)) = view.shops.get(shop_id) {
+            if let Some(shop) = view.shops.get(shop_id) {
                 for choice_index in 0..choices.len() {
                     enqueue_phase2_action(
                         &mut queue,
                         &mut serial,
                         &node,
-                        navigation.clone(),
+                        shop.navigation.clone(),
                         PendingAction::Shop {
                             shop_index,
                             choice_index,
                             choice_offset,
-                            floor: floor.clone(),
-                            adjacent: *adjacent,
+                            floor: shop.floor.clone(),
+                            adjacent: shop.adjacent,
                         },
                         blocks,
                         shops,
@@ -2752,6 +2898,21 @@ struct PhaseAResult {
 }
 
 #[cfg(test)]
+fn clear_phase_a_accepted_trace() {
+    PHASE_A_ACCEPTED_TRACE.with(|trace| trace.borrow_mut().clear());
+}
+
+#[cfg(test)]
+fn record_phase_a_accepted(state: &SolverState) {
+    PHASE_A_ACCEPTED_TRACE.with(|trace| trace.borrow_mut().push(state.clone()));
+}
+
+#[cfg(test)]
+fn take_phase_a_accepted_trace() -> Vec<SolverState> {
+    PHASE_A_ACCEPTED_TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
+}
+
+#[cfg(test)]
 struct PhaseADropProbe;
 
 #[cfg(test)]
@@ -2778,94 +2939,96 @@ fn run_numeric_proof(
 ) -> PhaseAResult {
     #[cfg(test)]
     let _drop_probe = PhaseADropProbe;
+    #[cfg(test)]
+    clear_phase_a_accepted_trace();
     let mut store = PhaseALabelStore {
         structural_nodes: Vec::new(),
         structural_ids: HashMap::new(),
         labels: Vec::new(),
         frontiers: Vec::new(),
     };
-    let mut queue = VecDeque::<LabelId>::new();
-    let mut initial = initial.clone();
-    (initial.floor, initial.x, initial.y) = connectivity.representative(&initial, floors, blocks);
-    if let Some(initial_id) = store.accept(initial) {
-        queue.push_back(initial_id);
+    if max_states == 0 {
+        return PhaseAResult {
+            outcome: PhaseAOutcome::BudgetExhausted,
+            explored: 0,
+        };
     }
-    let mut explored = 0usize;
+    let mut queue = VecDeque::<PhaseAWorkItem>::new();
     let mut best: Option<NumericObjective> = None;
-    while let Some(label_id) = queue.pop_front() {
-        if store.is_stale(label_id) {
-            continue;
+
+    // The initial connectivity scan both canonicalizes its accepted label and
+    // supplies the first FIFO actions. No second representative-only scan is
+    // needed anywhere in Phase A.
+    let mut initial = initial.clone();
+    let initial_view = connectivity.view(&initial, floors, blocks, terminals, false);
+    (initial.floor, initial.x, initial.y) = initial_view.representative.clone();
+    if let Some(initial_id) = store.accept(initial.clone()) {
+        #[cfg(test)]
+        record_phase_a_accepted(&initial);
+        if !initial_view.terminals.is_empty() {
+            best = Some(NumericObjective::from_state(&initial));
         }
-        if explored >= max_states {
+        enqueue_phase_a_actions(&mut queue, initial_id, &initial_view, shops);
+        if store.labels.len() == max_states {
             return PhaseAResult {
-                outcome: PhaseAOutcome::BudgetExhausted,
-                explored,
+                outcome: if queue.is_empty() {
+                    PhaseAOutcome::Complete(best)
+                } else {
+                    PhaseAOutcome::BudgetExhausted
+                },
+                explored: store.labels.len(),
             };
         }
-        let node = store
-            .state_for(label_id)
-            .expect("accepted label must reference a structural node");
-        let view = connectivity.view(&node, floors, blocks, terminals, false);
-        explored += 1;
-        if !view.terminals.is_empty() {
-            let objective = NumericObjective::from_state(&node);
-            if best.is_none_or(|old| objective.cmp(old).is_gt()) {
-                best = Some(objective);
-            }
-        }
-        for boundary in view.boundaries {
-            let action = PendingAction::Block {
-                index: boundary.index,
-                adjacent: boundary.adjacent,
-            };
-            if let Some(mut candidate) =
-                materialize_pending_action(&node, action, blocks, shops, false)
-            {
-                (candidate.state.floor, candidate.state.x, candidate.state.y) =
-                    connectivity.representative(&candidate.state, floors, blocks);
-                if let Some(id) = store.accept(candidate.state) {
-                    queue.push_back(id);
+    }
+
+    while let Some(work_item) = queue.pop_front() {
+        // Labels are append-only. A dominated source stays addressable and its
+        // already-enqueued action remains part of FIFO semantics.
+        let Some(source_id) = work_item.source_label() else {
+            continue;
+        };
+        let Some(source) = store.state_for(source_id) else {
+            continue;
+        };
+        let Some(action) = work_item.action.pending_action(blocks, shops) else {
+            continue;
+        };
+        let Some(mut candidate) = materialize_pending_action(&source, action, blocks, shops, false)
+        else {
+            continue;
+        };
+        // A successful candidate performs exactly one connectivity scan. Its
+        // representative is reused for canonicalization, terminal detection,
+        // and the next batch of compact FIFO actions.
+        let view = connectivity.view(&candidate.state, floors, blocks, terminals, false);
+        (candidate.state.floor, candidate.state.x, candidate.state.y) = view.representative.clone();
+        if let Some(label_id) = store.accept(candidate.state.clone()) {
+            let node = candidate.state;
+            #[cfg(test)]
+            record_phase_a_accepted(&node);
+
+            if !view.terminals.is_empty() {
+                let objective = NumericObjective::from_state(&node);
+                if best.is_none_or(|old| objective.cmp(old).is_gt()) {
+                    best = Some(objective);
                 }
             }
-        }
-        let mut choice_offset = 0usize;
-        for (shop_index, shop) in shops.iter().enumerate() {
-            let shop_id = shop
-                .get("shop_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let accessible = view.shops.get(shop_id);
-            let choices = shop
-                .get("choices")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if let Some((shop_floor, adjacent, _navigation)) = accessible {
-                for local in 0..choices.len() {
-                    let action = PendingAction::Shop {
-                        shop_index,
-                        choice_index: local,
-                        choice_offset,
-                        floor: shop_floor.clone(),
-                        adjacent: *adjacent,
-                    };
-                    if let Some(mut candidate) =
-                        materialize_pending_action(&node, action, blocks, shops, false)
-                    {
-                        (candidate.state.floor, candidate.state.x, candidate.state.y) =
-                            connectivity.representative(&candidate.state, floors, blocks);
-                        if let Some(id) = store.accept(candidate.state) {
-                            queue.push_back(id);
-                        }
-                    }
-                }
+            enqueue_phase_a_actions(&mut queue, label_id, &view, shops);
+            if store.labels.len() == max_states {
+                return PhaseAResult {
+                    outcome: if queue.is_empty() {
+                        PhaseAOutcome::Complete(best)
+                    } else {
+                        PhaseAOutcome::BudgetExhausted
+                    },
+                    explored: store.labels.len(),
+                };
             }
-            choice_offset += choices.len();
         }
     }
     PhaseAResult {
         outcome: PhaseAOutcome::Complete(best),
-        explored,
+        explored: store.labels.len(),
     }
 }
 
@@ -3732,6 +3895,250 @@ mod tests {
     }
 
     #[test]
+    fn phase_a_work_items_are_compact_and_reject_narrowing_overflow() {
+        assert_eq!(std::mem::size_of::<PhaseAWorkItem>(), 24);
+        let boundary = ReachBoundary {
+            index: usize::MAX,
+            adjacent: (u64::MAX, 0),
+            navigation: Vec::new(),
+        };
+        assert!(PhaseAActionRef::block(&boundary).is_none());
+        let shop = ReachShop {
+            block_index: usize::MAX,
+            floor: "F".into(),
+            adjacent: (u64::MAX, 0),
+            navigation: Vec::new(),
+        };
+        assert!(PhaseAActionRef::shop(0, 0, &shop).is_none());
+        let safe = PhaseAActionRef {
+            tagged_index: 0,
+            choice_index: 0,
+            adjacent_x: 0,
+            adjacent_y: 0,
+            shop_block_index: 0,
+        };
+        assert!(PhaseAWorkItem::new(LabelId(usize::MAX), safe).is_none());
+    }
+
+    #[test]
+    fn stale_phase_a_work_source_remains_addressable() {
+        let mut store = empty_phase_a_store();
+        let stale = store.accept(terminal_node(1, 1, 1, "weak")).unwrap();
+        let stronger = store.accept(terminal_node(2, 1, 1, "strong")).unwrap();
+        assert!(store.is_stale(stale));
+        let item = PhaseAWorkItem::new(
+            stale,
+            PhaseAActionRef {
+                tagged_index: 0,
+                choice_index: 0,
+                adjacent_x: 0,
+                adjacent_y: 0,
+                shop_block_index: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(item.source_label(), Some(stale));
+        assert_eq!(
+            store.state_for(item.source_label().unwrap()),
+            store.state_for(stale)
+        );
+        assert!(!store.is_stale(stronger));
+    }
+
+    fn eager_phase_a_accepted_trace(
+        initial: &SolverState,
+        max_states: usize,
+        connectivity: &ConnectivityIndex,
+        floors: &HashMap<String, SolverFloor>,
+        blocks: &[SolverBlock],
+        terminals: &[(&str, (u64, u64))],
+        shops: &[Value],
+    ) -> Vec<SolverState> {
+        let mut store = empty_phase_a_store();
+        let mut queue = VecDeque::<LabelId>::new();
+        let mut trace = Vec::new();
+        let mut initial = initial.clone();
+        (initial.floor, initial.x, initial.y) =
+            connectivity.representative(&initial, floors, blocks);
+        if let Some(label_id) = store.accept(initial.clone()) {
+            trace.push(initial);
+            queue.push_back(label_id);
+        }
+        let mut expanded = 0usize;
+        while let Some(label_id) = queue.pop_front() {
+            if store.is_stale(label_id) || expanded >= max_states {
+                continue;
+            }
+            let node = store.state_for(label_id).unwrap();
+            let view = connectivity.view(&node, floors, blocks, terminals, false);
+            expanded += 1;
+            for boundary in view.boundaries {
+                if let Some(mut candidate) = materialize_pending_action(
+                    &node,
+                    PendingAction::Block {
+                        index: boundary.index,
+                        adjacent: boundary.adjacent,
+                    },
+                    blocks,
+                    shops,
+                    false,
+                ) {
+                    (candidate.state.floor, candidate.state.x, candidate.state.y) =
+                        connectivity.representative(&candidate.state, floors, blocks);
+                    if let Some(next) = store.accept(candidate.state.clone()) {
+                        trace.push(candidate.state);
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+        trace
+    }
+
+    #[test]
+    fn phase_a_compact_fifo_matches_eager_semantic_accepted_trace() {
+        let blocks = vec![
+            SolverBlock {
+                floor: "F".into(),
+                x: 1,
+                y: 0,
+                id: "first".into(),
+                kind: "resource".into(),
+                data: json!({"delta":{"hp":1,"attack":0,"defense":0,"gold":0,"experience":0,
+                    "keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}),
+                state_slot: Some(0),
+            },
+            SolverBlock {
+                floor: "F".into(),
+                x: 2,
+                y: 0,
+                id: "second".into(),
+                kind: "resource".into(),
+                data: json!({"delta":{"hp":0,"attack":1,"defense":0,"gold":0,"experience":0,
+                    "keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}),
+                state_slot: Some(1),
+            },
+        ];
+        let floors = HashMap::from([("F".into(), indexed_floor(3, vec![0, 1]))]);
+        let connectivity = ConnectivityIndex::new(&floors, &blocks);
+        let mut initial = terminal_node(1, 1, 10, "initial");
+        initial.consumed = ConsumedBits::from_bools(&[false, false]);
+        let expected = eager_phase_a_accepted_trace(
+            &initial,
+            16,
+            &connectivity,
+            &floors,
+            &blocks,
+            &[("F", (0, 0))],
+            &[],
+        );
+        let result = run_numeric_proof(
+            &initial,
+            16,
+            &connectivity,
+            &floors,
+            &blocks,
+            &[("F", (0, 0))],
+            &[],
+        );
+        assert!(matches!(result.outcome, PhaseAOutcome::Complete(_)));
+        assert_eq!(take_phase_a_accepted_trace(), expected);
+    }
+
+    #[test]
+    fn phase_a_work_items_keep_boundary_then_shop_choice_order() {
+        let view = ConnectivityView {
+            representative: ("F".into(), 0, 0),
+            boundaries: vec![
+                ReachBoundary {
+                    index: 7,
+                    adjacent: (1, 0),
+                    navigation: Vec::new(),
+                },
+                ReachBoundary {
+                    index: 3,
+                    adjacent: (0, 1),
+                    navigation: Vec::new(),
+                },
+            ],
+            shops: HashMap::from([(
+                "first".into(),
+                ReachShop {
+                    block_index: 9,
+                    floor: "F".into(),
+                    adjacent: (2, 0),
+                    navigation: Vec::new(),
+                },
+            )]),
+            terminals: Vec::new(),
+        };
+        let shops = vec![
+            json!({"shop_id":"first","choices":[{},{}]}),
+            json!({"shop_id":"unreachable","choices":[{}]}),
+        ];
+        let mut queue = VecDeque::new();
+        enqueue_phase_a_actions(&mut queue, LabelId(4), &view, &shops);
+        let trace: Vec<_> = queue
+            .into_iter()
+            .map(|item| {
+                (
+                    item.source_label,
+                    item.action.tagged_index,
+                    item.action.choice_index,
+                    item.action.shop_block_index,
+                )
+            })
+            .collect();
+        assert_eq!(
+            trace,
+            vec![
+                (4, 7, 0, 0),
+                (4, 3, 0, 0),
+                (4, PHASE_A_SHOP_ACTION, 0, 9),
+                (4, PHASE_A_SHOP_ACTION, 1, 9),
+            ]
+        );
+    }
+
+    #[test]
+    fn phase_a_maximum_accepted_label_reports_complete_or_exhausted_by_pending_work() {
+        let initial = terminal_node(1, 1, 10, "initial");
+        let no_blocks = Vec::new();
+        let no_successor_floors = HashMap::from([("F".into(), indexed_floor(1, Vec::new()))]);
+        let no_successor_index = ConnectivityIndex::new(&no_successor_floors, &no_blocks);
+        let complete = run_numeric_proof(
+            &initial,
+            1,
+            &no_successor_index,
+            &no_successor_floors,
+            &no_blocks,
+            &[("F", (0, 0))],
+            &[],
+        );
+        assert!(matches!(complete.outcome, PhaseAOutcome::Complete(_)));
+        assert_eq!(complete.explored, 1);
+
+        let blocks = vec![SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "successor".into(),
+            kind: "resource".into(),
+            data: json!({"delta":{"hp":1,"attack":0,"defense":0,"gold":0,"experience":0,
+                "keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}),
+            state_slot: Some(0),
+        }];
+        let floors = HashMap::from([("F".into(), indexed_floor(2, vec![0]))]);
+        let index = ConnectivityIndex::new(&floors, &blocks);
+        let mut initial = initial;
+        initial.consumed = ConsumedBits::from_bools(&[false]);
+        let exhausted =
+            run_numeric_proof(&initial, 1, &index, &floors, &blocks, &[("F", (0, 0))], &[]);
+        assert!(matches!(exhausted.outcome, PhaseAOutcome::BudgetExhausted));
+        assert_eq!(exhausted.explored, 1);
+    }
+
+    #[test]
     fn phase_a_labels_match_the_tiny_world_numeric_oracle_and_budget_status() {
         // two_terminal_routes has only the no-potion, +1-potion, +10-potion,
         // and both-potions terminal possibilities. Its independently enumerated
@@ -4023,8 +4430,8 @@ mod tests {
             vec![2]
         );
         assert_eq!(closed.boundaries[0].navigation.as_slice(), &[0]);
-        assert_eq!(closed.shops["remoteShop"].0, "B");
-        assert_eq!(closed.shops["remoteShop"].2.as_slice(), &[0]);
+        assert_eq!(closed.shops["remoteShop"].floor, "B");
+        assert_eq!(closed.shops["remoteShop"].navigation.as_slice(), &[0]);
         assert!(closed.terminals.is_empty());
 
         assert!(set_block_consumed(&mut state, &blocks[2], true));
