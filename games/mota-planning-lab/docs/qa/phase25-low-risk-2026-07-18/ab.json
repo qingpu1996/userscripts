@@ -1,0 +1,79 @@
+{
+  "schema": "mota-phase25-profile-v1",
+  "request": {
+    "sha256": "508b4d25557b0c30b649d5e923a5ec9fa3470dc8555d8d49e3dcb9bad98ba55e",
+    "bytes": 2576604
+  },
+  "versions": {
+    "A": {
+      "binary": "/private/tmp/mota-phase25-build/9608195/release/mota-shadow-runtime",
+      "binary_sha256": "9e5e9a076969c70d86660e078c8137eccf27512622451b13b20647e0df140927",
+      "source": "/private/tmp/mota-phase25-source/9608195/shadow-runtime/src/main.rs",
+      "source_sha256": "217d8aaf938b78d9d9f7286565481a59a2924a52a30f2148d351f9e1b117777a"
+    },
+    "B": {
+      "binary": "/private/tmp/mota-phase25-build/phase25-current/release/mota-shadow-runtime",
+      "binary_sha256": "c3165c12b1c673a085348e5bcfadef5ecc5b6c66ed78016fe6a947fb1a9d0e86",
+      "source": "/Users/nihplod/Documents/codes/frontend/scripts/userscripts/games/mota-planning-lab/rust/shadow-runtime/src/main.rs",
+      "source_sha256": "205c0645828fb4d6e99d79918e82de15b0a320cd98ca2c6d75f0d43286a2c5e8"
+    }
+  },
+  "method": {
+    "warmups_per_version": 1,
+    "official_samples_per_version": 10,
+    "order": [
+      "A",
+      "B",
+      "A",
+      "B",
+      "A",
+      "B",
+      "A",
+      "B",
+      "A",
+      "B",
+      "A",
+      "B",
+      "A",
+      "B",
+      "A",
+      "B",
+      "A",
+      "B",
+      "A",
+      "B"
+    ],
+    "request": "pure POST /cycle",
+    "rss": "service PID sampled every 10 ms",
+    "canonical_response": "sorted JSON with shadow.cycle removed"
+  },
+  "results": {
+    "A": {
+      "median_post_ms": 1476.2439993210137,
+      "p95_post_ms": 1576.789362495765,
+      "max_post_ms": 1590.234125033021,
+      "median_rss_bytes": 51830784.0,
+      "p95_rss_bytes": 67318579.19999999,
+      "max_rss_bytes": 71417856,
+      "canonical_response_hashes": [
+        "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2"
+      ]
+    },
+    "B": {
+      "median_post_ms": 1411.8803963065147,
+      "p95_post_ms": 1495.992102008313,
+      "max_post_ms": 1539.748958311975,
+      "median_rss_bytes": 50094080.0,
+      "p95_rss_bytes": 50135040.0,
+      "max_rss_bytes": 50135040,
+      "canonical_response_hashes": [
+        "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2"
+      ]
+    }
+  },
+  "profile_events": {
+    "A": [],
+    "B": []
+  },
+  "raw_samples_tsv": "/private/tmp/mota-phase25-profile-9608195-off/samples.tsv"
+}

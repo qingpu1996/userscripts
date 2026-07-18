@@ -304,6 +304,7 @@ thread_local! {
     static PHASE2_CALLS: Cell<usize> = const { Cell::new(0) };
     static PHASE_A_DROPPED: Cell<bool> = const { Cell::new(false) };
     static PHASE2_SAW_PHASE_A_DROPPED: Cell<bool> = const { Cell::new(false) };
+    static MATERIALIZE_SOURCE_CLONES: Cell<usize> = const { Cell::new(0) };
     // Test-only semantic evidence: it never crosses the shadow protocol.
     static PHASE_A_ACCEPTED_TRACE: RefCell<Vec<SolverState>> = const { RefCell::new(Vec::new()) };
 }
@@ -1170,8 +1171,11 @@ impl PhaseALabelStore {
         hash
     }
 
-    fn find_structural(&self, node: &StructuralNode) -> Option<StructuralNodeId> {
-        let hash = Self::structural_hash(node);
+    fn find_structural_with_hash(
+        &self,
+        node: &StructuralNode,
+        hash: u64,
+    ) -> Option<StructuralNodeId> {
         self.structural_ids.get(&hash).and_then(|ids| {
             ids.iter().copied().find(|id| {
                 profile_with_stats(|stats| stats.structural_equality_checks += 1);
@@ -1182,16 +1186,28 @@ impl PhaseALabelStore {
         })
     }
 
-    fn intern_structural(&mut self, node: StructuralNode) -> StructuralNodeId {
-        if let Some(id) = self.find_structural(&node) {
-            return id;
-        }
-        let hash = Self::structural_hash(&node);
+    #[allow(dead_code)]
+    fn find_structural(&self, node: &StructuralNode) -> Option<StructuralNodeId> {
+        let hash = Self::structural_hash(node);
+        self.find_structural_with_hash(node, hash)
+    }
+
+    fn insert_structural_with_hash(&mut self, node: StructuralNode, hash: u64) -> StructuralNodeId {
         let id = StructuralNodeId(self.structural_nodes.len());
         self.structural_nodes.push(node);
         self.frontiers.push(Vec::new());
         self.structural_ids.entry(hash).or_default().push(id);
         id
+    }
+
+    fn intern_structural(&mut self, node: StructuralNode) -> StructuralNodeId {
+        // Hash once for both lookup and insertion. Equality remains the final
+        // authority when a hash bucket contains collisions.
+        let hash = Self::structural_hash(&node);
+        if let Some(id) = self.find_structural_with_hash(&node, hash) {
+            return id;
+        }
+        self.insert_structural_with_hash(node, hash)
     }
 
     fn state_for(&self, id: LabelId) -> Option<SolverState> {
@@ -1208,53 +1224,55 @@ impl PhaseALabelStore {
             .unwrap_or(true)
     }
 
-    fn frontier_accepts(&self, structural_id: StructuralNodeId, resources: &ResourceLabel) -> bool {
-        let started = profile_start();
-        let result = self
-            .frontiers
-            .get(structural_id.0)
-            .into_iter()
-            .flatten()
-            .all(|id| {
-                profile_with_stats(|stats| stats.frontier_comparisons += 1);
-                self.labels
-                    .get(id.0)
-                    .is_none_or(|label| !label.resources.dominates(resources))
-            });
-        profile_elapsed(started, |stats, nanos| stats.frontier_ns += nanos);
-        result
-    }
-
-    fn stale_dominated_labels(
+    // The frontier invariant is that no two live entries dominate one another.
+    // A single stable-order pass can therefore reject a candidate before any
+    // mutation, or compact/stale every entry dominated by an accepted
+    // candidate. This keeps stale IDs addressable while avoiding the old
+    // reject scan plus dominated-label scan.
+    fn admit_frontier(
         &mut self,
         structural_id: StructuralNodeId,
         resources: &ResourceLabel,
-    ) {
+    ) -> bool {
         let started = profile_start();
-        let dominated: Vec<LabelId> = self
+        let frontier = self
             .frontiers
-            .get(structural_id.0)
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|id| {
-                profile_with_stats(|stats| stats.frontier_comparisons += 1);
-                self.labels
-                    .get(id.0)
-                    .is_some_and(|label| resources.dominates(&label.resources))
-            })
-            .collect();
-        for id in dominated {
-            if let Some(label) = self.labels.get_mut(id.0) {
-                label.stale = true;
-            }
-        }
-        let labels = &self.labels;
-        self.frontiers
             .get_mut(structural_id.0)
-            .expect("interned structural ID must have a frontier slot")
-            .retain(|id| labels.get(id.0).is_some_and(|label| !label.stale));
+            .expect("interned structural ID must have a frontier slot");
+        let mut write = 0;
+        let mut accepted = true;
+        let mut index = 0;
+        while index < frontier.len() {
+            let id = frontier[index];
+            profile_with_stats(|stats| stats.frontier_comparisons += 1);
+            let Some(label) = self.labels.get(id.0) else {
+                index += 1;
+                continue;
+            };
+            if label.resources.dominates(resources) {
+                // Existing frontiers are maintained without dominance pairs;
+                // seeing a dominator means rejection and must leave the
+                // frontier untouched. In a valid frontier this branch occurs
+                // before any candidate-dominated entry.
+                debug_assert_eq!(write, index);
+                accepted = false;
+                break;
+            }
+            if resources.dominates(&label.resources) {
+                if let Some(label) = self.labels.get_mut(id.0) {
+                    label.stale = true;
+                }
+            } else {
+                frontier[write] = id;
+                write += 1;
+            }
+            index += 1;
+        }
+        if accepted {
+            frontier.truncate(write);
+        }
         profile_elapsed(started, |stats, nanos| stats.frontier_ns += nanos);
+        accepted
     }
 
     // Equality is intentionally covered here: `dominates` is reflexive, so a
@@ -1262,10 +1280,9 @@ impl PhaseALabelStore {
     fn accept(&mut self, state: SolverState) -> Option<LabelId> {
         let structural_id = self.intern_structural(StructuralNode::from_state(&state));
         let resources = ResourceLabel::from_state(&state);
-        if !self.frontier_accepts(structural_id, &resources) {
+        if !self.admit_frontier(structural_id, &resources) {
             return None;
         }
-        self.stale_dominated_labels(structural_id, &resources);
         let id = LabelId(self.labels.len());
         self.labels.push(PhaseALabel {
             structural_id,
@@ -2434,14 +2451,77 @@ fn add_delta(state: &mut SolverState, delta: &Value) -> Result<(), String> {
         state.blue += keys.get("blue").and_then(Value::as_u64).unwrap_or(0);
         state.red += keys.get("red").and_then(Value::as_u64).unwrap_or(0);
     }
-    let mut inventory: BTreeMap<String, u64> = state.inventory.iter().cloned().collect();
-    if let Some(items) = delta.get("inventory").and_then(Value::as_object) {
+    if let Some(items) = delta
+        .get("inventory")
+        .and_then(Value::as_object)
+        .filter(|items| !items.is_empty())
+    {
+        let mut inventory: BTreeMap<String, u64> = state.inventory.iter().cloned().collect();
         for (id, count) in items {
             *inventory.entry(id.clone()).or_default() += count.as_u64().unwrap_or(0);
         }
+        state.inventory = Arc::new(inventory.into_iter().collect());
     }
-    state.inventory = Arc::new(inventory.into_iter().collect());
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ShopEffectValues {
+    level: u64,
+    hp: F64Bits,
+    attack: F64Bits,
+    defense: F64Bits,
+    gold: u64,
+    experience: u64,
+    yellow: u64,
+    blue: u64,
+    red: u64,
+}
+
+impl ShopEffectValues {
+    fn from_state(state: &SolverState) -> Self {
+        Self {
+            level: state.level,
+            hp: state.hp,
+            attack: state.attack,
+            defense: state.defense,
+            gold: state.gold,
+            experience: state.experience,
+            yellow: state.yellow,
+            blue: state.blue,
+            red: state.red,
+        }
+    }
+
+    fn apply(&mut self, effect: &Value) -> Option<()> {
+        let field = effect["field"].as_str().unwrap_or_default();
+        let amount = effect["amount"].as_u64().unwrap_or(0);
+        match field {
+            "level" => self.level = self.level.saturating_add(amount),
+            "hp" => self.hp = self.hp.add(amount as f64)?,
+            "attack" => self.attack = self.attack.add(amount as f64)?,
+            "defense" => self.defense = self.defense.add(amount as f64)?,
+            "gold" => self.gold = self.gold.saturating_add(amount),
+            "experience" => self.experience = self.experience.saturating_add(amount),
+            "yellow" => self.yellow = self.yellow.saturating_add(amount),
+            "blue" => self.blue = self.blue.saturating_add(amount),
+            "red" => self.red = self.red.saturating_add(amount),
+            _ => return None,
+        }
+        Some(())
+    }
+
+    fn write_to(self, state: &mut SolverState) {
+        state.level = self.level;
+        state.hp = self.hp;
+        state.attack = self.attack;
+        state.defense = self.defense;
+        state.gold = self.gold;
+        state.experience = self.experience;
+        state.yellow = self.yellow;
+        state.blue = self.blue;
+        state.red = self.red;
+    }
 }
 
 fn enemy_loss(state: &SolverState, enemy: &Value) -> Option<f64> {
@@ -2721,6 +2801,13 @@ struct MaterializedCandidate {
     route_action: Option<RouteAction>,
 }
 
+#[inline]
+fn clone_materialize_source(source: &SolverState) -> SolverState {
+    #[cfg(test)]
+    MATERIALIZE_SOURCE_CLONES.with(|clones| clones.set(clones.get() + 1));
+    source.clone()
+}
+
 fn materialize_pending_action(
     source: &SolverState,
     pending_action: PendingAction,
@@ -2770,15 +2857,9 @@ fn materialize_pending_action_inner(
     shops: &[Value],
     record_route: bool,
 ) -> Option<MaterializedCandidate> {
-    let mut next = MaterializedCandidate {
-        state: source.clone(),
-        route_action: None,
-    };
     match pending_action {
         PendingAction::Block { index, adjacent } => {
             let block = blocks.get(index)?;
-            next.state.floor = block.floor.clone();
-            (next.state.x, next.state.y) = adjacent;
             match block.kind.as_str() {
                 "door" => {
                     let cost = &block.data["key_cost"];
@@ -2787,36 +2868,41 @@ fn materialize_pending_action_inner(
                         cost["blue"].as_u64().unwrap_or(0),
                         cost["red"].as_u64().unwrap_or(0),
                     );
-                    if next.state.yellow < yellow || next.state.blue < blue || next.state.red < red
-                    {
+                    if source.yellow < yellow || source.blue < blue || source.red < red {
                         return None;
                     }
-                    let mut inventory: BTreeMap<String, u64> =
-                        next.state.inventory.iter().cloned().collect();
                     let inventory_cost =
                         block.data.get("inventory_cost").and_then(Value::as_object);
+                    let inventory_cost = inventory_cost.filter(|costs| !costs.is_empty());
                     if inventory_cost.is_some_and(|costs| {
                         costs.iter().any(|(id, count)| {
-                            inventory.get(id).copied().unwrap_or(0)
-                                < count.as_u64().unwrap_or(u64::MAX)
+                            state_count(&source.inventory, id) < count.as_u64().unwrap_or(u64::MAX)
                         })
                     }) {
                         return None;
                     }
+                    let mut next = MaterializedCandidate {
+                        state: clone_materialize_source(source),
+                        route_action: None,
+                    };
+                    next.state.floor = block.floor.clone();
+                    (next.state.x, next.state.y) = adjacent;
                     next.state.yellow -= yellow;
                     next.state.blue -= blue;
                     next.state.red -= red;
                     if let Some(costs) = inventory_cost {
+                        let mut inventory: BTreeMap<String, u64> =
+                            next.state.inventory.iter().cloned().collect();
                         for (id, count) in costs {
                             *inventory.entry(id.clone()).or_default() -= count.as_u64()?;
                         }
+                        next.state.inventory = Arc::new(
+                            inventory
+                                .into_iter()
+                                .filter(|(_, count)| *count > 0)
+                                .collect(),
+                        );
                     }
-                    next.state.inventory = Arc::new(
-                        inventory
-                            .into_iter()
-                            .filter(|(_, count)| *count > 0)
-                            .collect(),
-                    );
                     if !set_block_consumed(&mut next.state, block, true) {
                         return None;
                     }
@@ -2826,8 +2912,15 @@ fn materialize_pending_action_inner(
                             action: BlockRouteAction::Door { yellow, blue, red },
                         });
                     }
+                    Some(next)
                 }
                 "resource" => {
+                    let mut next = MaterializedCandidate {
+                        state: clone_materialize_source(source),
+                        route_action: None,
+                    };
+                    next.state.floor = block.floor.clone();
+                    (next.state.x, next.state.y) = adjacent;
                     add_delta(&mut next.state, &block.data["delta"]).ok()?;
                     if !set_block_consumed(&mut next.state, block, true) {
                         return None;
@@ -2838,16 +2931,29 @@ fn materialize_pending_action_inner(
                             action: BlockRouteAction::Resource,
                         });
                     }
+                    Some(next)
                 }
                 "enemy" => {
-                    let loss = enemy_loss(&next.state, &block.data["enemy"])?;
-                    if loss >= next.state.hp.get() {
+                    let loss = enemy_loss(source, &block.data["enemy"])?;
+                    if loss >= source.hp.get() {
                         return None;
                     }
-                    next.state.hp = F64Bits::new(next.state.hp.get() - loss)?;
-                    next.state.gold += block.data["enemy"]["gold"].as_u64().unwrap_or(0);
-                    next.state.experience +=
-                        block.data["enemy"]["experience"].as_u64().unwrap_or(0);
+                    let hp = F64Bits::new(source.hp.get() - loss)?;
+                    let gold = source
+                        .gold
+                        .checked_add(block.data["enemy"]["gold"].as_u64().unwrap_or(0))?;
+                    let experience = source
+                        .experience
+                        .checked_add(block.data["enemy"]["experience"].as_u64().unwrap_or(0))?;
+                    let mut next = MaterializedCandidate {
+                        state: clone_materialize_source(source),
+                        route_action: None,
+                    };
+                    next.state.floor = block.floor.clone();
+                    (next.state.x, next.state.y) = adjacent;
+                    next.state.hp = hp;
+                    next.state.gold = gold;
+                    next.state.experience = experience;
                     if !set_block_consumed(&mut next.state, block, true) {
                         return None;
                     }
@@ -2859,8 +2965,15 @@ fn materialize_pending_action_inner(
                             },
                         });
                     }
+                    Some(next)
                 }
                 "transition" => {
+                    let mut next = MaterializedCandidate {
+                        state: clone_materialize_source(source),
+                        route_action: None,
+                    };
+                    next.state.floor = block.floor.clone();
+                    (next.state.x, next.state.y) = adjacent;
                     let target = &block.data["target"];
                     next.state.floor = target["floor_id"].as_str().unwrap_or_default().to_owned();
                     next.state.x = target["x"].as_u64().unwrap_or(0);
@@ -2871,8 +2984,15 @@ fn materialize_pending_action_inner(
                             action: BlockRouteAction::Transition,
                         });
                     }
+                    Some(next)
                 }
                 "event" => {
+                    let mut next = MaterializedCandidate {
+                        state: clone_materialize_source(source),
+                        route_action: None,
+                    };
+                    next.state.floor = block.floor.clone();
+                    (next.state.x, next.state.y) = adjacent;
                     let event_details = apply_audited_event(&mut next.state, block, index, blocks)?;
                     if record_route {
                         next.route_action = Some(RouteAction::Block {
@@ -2885,8 +3005,9 @@ fn materialize_pending_action_inner(
                             },
                         });
                     }
+                    Some(next)
                 }
-                _ => return None,
+                _ => None,
             }
         }
         PendingAction::Shop {
@@ -2903,60 +3024,51 @@ fn materialize_pending_action_inner(
                 .unwrap_or_default();
             let choice = shop.get("choices")?.as_array()?.get(choice_index)?;
             let count_index = choice_offset.checked_add(choice_index)?;
-            let purchase_count = *next.state.shop_counts.get(count_index)?;
+            let purchase_count = *source.shop_counts.get(count_index)?;
             let cost = choice["base_cost"].as_u64()?.checked_add(
                 choice["increment_per_purchase"]
                     .as_u64()?
                     .checked_mul(purchase_count)?,
             )?;
-            next.state.floor = floor.clone();
-            (next.state.x, next.state.y) = adjacent;
             let currency = choice
                 .get("currency")
                 .and_then(Value::as_str)
                 .unwrap_or("gold");
             let balance = match currency {
-                "gold" => next.state.gold,
-                "experience" => next.state.experience,
-                "yellow" => next.state.yellow,
-                "blue" => next.state.blue,
-                "red" => next.state.red,
+                "gold" => source.gold,
+                "experience" => source.experience,
+                "yellow" => source.yellow,
+                "blue" => source.blue,
+                "red" => source.red,
                 _ => return None,
             };
             if balance < cost {
                 return None;
             }
-            match currency {
-                "gold" => next.state.gold -= cost,
-                "experience" => next.state.experience -= cost,
-                "yellow" => next.state.yellow -= cost,
-                "blue" => next.state.blue -= cost,
-                "red" => next.state.red -= cost,
-                _ => unreachable!(),
-            }
-            let effects: Vec<Value> = choice
+            let effects = choice
                 .get("effects")
                 .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_else(|| vec![choice["effect"].clone()]);
-            for effect in &effects {
-                let field = effect["field"].as_str().unwrap_or_default();
-                let amount = effect["amount"].as_u64().unwrap_or(0);
-                match field {
-                    "level" => next.state.level = next.state.level.saturating_add(amount),
-                    "hp" => next.state.hp = next.state.hp.add(amount as f64)?,
-                    "attack" => next.state.attack = next.state.attack.add(amount as f64)?,
-                    "defense" => next.state.defense = next.state.defense.add(amount as f64)?,
-                    "gold" => next.state.gold = next.state.gold.saturating_add(amount),
-                    "experience" => {
-                        next.state.experience = next.state.experience.saturating_add(amount)
-                    }
-                    "yellow" => next.state.yellow = next.state.yellow.saturating_add(amount),
-                    "blue" => next.state.blue = next.state.blue.saturating_add(amount),
-                    "red" => next.state.red = next.state.red.saturating_add(amount),
-                    _ => return None,
-                }
+                .map(Vec::as_slice)
+                .or_else(|| choice.get("effect").map(std::slice::from_ref))?;
+            let mut values = ShopEffectValues::from_state(source);
+            match currency {
+                "gold" => values.gold -= cost,
+                "experience" => values.experience -= cost,
+                "yellow" => values.yellow -= cost,
+                "blue" => values.blue -= cost,
+                "red" => values.red -= cost,
+                _ => unreachable!(),
             }
+            for effect in effects {
+                values.apply(effect)?;
+            }
+            let mut next = MaterializedCandidate {
+                state: clone_materialize_source(source),
+                route_action: None,
+            };
+            next.state.floor = floor.clone();
+            (next.state.x, next.state.y) = adjacent;
+            values.write_to(&mut next.state);
             Arc::make_mut(&mut next.state.shop_counts)[count_index] += 1;
             if record_route {
                 next.route_action = Some(RouteAction::Shop {
@@ -2977,9 +3089,9 @@ fn materialize_pending_action_inner(
                         .collect::<Option<Vec<_>>>()?,
                 });
             }
+            Some(next)
         }
     }
-    Some(next)
 }
 
 #[derive(Clone)]
@@ -5045,6 +5157,225 @@ mod tests {
         assert_eq!(details["event_id"], "fairy_mt0");
         assert_eq!(state.attack.get(), 20.0 * 4.0 / 3.0);
         assert!(!state.attack.get().fract().eq(&0.0));
+    }
+
+    #[test]
+    fn empty_inventory_delta_keeps_shared_inventory_arc() {
+        let mut state = terminal_node(10, 10, 100, "x");
+        state.inventory = Arc::new(vec![("cross".to_owned(), 1)]);
+        let before = state.inventory.clone();
+        add_delta(
+            &mut state,
+            &json!({"attack":1,"inventory":{},"keys":{"yellow":0,"blue":0,"red":0}}),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&state.inventory, &before));
+        assert_eq!(state_count(&state.inventory, "cross"), 1);
+    }
+
+    #[test]
+    fn door_inventory_map_is_only_materialized_for_nonempty_inventory_cost() {
+        let mut source = terminal_node(10, 10, 100, "x");
+        source.yellow = 1;
+        source.inventory = Arc::new(vec![("cross".to_owned(), 1)]);
+        source.consumed = ConsumedBits::from_bools(&[false]);
+        let ordinary = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "yellowDoor".into(),
+            kind: "door".into(),
+            data: json!({"key_cost":{"yellow":1,"blue":0,"red":0}}),
+            state_slot: Some(0),
+        };
+        let mut inventory_door = ordinary.clone();
+        inventory_door.data["inventory_cost"] = json!({"cross":1});
+        let ordinary_successor = materialize_pending_action_inner(
+            &source,
+            PendingAction::Block {
+                index: 0,
+                adjacent: (0, 0),
+            },
+            &[ordinary],
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &source.inventory,
+            &ordinary_successor.state.inventory
+        ));
+        let inventory_successor = materialize_pending_action_inner(
+            &source,
+            PendingAction::Block {
+                index: 0,
+                adjacent: (0, 0),
+            },
+            &[inventory_door],
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            state_count(&inventory_successor.state.inventory, "cross"),
+            0
+        );
+    }
+
+    #[test]
+    fn infeasible_door_shop_enemy_do_not_clone_complete_successor() {
+        let mut source = terminal_node(10, 10, 10, "x");
+        source.consumed = ConsumedBits::from_bools(&[false]);
+        let door = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "redDoor".into(),
+            kind: "door".into(),
+            data: json!({"key_cost":{"yellow":1,"blue":0,"red":0}}),
+            state_slot: Some(0),
+        };
+        let shops = vec![json!({"shop_id":"shop","choices":[
+            {"choice_id":"choice","base_cost":10,"increment_per_purchase":0,
+             "currency":"gold","effect":{"field":"attack","amount":1}}
+        ]})];
+        source.shop_counts = Arc::new(vec![0]);
+        let enemy = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "enemy".into(),
+            kind: "enemy".into(),
+            data: json!({"enemy":{"hp":30,"attack":100,"defense":0,"gold":0,"experience":0}}),
+            state_slot: Some(0),
+        };
+        for action in [PendingAction::Block {
+            index: 0,
+            adjacent: (0, 0),
+        }] {
+            MATERIALIZE_SOURCE_CLONES.with(|clones| clones.set(0));
+            assert!(
+                materialize_pending_action_inner(&source, action, &[door.clone()], &[], false)
+                    .is_none()
+            );
+            assert_eq!(MATERIALIZE_SOURCE_CLONES.with(Cell::get), 0);
+        }
+        MATERIALIZE_SOURCE_CLONES.with(|clones| clones.set(0));
+        assert!(
+            materialize_pending_action_inner(
+                &source,
+                PendingAction::Shop {
+                    shop_index: 0,
+                    choice_index: 0,
+                    choice_offset: 0,
+                    floor: "F".into(),
+                    adjacent: (0, 0),
+                },
+                &[],
+                &shops,
+                false,
+            )
+            .is_none()
+        );
+        assert_eq!(MATERIALIZE_SOURCE_CLONES.with(Cell::get), 0);
+        MATERIALIZE_SOURCE_CLONES.with(|clones| clones.set(0));
+        assert!(
+            materialize_pending_action_inner(
+                &source,
+                PendingAction::Block {
+                    index: 0,
+                    adjacent: (0, 0),
+                },
+                &[enemy],
+                &[],
+                false,
+            )
+            .is_none()
+        );
+        assert_eq!(MATERIALIZE_SOURCE_CLONES.with(Cell::get), 0);
+    }
+
+    #[test]
+    fn shop_effects_are_borrowed_in_phase_a_but_route_data_matches_phase_b() {
+        let mut source = terminal_node(10, 10, 100, "x");
+        source.gold = 50;
+        source.shop_counts = Arc::new(vec![0]);
+        let shops = vec![json!({"shop_id":"shop","choices":[
+            {"choice_id":"choice","base_cost":10,"increment_per_purchase":0,
+             "currency":"gold","effects":[
+                {"field":"attack","amount":3},{"field":"gold","amount":2}
+             ]}
+        ]})];
+        let phase_a = materialize_pending_action_inner(
+            &source,
+            PendingAction::Shop {
+                shop_index: 0,
+                choice_index: 0,
+                choice_offset: 0,
+                floor: "F".into(),
+                adjacent: (0, 0),
+            },
+            &[],
+            &shops,
+            false,
+        )
+        .unwrap();
+        let phase_b = materialize_pending_action_inner(
+            &source,
+            PendingAction::Shop {
+                shop_index: 0,
+                choice_index: 0,
+                choice_offset: 0,
+                floor: "F".into(),
+                adjacent: (0, 0),
+            },
+            &[],
+            &shops,
+            true,
+        )
+        .unwrap();
+        assert_eq!(phase_a.state, phase_b.state);
+        assert_eq!(
+            route_action_json(&phase_b.route_action.unwrap(), &[]),
+            json!({"step_kind":"shop","floor_id":"F","shop_id":"shop",
+            "choice_id":"choice","details":{"currency":"gold","cost":10,
+            "purchase_count_before":0,"effects":[
+                {"field":"attack","amount":3},{"field":"gold","amount":2}
+            ]}})
+        );
+    }
+
+    #[test]
+    fn structural_hash_collision_still_checks_full_equality() {
+        let mut store = empty_phase_a_store();
+        let first = StructuralNode::from_state(&terminal_node(10, 10, 100, "first"));
+        let mut second_state = terminal_node(10, 10, 100, "second");
+        second_state.x = 1;
+        let second = StructuralNode::from_state(&second_state);
+        let first_id = store.insert_structural_with_hash(first.clone(), 7);
+        assert_eq!(store.find_structural_with_hash(&first, 7), Some(first_id));
+        assert_eq!(store.find_structural_with_hash(&second, 7), None);
+        let second_id = store.insert_structural_with_hash(second.clone(), 7);
+        assert_ne!(first_id, second_id);
+        assert_eq!(store.find_structural_with_hash(&second, 7), Some(second_id));
+    }
+
+    #[test]
+    fn one_pass_frontier_preserves_incomparable_order_and_rejects_dominated() {
+        let mut store = empty_phase_a_store();
+        let weak = store.accept(terminal_node(10, 5, 100, "weak")).unwrap();
+        let incomparable = store
+            .accept(terminal_node(5, 10, 100, "incomparable"))
+            .unwrap();
+        let strong = store.accept(terminal_node(11, 6, 100, "strong")).unwrap();
+        assert!(store.is_stale(weak));
+        assert_eq!(store.frontiers[0], [incomparable, strong]);
+        assert!(
+            store
+                .accept(terminal_node(4, 9, 100, "dominated"))
+                .is_none()
+        );
+        assert_eq!(store.frontiers[0], [incomparable, strong]);
     }
 
     #[test]
