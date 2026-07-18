@@ -1,0 +1,73 @@
+{
+  "schema": "mota-phase25-profile-v1",
+  "request": {
+    "sha256": "508b4d25557b0c30b649d5e923a5ec9fa3470dc8555d8d49e3dcb9bad98ba55e",
+    "bytes": 2576604
+  },
+  "versions": {
+    "A": {
+      "binary": "/private/tmp/mota-phase4b-closeout-evidence.1bpam3/binary/A-c20ddd2",
+      "binary_sha256": "ef27419252fc7904fcec7c272afeeab74c010c7bb3e1395a8c095e5f2611e685",
+      "source": "/private/tmp/mota-phase4b-closeout-evidence.1bpam3/source/A-c20ddd2-main.rs",
+      "source_sha256": "22dcc4d7bcbf05cd01c72671500c31c87586d3650f81f41e98edd8a29e77b0f3"
+    },
+    "B": {
+      "binary": "/private/tmp/mota-phase4b-closeout-evidence.1bpam3/binary/B-uncommitted-closeout",
+      "binary_sha256": "7fd89633b925433e182d11990d7cdccd2cd039cd97d6842637389c8aa658cfa9",
+      "source": "/private/tmp/mota-phase4b-closeout-evidence.1bpam3/source/B-uncommitted-closeout-main.rs",
+      "source_sha256": "f6e1149bf2daed46ff9458ac2b0723a7b2bcbe85a924cb73ecedf6ae385e05a6"
+    }
+  },
+  "method": {
+    "warmups_per_version": 1,
+    "official_samples_per_version": 7,
+    "order": [
+      "A",
+      "B",
+      "A",
+      "B",
+      "A",
+      "B",
+      "A",
+      "B",
+      "A",
+      "B",
+      "A",
+      "B",
+      "A",
+      "B"
+    ],
+    "request": "pure POST /cycle",
+    "rss": "service PID sampled every 10 ms",
+    "canonical_response": "sorted JSON with shadow.cycle removed"
+  },
+  "results": {
+    "A": {
+      "median_post_ms": 1204.3407084420323,
+      "p95_post_ms": 1207.9467293806374,
+      "max_post_ms": 1208.3460418507457,
+      "median_rss_bytes": 48922624,
+      "p95_rss_bytes": 49070080.0,
+      "max_rss_bytes": 49070080,
+      "canonical_response_hashes": [
+        "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2"
+      ]
+    },
+    "B": {
+      "median_post_ms": 1188.0367491394281,
+      "p95_post_ms": 1194.6212247014046,
+      "max_post_ms": 1194.6488749235868,
+      "median_rss_bytes": 49987584,
+      "p95_rss_bytes": 50020352.0,
+      "max_rss_bytes": 50020352,
+      "canonical_response_hashes": [
+        "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2"
+      ]
+    }
+  },
+  "profile_events": {
+    "A": [],
+    "B": []
+  },
+  "raw_samples_tsv": "/private/tmp/mota-phase4b-closeout-evidence.1bpam3/ab-final/samples.tsv"
+}

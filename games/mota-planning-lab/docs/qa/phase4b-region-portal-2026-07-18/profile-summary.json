@@ -1,0 +1,1375 @@
+{
+  "schema": "mota-phase25-profile-v1",
+  "request": {
+    "sha256": "508b4d25557b0c30b649d5e923a5ec9fa3470dc8555d8d49e3dcb9bad98ba55e",
+    "bytes": 2576604
+  },
+  "versions": {
+    "A": {
+      "binary": "/private/tmp/mota-phase4b-closeout-evidence.1bpam3/binary/A-c20ddd2",
+      "binary_sha256": "ef27419252fc7904fcec7c272afeeab74c010c7bb3e1395a8c095e5f2611e685",
+      "source": "/private/tmp/mota-phase4b-closeout-evidence.1bpam3/source/A-c20ddd2-main.rs",
+      "source_sha256": "22dcc4d7bcbf05cd01c72671500c31c87586d3650f81f41e98edd8a29e77b0f3"
+    },
+    "B": {
+      "binary": "/private/tmp/mota-phase4b-closeout-evidence.1bpam3/binary/B-uncommitted-closeout",
+      "binary_sha256": "7fd89633b925433e182d11990d7cdccd2cd039cd97d6842637389c8aa658cfa9",
+      "source": "/private/tmp/mota-phase4b-closeout-evidence.1bpam3/source/B-uncommitted-closeout-main.rs",
+      "source_sha256": "f6e1149bf2daed46ff9458ac2b0723a7b2bcbe85a924cb73ecedf6ae385e05a6"
+    }
+  },
+  "method": {
+    "warmups_per_version": 1,
+    "official_samples_per_version": 3,
+    "order": [
+      "A",
+      "B",
+      "A",
+      "B",
+      "A",
+      "B"
+    ],
+    "request": "pure POST /cycle",
+    "rss": "service PID sampled every 10 ms",
+    "canonical_response": "sorted JSON with shadow.cycle removed"
+  },
+  "results": {
+    "A": {
+      "median_post_ms": 2384.1504584997892,
+      "p95_post_ms": 2529.670557845384,
+      "max_post_ms": 2545.839457772672,
+      "median_rss_bytes": 76038144,
+      "p95_rss_bytes": 79385395.2,
+      "max_rss_bytes": 79757312,
+      "canonical_response_hashes": [
+        "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2"
+      ]
+    },
+    "B": {
+      "median_post_ms": 1236.4937914535403,
+      "p95_post_ms": 1249.1220673546195,
+      "max_post_ms": 1250.525209121406,
+      "median_rss_bytes": 50036736,
+      "p95_rss_bytes": 50095718.4,
+      "max_rss_bytes": 50102272,
+      "canonical_response_hashes": [
+        "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2"
+      ]
+    }
+  },
+  "profile_events": {
+    "A": [
+      {
+        "connectivity_view": {
+          "calls": 176119,
+          "ns": 2211093794
+        },
+        "connectivity_view_calls": 176119,
+        "connectivity_view_ns": 2211093794,
+        "enqueue_actions_ns": 5980356,
+        "event": "mota_shadow_profile_v1",
+        "frontier": {
+          "comparisons": 154857,
+          "ns": 3561860
+        },
+        "frontier_comparisons": 154857,
+        "frontier_ns": 3561860,
+        "local_reachable": {
+          "calls": 1585071,
+          "ns": 596764483
+        },
+        "local_reachable_calls": 1585071,
+        "local_reachable_ns": 596764483,
+        "materialize": {
+          "phase_a": {
+            "by_action_kind": {
+              "door": {
+                "calls": 37988,
+                "ns": 2547673
+              },
+              "enemy": {
+                "calls": 50668,
+                "ns": 2429225
+              },
+              "event": {
+                "calls": 28768,
+                "ns": 1530244
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 108374,
+                "ns": 9156475
+              },
+              "shop": {
+                "calls": 86298,
+                "ns": 3942237
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 312096,
+            "feasible": 176118,
+            "infeasible": 135978,
+            "ns": 19605854
+          },
+          "phase_b": {
+            "by_action_kind": {
+              "door": {
+                "calls": 0,
+                "ns": 0
+              },
+              "enemy": {
+                "calls": 0,
+                "ns": 0
+              },
+              "event": {
+                "calls": 0,
+                "ns": 0
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 0,
+                "ns": 0
+              },
+              "shop": {
+                "calls": 0,
+                "ns": 0
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 0,
+            "feasible": 0,
+            "infeasible": 0,
+            "ns": 0
+          }
+        },
+        "materialize_calls": 312096,
+        "materialize_feasible": 176118,
+        "materialize_infeasible": 135978,
+        "passability_signature": {
+          "key": "exact passability signature + exact floor id + start cell id",
+          "potential_hit_rate": 0.9324446665165157,
+          "repeated_keys": 1477991,
+          "request_total": 1585071,
+          "unique_keys": 107080
+        },
+        "passability_signature_repeated_keys": 1477991,
+        "passability_signature_request_total": 1585071,
+        "passability_signature_unique_keys": 107080,
+        "phase_a_accepted": 50000,
+        "phase_a_explored": 50000,
+        "phase_a_pending": 281991,
+        "phase_a_rejected": 126119,
+        "phase_b_explored": 0,
+        "skipped_stale_by_action_kind": {
+          "door": 59822,
+          "enemy": 0,
+          "event": 0,
+          "invalid": 0,
+          "resource": 0,
+          "shop": 0,
+          "transition": 0
+        },
+        "skipped_stale_source_work_items": 59822,
+        "stale_source_by_action_kind": {
+          "door": 59822,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "stale_source_work_items": 219918,
+        "structural_equality_checks": 154857,
+        "structural_hash": {
+          "calls": 176119,
+          "ns": 21253468
+        },
+        "structural_hash_calls": 176119,
+        "structural_hash_ns": 21253468,
+        "topology": {
+          "key": "interned exact floor topology id + raw start x/y",
+          "query_total": 1585071,
+          "repeated_keys": 1585020,
+          "unique_keys": 51
+        },
+        "topology_query_total": 1585071,
+        "topology_repeated_keys": 1585020,
+        "topology_unique_keys": 51,
+        "unproven_stale_by_action_kind": {
+          "door": 0,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "work_items_popped": 371918
+      },
+      {
+        "connectivity_view": {
+          "calls": 176119,
+          "ns": 2219656298
+        },
+        "connectivity_view_calls": 176119,
+        "connectivity_view_ns": 2219656298,
+        "enqueue_actions_ns": 5797750,
+        "event": "mota_shadow_profile_v1",
+        "frontier": {
+          "comparisons": 154857,
+          "ns": 3726103
+        },
+        "frontier_comparisons": 154857,
+        "frontier_ns": 3726103,
+        "local_reachable": {
+          "calls": 1585071,
+          "ns": 597918711
+        },
+        "local_reachable_calls": 1585071,
+        "local_reachable_ns": 597918711,
+        "materialize": {
+          "phase_a": {
+            "by_action_kind": {
+              "door": {
+                "calls": 37988,
+                "ns": 2585659
+              },
+              "enemy": {
+                "calls": 50668,
+                "ns": 2504567
+              },
+              "event": {
+                "calls": 28768,
+                "ns": 1541895
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 108374,
+                "ns": 9477043
+              },
+              "shop": {
+                "calls": 86298,
+                "ns": 4076195
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 312096,
+            "feasible": 176118,
+            "infeasible": 135978,
+            "ns": 20185359
+          },
+          "phase_b": {
+            "by_action_kind": {
+              "door": {
+                "calls": 0,
+                "ns": 0
+              },
+              "enemy": {
+                "calls": 0,
+                "ns": 0
+              },
+              "event": {
+                "calls": 0,
+                "ns": 0
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 0,
+                "ns": 0
+              },
+              "shop": {
+                "calls": 0,
+                "ns": 0
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 0,
+            "feasible": 0,
+            "infeasible": 0,
+            "ns": 0
+          }
+        },
+        "materialize_calls": 312096,
+        "materialize_feasible": 176118,
+        "materialize_infeasible": 135978,
+        "passability_signature": {
+          "key": "exact passability signature + exact floor id + start cell id",
+          "potential_hit_rate": 0.9324446665165157,
+          "repeated_keys": 1477991,
+          "request_total": 1585071,
+          "unique_keys": 107080
+        },
+        "passability_signature_repeated_keys": 1477991,
+        "passability_signature_request_total": 1585071,
+        "passability_signature_unique_keys": 107080,
+        "phase_a_accepted": 50000,
+        "phase_a_explored": 50000,
+        "phase_a_pending": 281991,
+        "phase_a_rejected": 126119,
+        "phase_b_explored": 0,
+        "skipped_stale_by_action_kind": {
+          "door": 59822,
+          "enemy": 0,
+          "event": 0,
+          "invalid": 0,
+          "resource": 0,
+          "shop": 0,
+          "transition": 0
+        },
+        "skipped_stale_source_work_items": 59822,
+        "stale_source_by_action_kind": {
+          "door": 59822,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "stale_source_work_items": 219918,
+        "structural_equality_checks": 154857,
+        "structural_hash": {
+          "calls": 176119,
+          "ns": 21444707
+        },
+        "structural_hash_calls": 176119,
+        "structural_hash_ns": 21444707,
+        "topology": {
+          "key": "interned exact floor topology id + raw start x/y",
+          "query_total": 1585071,
+          "repeated_keys": 1585020,
+          "unique_keys": 51
+        },
+        "topology_query_total": 1585071,
+        "topology_repeated_keys": 1585020,
+        "topology_unique_keys": 51,
+        "unproven_stale_by_action_kind": {
+          "door": 0,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "work_items_popped": 371918
+      },
+      {
+        "connectivity_view": {
+          "calls": 176119,
+          "ns": 2228664566
+        },
+        "connectivity_view_calls": 176119,
+        "connectivity_view_ns": 2228664566,
+        "enqueue_actions_ns": 5959035,
+        "event": "mota_shadow_profile_v1",
+        "frontier": {
+          "comparisons": 154857,
+          "ns": 4104347
+        },
+        "frontier_comparisons": 154857,
+        "frontier_ns": 4104347,
+        "local_reachable": {
+          "calls": 1585071,
+          "ns": 600219310
+        },
+        "local_reachable_calls": 1585071,
+        "local_reachable_ns": 600219310,
+        "materialize": {
+          "phase_a": {
+            "by_action_kind": {
+              "door": {
+                "calls": 37988,
+                "ns": 2629009
+              },
+              "enemy": {
+                "calls": 50668,
+                "ns": 2503077
+              },
+              "event": {
+                "calls": 28768,
+                "ns": 1536669
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 108374,
+                "ns": 9696161
+              },
+              "shop": {
+                "calls": 86298,
+                "ns": 4067050
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 312096,
+            "feasible": 176118,
+            "infeasible": 135978,
+            "ns": 20431966
+          },
+          "phase_b": {
+            "by_action_kind": {
+              "door": {
+                "calls": 0,
+                "ns": 0
+              },
+              "enemy": {
+                "calls": 0,
+                "ns": 0
+              },
+              "event": {
+                "calls": 0,
+                "ns": 0
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 0,
+                "ns": 0
+              },
+              "shop": {
+                "calls": 0,
+                "ns": 0
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 0,
+            "feasible": 0,
+            "infeasible": 0,
+            "ns": 0
+          }
+        },
+        "materialize_calls": 312096,
+        "materialize_feasible": 176118,
+        "materialize_infeasible": 135978,
+        "passability_signature": {
+          "key": "exact passability signature + exact floor id + start cell id",
+          "potential_hit_rate": 0.9324446665165157,
+          "repeated_keys": 1477991,
+          "request_total": 1585071,
+          "unique_keys": 107080
+        },
+        "passability_signature_repeated_keys": 1477991,
+        "passability_signature_request_total": 1585071,
+        "passability_signature_unique_keys": 107080,
+        "phase_a_accepted": 50000,
+        "phase_a_explored": 50000,
+        "phase_a_pending": 281991,
+        "phase_a_rejected": 126119,
+        "phase_b_explored": 0,
+        "skipped_stale_by_action_kind": {
+          "door": 59822,
+          "enemy": 0,
+          "event": 0,
+          "invalid": 0,
+          "resource": 0,
+          "shop": 0,
+          "transition": 0
+        },
+        "skipped_stale_source_work_items": 59822,
+        "stale_source_by_action_kind": {
+          "door": 59822,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "stale_source_work_items": 219918,
+        "structural_equality_checks": 154857,
+        "structural_hash": {
+          "calls": 176119,
+          "ns": 21512310
+        },
+        "structural_hash_calls": 176119,
+        "structural_hash_ns": 21512310,
+        "topology": {
+          "key": "interned exact floor topology id + raw start x/y",
+          "query_total": 1585071,
+          "repeated_keys": 1585020,
+          "unique_keys": 51
+        },
+        "topology_query_total": 1585071,
+        "topology_repeated_keys": 1585020,
+        "topology_unique_keys": 51,
+        "unproven_stale_by_action_kind": {
+          "door": 0,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "work_items_popped": 371918
+      },
+      {
+        "connectivity_view": {
+          "calls": 176119,
+          "ns": 2373251372
+        },
+        "connectivity_view_calls": 176119,
+        "connectivity_view_ns": 2373251372,
+        "enqueue_actions_ns": 5640484,
+        "event": "mota_shadow_profile_v1",
+        "frontier": {
+          "comparisons": 154857,
+          "ns": 4333688
+        },
+        "frontier_comparisons": 154857,
+        "frontier_ns": 4333688,
+        "local_reachable": {
+          "calls": 1585071,
+          "ns": 642323521
+        },
+        "local_reachable_calls": 1585071,
+        "local_reachable_ns": 642323521,
+        "materialize": {
+          "phase_a": {
+            "by_action_kind": {
+              "door": {
+                "calls": 37988,
+                "ns": 3018891
+              },
+              "enemy": {
+                "calls": 50668,
+                "ns": 2744745
+              },
+              "event": {
+                "calls": 28768,
+                "ns": 1713341
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 108374,
+                "ns": 10697517
+              },
+              "shop": {
+                "calls": 86298,
+                "ns": 4473910
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 312096,
+            "feasible": 176118,
+            "infeasible": 135978,
+            "ns": 22648404
+          },
+          "phase_b": {
+            "by_action_kind": {
+              "door": {
+                "calls": 0,
+                "ns": 0
+              },
+              "enemy": {
+                "calls": 0,
+                "ns": 0
+              },
+              "event": {
+                "calls": 0,
+                "ns": 0
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 0,
+                "ns": 0
+              },
+              "shop": {
+                "calls": 0,
+                "ns": 0
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 0,
+            "feasible": 0,
+            "infeasible": 0,
+            "ns": 0
+          }
+        },
+        "materialize_calls": 312096,
+        "materialize_feasible": 176118,
+        "materialize_infeasible": 135978,
+        "passability_signature": {
+          "key": "exact passability signature + exact floor id + start cell id",
+          "potential_hit_rate": 0.9324446665165157,
+          "repeated_keys": 1477991,
+          "request_total": 1585071,
+          "unique_keys": 107080
+        },
+        "passability_signature_repeated_keys": 1477991,
+        "passability_signature_request_total": 1585071,
+        "passability_signature_unique_keys": 107080,
+        "phase_a_accepted": 50000,
+        "phase_a_explored": 50000,
+        "phase_a_pending": 281991,
+        "phase_a_rejected": 126119,
+        "phase_b_explored": 0,
+        "skipped_stale_by_action_kind": {
+          "door": 59822,
+          "enemy": 0,
+          "event": 0,
+          "invalid": 0,
+          "resource": 0,
+          "shop": 0,
+          "transition": 0
+        },
+        "skipped_stale_source_work_items": 59822,
+        "stale_source_by_action_kind": {
+          "door": 59822,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "stale_source_work_items": 219918,
+        "structural_equality_checks": 154857,
+        "structural_hash": {
+          "calls": 176119,
+          "ns": 22903487
+        },
+        "structural_hash_calls": 176119,
+        "structural_hash_ns": 22903487,
+        "topology": {
+          "key": "interned exact floor topology id + raw start x/y",
+          "query_total": 1585071,
+          "repeated_keys": 1585020,
+          "unique_keys": 51
+        },
+        "topology_query_total": 1585071,
+        "topology_repeated_keys": 1585020,
+        "topology_unique_keys": 51,
+        "unproven_stale_by_action_kind": {
+          "door": 0,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "work_items_popped": 371918
+      }
+    ],
+    "B": [
+      {
+        "accepted_semantic_trace_hash": "7f0aeb674cd6f09f",
+        "connectivity_view": {
+          "calls": 176119,
+          "ns": 1072594974
+        },
+        "connectivity_view_calls": 176119,
+        "connectivity_view_ns": 1072594974,
+        "enqueue_actions_ns": 5623994,
+        "event": "mota_shadow_profile_v1",
+        "frontier": {
+          "comparisons": 154857,
+          "ns": 3478064
+        },
+        "frontier_comparisons": 154857,
+        "frontier_ns": 3478064,
+        "local_reachable": {
+          "calls": 0,
+          "ns": 0
+        },
+        "local_reachable_calls": 0,
+        "local_reachable_ns": 0,
+        "materialize": {
+          "phase_a": {
+            "by_action_kind": {
+              "door": {
+                "calls": 37988,
+                "ns": 2463569
+              },
+              "enemy": {
+                "calls": 50668,
+                "ns": 2351827
+              },
+              "event": {
+                "calls": 28768,
+                "ns": 1459529
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 108374,
+                "ns": 9462839
+              },
+              "shop": {
+                "calls": 86298,
+                "ns": 3707536
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 312096,
+            "feasible": 176118,
+            "infeasible": 135978,
+            "ns": 19445300
+          },
+          "phase_b": {
+            "by_action_kind": {
+              "door": {
+                "calls": 0,
+                "ns": 0
+              },
+              "enemy": {
+                "calls": 0,
+                "ns": 0
+              },
+              "event": {
+                "calls": 0,
+                "ns": 0
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 0,
+                "ns": 0
+              },
+              "shop": {
+                "calls": 0,
+                "ns": 0
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 0,
+            "feasible": 0,
+            "infeasible": 0,
+            "ns": 0
+          }
+        },
+        "materialize_calls": 312096,
+        "materialize_feasible": 176118,
+        "materialize_infeasible": 135978,
+        "passability_signature": {
+          "key": "exact passability signature + exact floor id + start cell id",
+          "potential_hit_rate": 0.0,
+          "repeated_keys": 0,
+          "request_total": 0,
+          "unique_keys": 0
+        },
+        "passability_signature_repeated_keys": 0,
+        "passability_signature_request_total": 0,
+        "passability_signature_unique_keys": 0,
+        "phase_a_accepted": 50000,
+        "phase_a_explored": 50000,
+        "phase_a_pending": 281991,
+        "phase_a_rejected": 126119,
+        "phase_b_explored": 0,
+        "region_graph": {
+          "bfs_fallback_calls": 0,
+          "portal_traversals": 4847678,
+          "region_traversals": 3943594,
+          "view_calls": 176119
+        },
+        "skipped_stale_by_action_kind": {
+          "door": 59822,
+          "enemy": 0,
+          "event": 0,
+          "invalid": 0,
+          "resource": 0,
+          "shop": 0,
+          "transition": 0
+        },
+        "skipped_stale_source_work_items": 59822,
+        "stale_source_by_action_kind": {
+          "door": 59822,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "stale_source_work_items": 219918,
+        "structural_equality_checks": 154857,
+        "structural_hash": {
+          "calls": 176119,
+          "ns": 21640738
+        },
+        "structural_hash_calls": 176119,
+        "structural_hash_ns": 21640738,
+        "topology": {
+          "key": "interned exact floor topology id + raw start x/y",
+          "query_total": 0,
+          "repeated_keys": 0,
+          "unique_keys": 0
+        },
+        "topology_query_total": 0,
+        "topology_repeated_keys": 0,
+        "topology_unique_keys": 0,
+        "unproven_stale_by_action_kind": {
+          "door": 0,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "work_items_popped": 371918
+      },
+      {
+        "accepted_semantic_trace_hash": "7f0aeb674cd6f09f",
+        "connectivity_view": {
+          "calls": 176119,
+          "ns": 1066329582
+        },
+        "connectivity_view_calls": 176119,
+        "connectivity_view_ns": 1066329582,
+        "enqueue_actions_ns": 5747700,
+        "event": "mota_shadow_profile_v1",
+        "frontier": {
+          "comparisons": 154857,
+          "ns": 3634156
+        },
+        "frontier_comparisons": 154857,
+        "frontier_ns": 3634156,
+        "local_reachable": {
+          "calls": 0,
+          "ns": 0
+        },
+        "local_reachable_calls": 0,
+        "local_reachable_ns": 0,
+        "materialize": {
+          "phase_a": {
+            "by_action_kind": {
+              "door": {
+                "calls": 37988,
+                "ns": 2422951
+              },
+              "enemy": {
+                "calls": 50668,
+                "ns": 2280706
+              },
+              "event": {
+                "calls": 28768,
+                "ns": 1451402
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 108374,
+                "ns": 9386788
+              },
+              "shop": {
+                "calls": 86298,
+                "ns": 3721496
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 312096,
+            "feasible": 176118,
+            "infeasible": 135978,
+            "ns": 19263343
+          },
+          "phase_b": {
+            "by_action_kind": {
+              "door": {
+                "calls": 0,
+                "ns": 0
+              },
+              "enemy": {
+                "calls": 0,
+                "ns": 0
+              },
+              "event": {
+                "calls": 0,
+                "ns": 0
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 0,
+                "ns": 0
+              },
+              "shop": {
+                "calls": 0,
+                "ns": 0
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 0,
+            "feasible": 0,
+            "infeasible": 0,
+            "ns": 0
+          }
+        },
+        "materialize_calls": 312096,
+        "materialize_feasible": 176118,
+        "materialize_infeasible": 135978,
+        "passability_signature": {
+          "key": "exact passability signature + exact floor id + start cell id",
+          "potential_hit_rate": 0.0,
+          "repeated_keys": 0,
+          "request_total": 0,
+          "unique_keys": 0
+        },
+        "passability_signature_repeated_keys": 0,
+        "passability_signature_request_total": 0,
+        "passability_signature_unique_keys": 0,
+        "phase_a_accepted": 50000,
+        "phase_a_explored": 50000,
+        "phase_a_pending": 281991,
+        "phase_a_rejected": 126119,
+        "phase_b_explored": 0,
+        "region_graph": {
+          "bfs_fallback_calls": 0,
+          "portal_traversals": 4847678,
+          "region_traversals": 3943594,
+          "view_calls": 176119
+        },
+        "skipped_stale_by_action_kind": {
+          "door": 59822,
+          "enemy": 0,
+          "event": 0,
+          "invalid": 0,
+          "resource": 0,
+          "shop": 0,
+          "transition": 0
+        },
+        "skipped_stale_source_work_items": 59822,
+        "stale_source_by_action_kind": {
+          "door": 59822,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "stale_source_work_items": 219918,
+        "structural_equality_checks": 154857,
+        "structural_hash": {
+          "calls": 176119,
+          "ns": 22775473
+        },
+        "structural_hash_calls": 176119,
+        "structural_hash_ns": 22775473,
+        "topology": {
+          "key": "interned exact floor topology id + raw start x/y",
+          "query_total": 0,
+          "repeated_keys": 0,
+          "unique_keys": 0
+        },
+        "topology_query_total": 0,
+        "topology_repeated_keys": 0,
+        "topology_unique_keys": 0,
+        "unproven_stale_by_action_kind": {
+          "door": 0,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "work_items_popped": 371918
+      },
+      {
+        "accepted_semantic_trace_hash": "7f0aeb674cd6f09f",
+        "connectivity_view": {
+          "calls": 176119,
+          "ns": 1063242611
+        },
+        "connectivity_view_calls": 176119,
+        "connectivity_view_ns": 1063242611,
+        "enqueue_actions_ns": 5662800,
+        "event": "mota_shadow_profile_v1",
+        "frontier": {
+          "comparisons": 154857,
+          "ns": 3593842
+        },
+        "frontier_comparisons": 154857,
+        "frontier_ns": 3593842,
+        "local_reachable": {
+          "calls": 0,
+          "ns": 0
+        },
+        "local_reachable_calls": 0,
+        "local_reachable_ns": 0,
+        "materialize": {
+          "phase_a": {
+            "by_action_kind": {
+              "door": {
+                "calls": 37988,
+                "ns": 2403983
+              },
+              "enemy": {
+                "calls": 50668,
+                "ns": 2307621
+              },
+              "event": {
+                "calls": 28768,
+                "ns": 1446893
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 108374,
+                "ns": 9287645
+              },
+              "shop": {
+                "calls": 86298,
+                "ns": 3602354
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 312096,
+            "feasible": 176118,
+            "infeasible": 135978,
+            "ns": 19048496
+          },
+          "phase_b": {
+            "by_action_kind": {
+              "door": {
+                "calls": 0,
+                "ns": 0
+              },
+              "enemy": {
+                "calls": 0,
+                "ns": 0
+              },
+              "event": {
+                "calls": 0,
+                "ns": 0
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 0,
+                "ns": 0
+              },
+              "shop": {
+                "calls": 0,
+                "ns": 0
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 0,
+            "feasible": 0,
+            "infeasible": 0,
+            "ns": 0
+          }
+        },
+        "materialize_calls": 312096,
+        "materialize_feasible": 176118,
+        "materialize_infeasible": 135978,
+        "passability_signature": {
+          "key": "exact passability signature + exact floor id + start cell id",
+          "potential_hit_rate": 0.0,
+          "repeated_keys": 0,
+          "request_total": 0,
+          "unique_keys": 0
+        },
+        "passability_signature_repeated_keys": 0,
+        "passability_signature_request_total": 0,
+        "passability_signature_unique_keys": 0,
+        "phase_a_accepted": 50000,
+        "phase_a_explored": 50000,
+        "phase_a_pending": 281991,
+        "phase_a_rejected": 126119,
+        "phase_b_explored": 0,
+        "region_graph": {
+          "bfs_fallback_calls": 0,
+          "portal_traversals": 4847678,
+          "region_traversals": 3943594,
+          "view_calls": 176119
+        },
+        "skipped_stale_by_action_kind": {
+          "door": 59822,
+          "enemy": 0,
+          "event": 0,
+          "invalid": 0,
+          "resource": 0,
+          "shop": 0,
+          "transition": 0
+        },
+        "skipped_stale_source_work_items": 59822,
+        "stale_source_by_action_kind": {
+          "door": 59822,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "stale_source_work_items": 219918,
+        "structural_equality_checks": 154857,
+        "structural_hash": {
+          "calls": 176119,
+          "ns": 21296875
+        },
+        "structural_hash_calls": 176119,
+        "structural_hash_ns": 21296875,
+        "topology": {
+          "key": "interned exact floor topology id + raw start x/y",
+          "query_total": 0,
+          "repeated_keys": 0,
+          "unique_keys": 0
+        },
+        "topology_query_total": 0,
+        "topology_repeated_keys": 0,
+        "topology_unique_keys": 0,
+        "unproven_stale_by_action_kind": {
+          "door": 0,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "work_items_popped": 371918
+      },
+      {
+        "accepted_semantic_trace_hash": "7f0aeb674cd6f09f",
+        "connectivity_view": {
+          "calls": 176119,
+          "ns": 1075349351
+        },
+        "connectivity_view_calls": 176119,
+        "connectivity_view_ns": 1075349351,
+        "enqueue_actions_ns": 6190026,
+        "event": "mota_shadow_profile_v1",
+        "frontier": {
+          "comparisons": 154857,
+          "ns": 3806884
+        },
+        "frontier_comparisons": 154857,
+        "frontier_ns": 3806884,
+        "local_reachable": {
+          "calls": 0,
+          "ns": 0
+        },
+        "local_reachable_calls": 0,
+        "local_reachable_ns": 0,
+        "materialize": {
+          "phase_a": {
+            "by_action_kind": {
+              "door": {
+                "calls": 37988,
+                "ns": 2546195
+              },
+              "enemy": {
+                "calls": 50668,
+                "ns": 2349696
+              },
+              "event": {
+                "calls": 28768,
+                "ns": 1519074
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 108374,
+                "ns": 9649671
+              },
+              "shop": {
+                "calls": 86298,
+                "ns": 3711839
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 312096,
+            "feasible": 176118,
+            "infeasible": 135978,
+            "ns": 19776475
+          },
+          "phase_b": {
+            "by_action_kind": {
+              "door": {
+                "calls": 0,
+                "ns": 0
+              },
+              "enemy": {
+                "calls": 0,
+                "ns": 0
+              },
+              "event": {
+                "calls": 0,
+                "ns": 0
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 0,
+                "ns": 0
+              },
+              "shop": {
+                "calls": 0,
+                "ns": 0
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 0,
+            "feasible": 0,
+            "infeasible": 0,
+            "ns": 0
+          }
+        },
+        "materialize_calls": 312096,
+        "materialize_feasible": 176118,
+        "materialize_infeasible": 135978,
+        "passability_signature": {
+          "key": "exact passability signature + exact floor id + start cell id",
+          "potential_hit_rate": 0.0,
+          "repeated_keys": 0,
+          "request_total": 0,
+          "unique_keys": 0
+        },
+        "passability_signature_repeated_keys": 0,
+        "passability_signature_request_total": 0,
+        "passability_signature_unique_keys": 0,
+        "phase_a_accepted": 50000,
+        "phase_a_explored": 50000,
+        "phase_a_pending": 281991,
+        "phase_a_rejected": 126119,
+        "phase_b_explored": 0,
+        "region_graph": {
+          "bfs_fallback_calls": 0,
+          "portal_traversals": 4847678,
+          "region_traversals": 3943594,
+          "view_calls": 176119
+        },
+        "skipped_stale_by_action_kind": {
+          "door": 59822,
+          "enemy": 0,
+          "event": 0,
+          "invalid": 0,
+          "resource": 0,
+          "shop": 0,
+          "transition": 0
+        },
+        "skipped_stale_source_work_items": 59822,
+        "stale_source_by_action_kind": {
+          "door": 59822,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "stale_source_work_items": 219918,
+        "structural_equality_checks": 154857,
+        "structural_hash": {
+          "calls": 176119,
+          "ns": 23094384
+        },
+        "structural_hash_calls": 176119,
+        "structural_hash_ns": 23094384,
+        "topology": {
+          "key": "interned exact floor topology id + raw start x/y",
+          "query_total": 0,
+          "repeated_keys": 0,
+          "unique_keys": 0
+        },
+        "topology_query_total": 0,
+        "topology_repeated_keys": 0,
+        "topology_unique_keys": 0,
+        "unproven_stale_by_action_kind": {
+          "door": 0,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "work_items_popped": 371918
+      }
+    ]
+  },
+  "raw_samples_tsv": "/private/tmp/mota-phase4b-closeout-evidence.1bpam3/profile-final/samples.tsv"
+}

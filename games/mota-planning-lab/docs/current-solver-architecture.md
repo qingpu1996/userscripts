@@ -4,7 +4,7 @@
 
 本文描述仓库当前实现，而不是下一阶段目标。Rust 服务是只读 Shadow runtime：它在一次请求内解析 observation、建立求解状态、搜索有界的全局终局路线，并把证明结果或 `unproven` 状态返回给浏览器；浏览器当前强制 `shadowOnly`，不会执行路线。Rust 进程只保留进程内 cycle 计数，不持久化世界、搜索队列或路线。
 
-当前事实基线为 `11abffc`（Phase 3A typed rules/two-phase solver 加上 Phase 3B proven stale-source pruning）；本页只记录该提交已经交付的行为。
+已验收事实基线为 `299786b564e9d75b1db52b3eeab65451736a50ad`（Phase 4B static region/portal graph）。本文同时显式记录一组尚未提交的 closeout candidate：共享 `BlockPassability` 分类、profile-only accepted semantic trace，以及与其源码哈希精确绑定的新 QA 证据。除标注为“待提交 closeout”的内容外，其余机制均指已验收基线；closeout 内容不得归因于 `299786b`。
 
 `docs/solver-architecture.md`、`docs/protocol.md` 中仍有 Stage2B 的历史描述；当描述与当前代码不一致时，以 `rust/shadow-runtime/src/main.rs`、`src/observer.js` 和协议 schema 为准。本文不把未来的自动驾驶、逆向搜索或更强剪枝写成已实现能力。
 
@@ -41,7 +41,11 @@ Phase A 将完整 `SolverState` 显式拆成 interned `StructuralNode` 与 `Reso
 
 `ConnectivityIndex` 预先保存每层有效格和每格 block 索引，并为每个 transition 检查“纯、激活、非自环、唯一且互相可逆”的伙伴。只有满足这些条件的换层才是免费导航边；单向、inactive、带额外字段（副作用）或无法唯一配对的换层保留为战略 boundary。
 
-对每个搜索状态，`view` 从当前位置做局部 BFS：未消耗的非 `terrain`、非 `shop` block 阻断格子；门、敌人、资源、事件和战略换层停在边界。发现可逆楼梯后，会进入目标楼层并重算局部 BFS。组件用 `(floor, 最小可达格索引)` 去重，因而 floor 只是坐标命名空间，不是策略阶段。第一阶段不记录 transition 序列；只有路线见证阶段才重新计算并保留 navigation witness，远端楼层的候选仍可直接入队。
+`299786b` 已交付 Phase A static region/portal graph 及其安全 gate。**待提交 closeout** 将既有通行语义集中到 typed rule 的共享 `BlockPassability` 分类入口：`terrain`/`shop` 永久可通行；有状态槽的动态 blocker 仅在同格所有 blocker 都 consumed 后开放；无状态槽的 `opaque` 永久阻断。candidate 中旧 cell BFS、region graph 编译、安全 gate 和 profile-only passability slot 投影均使用这一定义；这是分类集中，不是新增求解策略。有效起点即使位于 active blocker portal 仍可离开，保持旧 BFS 的起点语义。
+
+Phase A 为每层请求内编译 static region/portal graph：静态自由格组成 region，可能随 `ConsumedBits` 开闭的 blocker 格形成 portal；每个 accepted candidate 只遍历 region/portal 闭包，不生成 navigation witness。相邻 portal、同格多 blocker、有效格洞/断层和多个可逆楼梯入口都保留 exact cell BFS 语义。只有安全 gate 确认模型安全且所有楼层图编译成功时才使用图；未知或未证明模型走 exact uncached BFS fallback。待提交 closeout 只把该 gate 与其他调用者已有的等价分类收敛到上述共享入口。
+
+Phase B、navigation witness 与 replay 仍使用旧的 uncached cell BFS。发现可逆楼梯后会进入目标楼层并重算局部 BFS；组件用 `(floor, 最小可达格索引)` 去重，因而 floor 只是坐标命名空间，不是策略阶段。Phase A 不记录 transition 序列；路线见证阶段才重新计算并保留 navigation witness，远端楼层候选仍可直接入队。
 
 动态门、事件替换或激活会改变 `ConsumedBits`/flags；下一状态会重新计算闭包，不复用过时的可达区域。对应 transition 的移动步骤仍写入 route witness/最终 route；系统没有独立的移动代价模型，也不制造一个“只是在第 N 层”的战略状态。
 
@@ -50,7 +54,7 @@ Phase A 将完整 `SolverState` 显式拆成 interned `StructuralNode` 与 `Reso
 ```mermaid
 flowchart TD
   A[解析 solver_model 与初始 hero] --> B[建立 ConsumedBits、inventory、shop counts、flags]
-  B --> C[ConnectivityIndex.view：局部 BFS + 可逆换层闭包]
+  B --> C[Phase A static region/portal closure\nsafe gate failure => exact cell BFS]
   C --> D[收集 boundary、shops、reachable terminal]
   D --> E[Phase A VecDeque PhaseAWorkItem\naccepted source + compact action ref]
   E --> F[pop_front；source 即使 stale 仍可寻址]
@@ -66,7 +70,7 @@ flowchart TD
   N -- 是 --> O[Phase 2：固定数值目标，字典序路线见证]
 ```
 
-Phase A 是 FIFO 的 bounded label-setting search：`VecDeque<PhaseAWorkItem>` 按 work item 的入队顺序取出，不按启发式优先级排序。每个 work item 只保存 accepted source label 与 compact action ref；pop 时 source 即便已 stale 仍可从 append-only arena 寻址。随后 materialize 该动作并只计算一次完整 `ConnectivityIndex::view`；无效钥匙、资源、战斗、商店或未支持事件返回 `None`，不会产生后继。动作资源可行性始终从 label 的实时资源检查，未写入结构缓存。
+Phase A 是 FIFO 的 bounded label-setting search：`VecDeque<PhaseAWorkItem>` 按 work item 的入队顺序取出，不按启发式优先级排序。每个 work item 只保存 accepted source label 与 compact action ref；pop 时 source 即便已 stale 仍可从 append-only arena 寻址。随后 materialize 该动作并只计算一次完整 `ConnectivityIndex::view_phase_a`（安全模型用 region/portal graph，否则 exact BFS）；无效钥匙、资源、战斗、商店或未支持事件返回 `None`，不会产生后继。动作资源可行性始终从 label 的实时资源检查，未写入结构缓存。
 
 Phase A 的 action ref 只有带 tag 的稳定 block/shop 索引、shop choice、shop tile 索引和相邻 cell，不能保留 navigation、String 或完整状态。初始 accepted source 计算一次 `view`，用其中 representative canonicalize/Pareto 后按 boundary、shop、choice 的原顺序入队；以后每个 FIFO work item 在真正 pop 时才 materialize。成功后复用这次 view 的 representative 做 canonicalize/Pareto、终局判断和后继入队，拒绝后立即丢弃该 view；代表 BFS 热路径为 0。新 label 支配旧 label 时旧 label 虽标记 stale，已入队 work item 仍可从 append-only arena 取回 source 并保持 FIFO 语义。第 `max_states` 个 accepted/expanded label 计入预算后，queue 空返回 Complete，否则返回 BudgetExhausted；不会 materialize 下一个 candidate。终局只更新 `NumericObjective`。候选包括所有可达 boundary（door、enemy、resource、event、战略 transition）以及可达受限商店的每个 choice；当前楼层的 `current_floor_immediate` 分析是同一响应中的独立即时 BFS，最多返回 256 个候选。
 
@@ -104,19 +108,23 @@ Phase A 没有独立的 exact `HashSet<SolverState>`。同一结构节点下，`
 
 这一剪枝依赖受支持规则的单调性假设：结构投影相同且资源更多不会减少未来合法动作或终局评分。库存、消费位、flags 和购买计数被放入 key，是为了不把“同一坐标但地图/事件状态不同”错误合并。外部方案若改变 key 或资源维度，必须给出可验证的不变量和反例测试。
 
-stale-source 的计数按 action kind 仅在 profile 开启时记录 `stale_source_by_action_kind`、`skipped_stale_by_action_kind` 与 `unproven_stale_by_action_kind`；后两者分区前者，且这些字段不进入响应。它们是诊断，不是剪枝条件。
+stale-source 的计数按 action kind 仅在 profile 开启时记录 `stale_source_by_action_kind`、`skipped_stale_by_action_kind` 与 `unproven_stale_by_action_kind`；后两者分区前者，且这些字段不进入响应。它们是诊断，不是剪枝条件。**待提交 closeout** 另在 profile JSON 中加入 `accepted_semantic_trace_hash`；该字段同样不进入 HTTP 响应，也不参与搜索决策。
 
 ## 10. 路线记录与 Shadow 边界
 
 Phase 2 的临时节点保存 block/shop 动作及 navigation segment，以及与输出 steps 等长的 typed key；Phase 1 不保留这些数据。响应中的 route 只读描述字段可按 step 类型变化，例如包含 `step_kind`、`floor_id`、坐标和详情；block step 还带 `block_id`，shop step 还带 `shop_id`/`choice_id`。协议递归拒绝 `action`、`operation`、`guard` 等可执行字段。当前 Rust 不自动操作页面、不保存路线到磁盘；下一轮由 JS 重新采集 observation。浏览器 journal 可保存会话/恢复元数据，但不承载 Rust 搜索状态。
 
-## 11. 性能、profile 与内存（11abffc）
+## 11. 性能、profile 与内存（已验收基线 + 待提交 closeout）
 
-严格的 Phase 3 A/B 归档使用同一 request：`594dc6d` 基线对 `11abffc` final；final default-off 样本的 median/p95/max POST 为 `1181.647/1209.779/1220.538 ms`，median/p95/max RSS 为 `49,037,312/49,093,018/49,102,848 B`，canonical response hash 保持 `af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2`。这是单一大 observation 的证据，不是 SLA；另有小型 proven fixture 覆盖 `phase_b_explored > 0`。
+`299786b` 是已验收 Phase 4B static region/portal graph 的功能基线，但旧 7+7 归档的 dirty source SHA 并不等于该提交的历史 `main.rs`，所以不能把旧 `-20.8852%` 数字归因于 `299786b`，该数字也不再作为当前 candidate 的证据。
 
-默认关闭 profile 时只保留开关分支，不创建计时器、HashSet 或 action-kind 诊断数组。`PassabilitySignature` 仅在 `MOTA_SHADOW_PROFILE=1` 下统计 potential hit rate；它不复用 `local_reachable` 结果，也不是 production cache。当前实现没有 local-reachable cache、region/portal graph 或生产 `PassabilitySignature` interning。
+新的固定请求 default-off 7+7 interleaved 归档以本轮隔离重建的 Phase 3 `c20ddd2` 为基线，以源码 SHA-256 `f6e1149bf2daed46ff9458ac2b0723a7b2bcbe85a924cb73ecedf6ae385e05a6` 的**未提交 closeout candidate**为对照。baseline/candidate median POST 为 `1204.340708/1188.036749 ms`，candidate 仅快 `1.3538%`，属于中性结果，不能证明明显性能提升。candidate max RSS 为 `50,020,352 B`（`50.020352 MB` / `47.703125 MiB`），低于 65 MB gate；14 个正式响应的 canonical hash 均为 `af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2`。该载荷 Phase B explored 为 0；证据与完整身份见 [`Phase 4B closeout QA`](qa/phase4b-region-portal-2026-07-18/README.md)。这些数字绑定未提交源码 blob，不属于 `299786b`。
 
-Phase A 的 compact FIFO、interned `StructuralNode`、八维 `ResourceLabel` frontier、COW 状态和位图仍是本提交的内存边界；Phase A 返回后队列/arena 确定性释放，Phase B 只在当前请求保存 route/navigation witness。历史 `af5b511`、`d899a8f` 的固定 RSS/位图快照仅作版本对照，不代表 `11abffc` 的当前承诺。原始小型证据与跨批次限制见 [`Phase 3 preflight QA`](qa/phase3-preflight-2026-07-18/README.md)。
+待提交 closeout 在默认关闭 profile 时只保留既有开关分支，不创建计时器、HashSet、语义哈希状态或 action-kind 诊断数组。`MOTA_SHADOW_PROFILE=1` 的 JSON 额外输出 `accepted_semantic_trace_hash`：按 accepted 顺序流式编码 `StructuralNode`、`ResourceLabel` 与稳定 source-action 身份，不使用 arena/`LabelId`、地址或 `HashMap` 迭代次序。新 QA 中 candidate 的 warmup 加 3 个正式 profile event 都得到 `7f0aeb674cd6f09f`；profile 延迟不与 default-off 延迟混比。unknown/fault、未开启 profile 都不改变 HTTP 响应。`PassabilitySignature` 仅在 profile 下统计旧 BFS potential hit rate；它不复用 `local_reachable` 结果，也不是 production cache。
+
+Phase 4A 的 request-local local-reachable cache 已否决并完整回退：两个变体在同一请求上分别比 baseline 慢 `51.2%` 与 `128.7%`，同时增加 RSS；其 key 投影、probe/hash、buffer 分配没有把高潜在重复率转化为收益。当前实现没有 local-reachable cache、production `PassabilitySignature` interning、跨请求 cache 或持久化；该设计不重试。事实边界见 [`Phase 4A cache rejected`](qa/phase4a-cache-rejected-2026-07-18/README.md)。Phase 4B 仅以请求内 static graph 替换 Phase A connectivity 热路径，不改变求解策略、Phase B 或协议。
+
+Phase A 的 compact FIFO、interned `StructuralNode`、八维 `ResourceLabel` frontier、COW 状态和位图仍是 `299786b` 的内存边界；Phase A 返回后队列/arena 确定性释放，Phase B 只在当前请求保存 route/navigation witness。历史 `af5b511`、`d899a8f` 的固定 RSS/位图快照仅作版本对照，不代表 `299786b` 或待提交 closeout 的当前承诺。原始小型证据与跨批次限制见 [`Phase 3 preflight QA`](qa/phase3-preflight-2026-07-18/README.md)。
 
 ## 12. 为什么 4000 格仍会组合爆炸
 
@@ -128,7 +136,7 @@ Phase A 的 compact FIFO、interned `StructuralNode`、八维 `ResourceLabel` fr
 
 - 50k 预算可能在仍有候选时停止，结果必须显示 `unproven`，不能当作无解或全局最优。
 - Phase A 的 work-item queue、结构/label arena 和 Pareto frontier 仍会随动作组合增长；Phase A 结束后会释放它们，但 Phase 2 的 route/navigation witness 当前仍为完整 `Vec` 深复制，复杂 proven 输入尚未使用 persistent parent/trie/LCP 压缩，也没有最终每类结构的稳定内存配额。
-- 50k A/B 仅覆盖一个 `PhaseB=0` 的未证明请求；不同存档的时间、RSS 和 frontier 形状仍须单独测量。当前 FIFO 的归档数字不构成跨 QA 测量的绝对性能结论。
+- closeout candidate 的 50k A/B 仅覆盖一个 `PhaseB=0` 的未证明请求；不同存档、safe-gate BFS fallback、非零 Phase B 的时间、RSS 和 frontier 形状仍须单独测量。当前中性结果不构成跨 QA 测量的绝对性能结论，也没有证明 candidate 明显快于 Phase 3 baseline。
 - solver model 只覆盖已审计规则子集；真实页面的动态事件、怪物 special、楼梯映射和终局投影仍需以 observation 覆盖率验证。
 - Shadow 输出是路线证明/建议，不是执行授权；`main.js` 的 `shadowOnly: true` 会在任何 adapter/executor 调用前拒绝 `execute` 响应。
 - 现有测试覆盖固定 fixture、协议和 Rust 单元行为；它们不证明任意真实存档都存在完整终局路线。
@@ -155,6 +163,6 @@ Phase A 的 compact FIFO、interned `StructuralNode`、八维 `ResourceLabel` fr
 | 浏览器请求与 Shadow-only | [`src/controller.js`](../src/controller.js)：`cycleBody`；[`src/main.js`](../src/main.js)：`shadowOnly: true` |
 | HTTP/响应 | [`rust/shadow-runtime/src/main.rs`](../rust/shadow-runtime/src/main.rs)：`read_request`、`handle_connection`、`shadow_response` |
 | 状态/位图/去重 | 同上：`SolverState`、`StructuralNode`、`ResourceLabel`、`PhaseALabelStore`、`ConsumedBits`、`global_analysis` |
-| 联通与 route witness | 同上：`ConnectivityIndex::view`、`ReachBoundary`、`ReachTerminal`、`Phase2Node`、`Phase2Route` |
+| 联通与 route witness | 同上：`StaticRegionGraph`、`ConnectivityIndex::view_phase_a`/`view`、`ReachBoundary`、`ReachTerminal`、`Phase2Node`、`Phase2Route`；`BlockPassability` 属于待提交 closeout |
 | 动作模拟 | 同上：`materialize_pending_action`、`apply_audited_event`、`enemy_loss` |
 | 协议约束 | [`protocol/cycle-response.schema.json`](../protocol/cycle-response.schema.json)、[`src/protocol.js`](../src/protocol.js) |

@@ -23,6 +23,8 @@ const SHADOW_REASON: &str =
     "Stage3 Rust shadow runtime analyzed bounded global routes; execution remains disabled.";
 const ALLOWED_ORIGIN: &str = "https://h5mota.com";
 const ALLOWED_REQUEST_HEADERS: [&str; 2] = ["content-type", "x-mota-lab"];
+const ACCEPTED_TRACE_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const ACCEPTED_TRACE_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 // Profiling is deliberately an opt-in runtime diagnostic. The disabled path
 // is one predictable boolean branch and never creates a timer, HashSet, or
@@ -712,6 +714,7 @@ struct ProfileStats {
     phase_a_accepted: u64,
     phase_a_rejected: u64,
     phase_a_pending: u64,
+    accepted_semantic_trace_hash: u64,
 }
 
 #[inline(always)]
@@ -831,7 +834,7 @@ fn profile_finish_json(stats: &ProfileStats) -> Value {
             .map(|kind| (kind.name().to_owned(), Value::from(counts[kind.index()])))
             .collect::<serde_json::Map<_, _>>()
     };
-    json!({
+    let mut result = json!({
         "event": "mota_shadow_profile_v1",
         "phase_a_explored": stats.phase_a_explored,
         "phase_b_explored": stats.phase_b_explored,
@@ -916,7 +919,10 @@ fn profile_finish_json(stats: &ProfileStats) -> Value {
         "passability_signature_request_total": stats.passability_signature_request_total,
         "passability_signature_unique_keys": signature_unique,
         "passability_signature_repeated_keys": signature_repeated,
-    })
+    });
+    result["accepted_semantic_trace_hash"] =
+        Value::from(format!("{:016x}", stats.accepted_semantic_trace_hash));
+    result
 }
 
 struct ProfileGuard {
@@ -930,6 +936,7 @@ impl ProfileGuard {
             PROFILE_CONTEXT.with(|context| {
                 *context.borrow_mut() = Some(ProfileStats {
                     phase: ProfilePhase::PhaseA,
+                    accepted_semantic_trace_hash: ACCEPTED_TRACE_HASH_OFFSET,
                     ..ProfileStats::default()
                 });
             });
@@ -958,6 +965,7 @@ thread_local! {
     static MATERIALIZE_SOURCE_CLONES: Cell<usize> = const { Cell::new(0) };
     // Test-only semantic evidence: it never crosses the shadow protocol.
     static PHASE_A_ACCEPTED_TRACE: RefCell<Vec<SolverState>> = const { RefCell::new(Vec::new()) };
+    static PHASE_A_ACCEPTED_SEMANTIC_HASH: Cell<u64> = const { Cell::new(ACCEPTED_TRACE_HASH_OFFSET) };
     // Keep the stale-pruning witness observable from a complete FIFO run.
     // These counters are test-only and deliberately do not affect release
     // search memory or scheduling.
@@ -1789,6 +1797,14 @@ enum CompiledBlockRule {
     Unsupported,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockPassability {
+    AlwaysFree,
+    DynamicBlocker(usize),
+    PermanentBlocker,
+    Unsafe,
+}
+
 #[allow(dead_code)]
 impl CompiledBlockRule {
     fn metadata(&self) -> Option<&RuleMetadata> {
@@ -1801,6 +1817,37 @@ impl CompiledBlockRule {
             | Self::Shop { meta, .. } => Some(meta),
             Self::Unsupported => None,
         }
+    }
+}
+
+fn block_passability(block: &SolverBlock) -> BlockPassability {
+    let dynamic_or_permanent = || {
+        block
+            .state_slot
+            .map(BlockPassability::DynamicBlocker)
+            .unwrap_or(BlockPassability::PermanentBlocker)
+    };
+    match compiled_rule(block) {
+        CompiledBlockRule::Shop { .. } => BlockPassability::AlwaysFree,
+        CompiledBlockRule::Transition { pure: false, .. } => BlockPassability::Unsafe,
+        CompiledBlockRule::Door { .. }
+        | CompiledBlockRule::Resource { .. }
+        | CompiledBlockRule::Enemy { .. }
+        | CompiledBlockRule::Transition { pure: true, .. }
+        | CompiledBlockRule::Event { .. } => dynamic_or_permanent(),
+        CompiledBlockRule::Unsupported => match block.kind.as_str() {
+            "terrain" | "shop" => BlockPassability::AlwaysFree,
+            "door" | "resource" | "enemy" | "event" | "opaque" => dynamic_or_permanent(),
+            _ => BlockPassability::Unsafe,
+        },
+    }
+}
+
+fn block_blocks_cell(state: &SolverState, block: &SolverBlock) -> bool {
+    match block_passability(block) {
+        BlockPassability::AlwaysFree => false,
+        BlockPassability::DynamicBlocker(slot) => !state.consumed.read(slot).unwrap_or(false),
+        BlockPassability::PermanentBlocker | BlockPassability::Unsafe => true,
     }
 }
 
@@ -2253,7 +2300,6 @@ impl PhaseALabelStore {
             .get_mut(structural_id.0)
             .expect("interned structural ID must have a frontier slot")
             .push(id);
-        profile_with_stats(|stats| stats.phase_a_accepted += 1);
         Some(id)
     }
 }
@@ -2448,6 +2494,142 @@ impl PhaseAActionRef {
             _ => false,
         }
     }
+}
+
+fn accepted_trace_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(ACCEPTED_TRACE_HASH_PRIME);
+    }
+}
+
+fn accepted_trace_u64(hash: &mut u64, value: u64) {
+    accepted_trace_bytes(hash, &value.to_be_bytes());
+}
+
+fn accepted_trace_string(hash: &mut u64, value: &str) {
+    accepted_trace_u64(hash, value.len() as u64);
+    accepted_trace_bytes(hash, value.as_bytes());
+}
+
+fn accepted_trace_entries(hash: &mut u64, entries: &[(String, u64)]) {
+    accepted_trace_u64(hash, entries.len() as u64);
+    for (name, value) in entries {
+        accepted_trace_string(hash, name);
+        accepted_trace_u64(hash, *value);
+    }
+}
+
+fn update_accepted_semantic_trace(
+    hash: &mut u64,
+    state: &SolverState,
+    source_action: Option<PhaseAActionRef>,
+    blocks: &[SolverBlock],
+    shops: &[CompiledShop],
+) {
+    // Versioned, length-delimited canonical content. The trace deliberately
+    // excludes arena IDs, LabelIds, addresses, and HashMap iteration order.
+    accepted_trace_bytes(hash, b"phase-a-accepted-v1");
+    accepted_trace_string(hash, &state.floor);
+    for value in [state.x, state.y, state.level] {
+        accepted_trace_u64(hash, value);
+    }
+    accepted_trace_entries(hash, &state.inventory);
+    accepted_trace_u64(hash, state.consumed.bit_len as u64);
+    accepted_trace_u64(hash, state.consumed.words.len() as u64);
+    for word in state.consumed.words.iter() {
+        accepted_trace_u64(hash, *word);
+    }
+    accepted_trace_u64(hash, state.shop_counts.len() as u64);
+    for count in state.shop_counts.iter() {
+        accepted_trace_u64(hash, *count);
+    }
+    accepted_trace_entries(hash, &state.flags);
+    for value in [
+        state.hp.0,
+        state.attack.0,
+        state.defense.0,
+        state.gold,
+        state.experience,
+        state.yellow,
+        state.blue,
+        state.red,
+    ] {
+        accepted_trace_u64(hash, value);
+    }
+    let Some(action) = source_action else {
+        accepted_trace_bytes(hash, b"initial");
+        return;
+    };
+    if action.tagged_index & PHASE_A_SHOP_ACTION == 0 {
+        accepted_trace_bytes(hash, b"block");
+        if let Some(block) = usize::try_from(action.tagged_index)
+            .ok()
+            .and_then(|index| blocks.get(index))
+        {
+            accepted_trace_string(hash, &block.floor);
+            accepted_trace_string(hash, &block.id);
+            accepted_trace_string(hash, &block.kind);
+            accepted_trace_u64(hash, block.x);
+            accepted_trace_u64(hash, block.y);
+            accepted_trace_u64(hash, block.numeric_id.unwrap_or(u64::MAX));
+        } else {
+            accepted_trace_bytes(hash, b"invalid");
+        }
+        return;
+    }
+    accepted_trace_bytes(hash, b"shop");
+    let shop_index = usize::try_from(action.tagged_index & !PHASE_A_SHOP_ACTION).ok();
+    let choice_index = usize::try_from(action.choice_index).ok();
+    if let (Some(shop), Some(choice)) = (
+        shop_index.and_then(|index| shops.get(index)),
+        choice_index.and_then(|index| {
+            shop_index
+                .and_then(|shop| shops.get(shop))?
+                .choices
+                .get(index)
+        }),
+    ) {
+        accepted_trace_string(hash, &shop.shop_id);
+        accepted_trace_string(hash, &choice.choice_id);
+    } else {
+        accepted_trace_bytes(hash, b"invalid");
+    }
+    if let Some(block) = usize::try_from(action.shop_block_index)
+        .ok()
+        .and_then(|index| blocks.get(index))
+    {
+        accepted_trace_string(hash, &block.floor);
+        accepted_trace_string(hash, &block.id);
+        accepted_trace_u64(hash, block.x);
+        accepted_trace_u64(hash, block.y);
+    } else {
+        accepted_trace_bytes(hash, b"invalid-tile");
+    }
+}
+
+fn profile_record_accepted_semantic_trace(
+    state: &SolverState,
+    source_action: Option<PhaseAActionRef>,
+    blocks: &[SolverBlock],
+    shops: &[CompiledShop],
+) {
+    profile_with_stats(|stats| {
+        stats.phase_a_accepted += 1;
+        update_accepted_semantic_trace(
+            &mut stats.accepted_semantic_trace_hash,
+            state,
+            source_action,
+            blocks,
+            shops,
+        )
+    });
+    #[cfg(test)]
+    PHASE_A_ACCEPTED_SEMANTIC_HASH.with(|hash| {
+        let mut value = hash.get();
+        update_accepted_semantic_trace(&mut value, state, source_action, blocks, shops);
+        hash.set(value);
+    });
 }
 
 impl PhaseAWorkItem {
@@ -3164,7 +3346,7 @@ impl StaticRegionGraph {
             floor.blocks_by_cell[cell].iter().any(|&index| {
                 blocks
                     .get(index)
-                    .is_none_or(|block| block.kind != "terrain" && block.kind != "shop")
+                    .is_none_or(|block| block_passability(block) != BlockPassability::AlwaysFree)
             })
         };
         let mut region_by_cell = vec![usize::MAX; floor.cells.len()];
@@ -3202,9 +3384,9 @@ impl StaticRegionGraph {
                 .iter()
                 .copied()
                 .filter(|&index| {
-                    blocks
-                        .get(index)
-                        .is_none_or(|block| block.kind != "terrain" && block.kind != "shop")
+                    blocks.get(index).is_none_or(|block| {
+                        block_passability(block) != BlockPassability::AlwaysFree
+                    })
                 })
                 .collect();
             portal_by_cell[cell] = portals.len();
@@ -3251,7 +3433,7 @@ impl StaticRegionGraph {
         self.portals[portal].blockers.iter().all(|&index| {
             blocks
                 .get(index)
-                .is_some_and(|block| block_is_consumed(state, block))
+                .is_some_and(|block| !block_blocks_cell(state, block))
         })
     }
 
@@ -3397,19 +3579,9 @@ impl ConnectivityIndex {
             })
             .collect::<HashMap<_, _>>();
         let region_graph_safe = floors.values().all(|floor| floor.region_graph.is_some())
-            && blocks.iter().all(|block| {
-                matches!(
-                    block.kind.as_str(),
-                    "door"
-                        | "resource"
-                        | "enemy"
-                        | "transition"
-                        | "event"
-                        | "shop"
-                        | "opaque"
-                        | "terrain"
-                )
-            });
+            && blocks
+                .iter()
+                .all(|block| block_passability(block) != BlockPassability::Unsafe);
         let reversible = (0..blocks.len())
             .map(|index| reversible_transition_partner(index, blocks))
             .collect();
@@ -3417,8 +3589,10 @@ impl ConnectivityIndex {
             .then(|| {
                 blocks
                     .iter()
-                    .filter(|block| block.kind != "terrain" && block.kind != "shop")
-                    .filter_map(|block| block.state_slot)
+                    .filter_map(|block| match block_passability(block) {
+                        BlockPassability::DynamicBlocker(slot) => Some(slot),
+                        _ => None,
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -3517,12 +3691,9 @@ impl ConnectivityIndex {
                 if seen[next] || !floor.cells[next] {
                     continue;
                 }
-                let blocked = floor.blocks_by_cell[next].iter().any(|&index| {
-                    let block = &blocks[index];
-                    !block_is_consumed(state, block)
-                        && block.kind != "terrain"
-                        && block.kind != "shop"
-                });
+                let blocked = floor.blocks_by_cell[next]
+                    .iter()
+                    .any(|&index| block_blocks_cell(state, &blocks[index]));
                 if !blocked {
                     seen[next] = true;
                     queue.push_back(next);
@@ -5051,6 +5222,7 @@ struct PhaseAResult {
 #[cfg(test)]
 fn clear_phase_a_accepted_trace() {
     PHASE_A_ACCEPTED_TRACE.with(|trace| trace.borrow_mut().clear());
+    PHASE_A_ACCEPTED_SEMANTIC_HASH.with(|hash| hash.set(ACCEPTED_TRACE_HASH_OFFSET));
 }
 
 #[cfg(test)]
@@ -5084,6 +5256,11 @@ fn record_phase_a_accepted(state: &SolverState) {
 #[cfg(test)]
 fn take_phase_a_accepted_trace() -> Vec<SolverState> {
     PHASE_A_ACCEPTED_TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
+}
+
+#[cfg(test)]
+fn phase_a_accepted_semantic_hash() -> u64 {
+    PHASE_A_ACCEPTED_SEMANTIC_HASH.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -5184,6 +5361,7 @@ fn run_numeric_proof_with_stale_skip(
     let initial_view = connectivity.view_phase_a(&initial, floors, blocks, terminals);
     (initial.floor, initial.x, initial.y) = initial_view.representative.clone();
     if let Some(initial_id) = store.accept(initial.clone()) {
+        profile_record_accepted_semantic_trace(&initial, None, blocks, shops);
         #[cfg(test)]
         record_phase_a_accepted(&initial);
         if !initial_view.terminals.is_empty() {
@@ -5247,6 +5425,7 @@ fn run_numeric_proof_with_stale_skip(
         (candidate.state.floor, candidate.state.x, candidate.state.y) = view.representative.clone();
         if let Some(label_id) = store.accept(candidate.state.clone()) {
             let node = candidate.state;
+            profile_record_accepted_semantic_trace(&node, Some(work_item.action), blocks, shops);
             #[cfg(test)]
             record_phase_a_accepted(&node);
 
@@ -6627,8 +6806,10 @@ mod tests {
         ];
         let passability_slots: Vec<_> = blocks
             .iter()
-            .filter(|block| block.kind != "terrain" && block.kind != "shop")
-            .filter_map(|block| block.state_slot)
+            .filter_map(|block| match block_passability(block) {
+                BlockPassability::DynamicBlocker(slot) => Some(slot),
+                _ => None,
+            })
             .collect();
         assert_eq!(passability_slots, vec![0, 1, 2]);
         let mut state = terminal_node(1, 1, 10, "base");
@@ -7307,6 +7488,7 @@ mod tests {
         );
         assert!(matches!(result.outcome, PhaseAOutcome::Complete(_)));
         assert_eq!(take_phase_a_accepted_trace(), expected);
+        let graph_hash = phase_a_accepted_semantic_hash();
         let no_skip = run_numeric_proof_without_stale_skip(
             &initial,
             16,
@@ -7327,6 +7509,22 @@ mod tests {
         };
         assert_eq!(objective(&result.outcome), objective(&no_skip.outcome));
         assert_eq!(result.explored, no_skip.explored);
+        assert_eq!(phase_a_accepted_semantic_hash(), graph_hash);
+
+        let mut bfs_connectivity = ConnectivityIndex::new(&floors, &blocks);
+        bfs_connectivity.region_graph_safe = false;
+        let bfs = run_numeric_proof(
+            &initial,
+            16,
+            &bfs_connectivity,
+            &floors,
+            &blocks,
+            &[("F", (0, 0))],
+            &[],
+        );
+        assert_eq!(phase_a_accepted_semantic_hash(), graph_hash);
+        assert_eq!(objective(&result.outcome), objective(&bfs.outcome));
+        assert_eq!(result.explored, bfs.explored);
     }
 
     #[test]
@@ -7791,6 +7989,130 @@ mod tests {
             let graph = connectivity.view_phase_a(&state, &floors, &blocks, &terminals);
             let bfs = connectivity.view(&state, &floors, &blocks, &terminals, false);
             assert_connectivity_views_equal(&graph, &bfs);
+        }
+    }
+
+    #[test]
+    fn region_graph_matches_bfs_on_fixed_two_dimensional_passability_edges() {
+        let transition = |floor: &str,
+                          x: u64,
+                          y: u64,
+                          id: &str,
+                          target_floor: &str,
+                          target_x: u64,
+                          target_y: u64| {
+            SolverBlock {
+                floor: floor.into(),
+                x,
+                y,
+                id: id.into(),
+                kind: "transition".into(),
+                data: json!({"block_id":id,"floor_id":floor,"initial_active":true,
+                    "kind":"transition","numeric_id":1,"x":x,"y":y,
+                    "target":{"floor_id":target_floor,"x":target_x,"y":target_y}}),
+                numeric_id: Some(1),
+                ..SolverBlock::fixture_defaults()
+            }
+        };
+        let blocks = vec![
+            SolverBlock {
+                floor: "A".into(),
+                x: 1,
+                y: 0,
+                id: "door-a".into(),
+                kind: "door".into(),
+                data: json!({"key_cost":{"yellow":1}}),
+                state_slot: Some(0),
+                ..SolverBlock::fixture_defaults()
+            },
+            SolverBlock {
+                floor: "A".into(),
+                x: 1,
+                y: 0,
+                id: "same-cell-resource".into(),
+                kind: "resource".into(),
+                data: json!({"delta":{}}),
+                state_slot: Some(1),
+                ..SolverBlock::fixture_defaults()
+            },
+            SolverBlock {
+                floor: "A".into(),
+                x: 2,
+                y: 0,
+                id: "adjacent-door".into(),
+                kind: "door".into(),
+                data: json!({"key_cost":{"yellow":1}}),
+                state_slot: Some(2),
+                ..SolverBlock::fixture_defaults()
+            },
+            SolverBlock {
+                floor: "A".into(),
+                x: 3,
+                y: 0,
+                id: "permanent-wall".into(),
+                kind: "opaque".into(),
+                data: json!({}),
+                state_slot: None,
+                ..SolverBlock::fixture_defaults()
+            },
+            transition("A", 1, 2, "stairs-left", "B", 0, 0),
+            transition("B", 0, 0, "stairs-left-back", "A", 1, 2),
+            transition("A", 4, 2, "stairs-right", "B", 4, 0),
+            transition("B", 4, 0, "stairs-right-back", "A", 4, 2),
+            SolverBlock {
+                floor: "A".into(),
+                x: 4,
+                y: 2,
+                id: "transition-cell-event".into(),
+                kind: "event".into(),
+                data: json!({"event":{"id":"dialogue_once"}}),
+                state_slot: Some(3),
+                ..SolverBlock::fixture_defaults()
+            },
+        ];
+        let a_cells = (0..6)
+            .flat_map(|x| [(x, 0), (x, 2)])
+            .chain([(0, 1), (5, 1)])
+            .collect();
+        let floors = HashMap::from([
+            (
+                "A".into(),
+                SolverFloor {
+                    width: 6,
+                    height: 3,
+                    cells: a_cells,
+                    blocks: vec![0, 1, 2, 3, 4, 6, 8],
+                },
+            ),
+            (
+                "B".into(),
+                SolverFloor {
+                    width: 5,
+                    height: 1,
+                    cells: (0..5).map(|x| (x, 0)).collect(),
+                    blocks: vec![5, 7],
+                },
+            ),
+        ]);
+        let connectivity = ConnectivityIndex::new(&floors, &blocks);
+        assert!(connectivity.region_graph_safe);
+        assert_eq!(
+            block_passability(&blocks[3]),
+            BlockPassability::PermanentBlocker
+        );
+        for mask in 0_u64..16 {
+            for start in [(0, 0), (1, 0), (0, 2)] {
+                let mut state = terminal_node(10, 10, 100, "two-dimensional");
+                state.floor = "A".into();
+                (state.x, state.y) = start;
+                state.consumed = ConsumedBits::from_bools(
+                    &(0..4).map(|bit| mask & (1 << bit) != 0).collect::<Vec<_>>(),
+                );
+                let terminals = [("A", (5, 0)), ("B", (2, 0))];
+                let graph = connectivity.view_phase_a(&state, &floors, &blocks, &terminals);
+                let bfs = connectivity.view(&state, &floors, &blocks, &terminals, false);
+                assert_connectivity_views_equal(&graph, &bfs);
+            }
         }
     }
 
