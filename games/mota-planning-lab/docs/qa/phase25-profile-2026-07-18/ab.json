@@ -1,0 +1,107 @@
+{
+  "schema": "mota-phase25-profile-v1",
+  "request": {
+    "sha256": "508b4d25557b0c30b649d5e923a5ec9fa3470dc8555d8d49e3dcb9bad98ba55e",
+    "bytes": 2576604
+  },
+  "versions": {
+    "A": {
+      "binary": "/private/tmp/mota-phase25-bins/4a7ad6c",
+      "binary_sha256": "bdcc5ab317f0757d23b52c8aecce48f828116022542e4a3913f25e820a8bdc22",
+      "source": "/private/tmp/mota-phase25-source/4a7ad6c/games/mota-planning-lab/rust/shadow-runtime/src/main.rs",
+      "source_sha256": "326aedf0cf8a4727b3f6bf472ffc1ca1302b46eab3b66b737408181fb1c41171"
+    },
+    "B": {
+      "binary": "/private/tmp/mota-phase25-bins/d899a8f",
+      "binary_sha256": "612b3081f9f33e6b2e53220d189e032051a120d6b03fea72d9fe8b5aa17caaec",
+      "source": "/private/tmp/mota-phase25-source/d899a8f/games/mota-planning-lab/rust/shadow-runtime/src/main.rs",
+      "source_sha256": "4034598278b73a17f692a189f99a5744a8780d76c8c061b136e68a4879ab3dc2"
+    },
+    "C": {
+      "binary": "/private/tmp/mota-phase25-build/d596e59-profiled2/release/mota-shadow-runtime",
+      "binary_sha256": "baa573399c967058d8d0f6b4d37dd49a96d4f1dd407d23bcd974612c67e55d0f",
+      "source": "/Users/nihplod/Documents/codes/frontend/scripts/userscripts/games/mota-planning-lab/rust/shadow-runtime/src/main.rs",
+      "source_sha256": "217d8aaf938b78d9d9f7286565481a59a2924a52a30f2148d351f9e1b117777a"
+    }
+  },
+  "method": {
+    "warmups_per_version": 1,
+    "official_samples_per_version": 10,
+    "order": [
+      "A",
+      "B",
+      "C",
+      "A",
+      "B",
+      "C",
+      "A",
+      "B",
+      "C",
+      "A",
+      "B",
+      "C",
+      "A",
+      "B",
+      "C",
+      "A",
+      "B",
+      "C",
+      "A",
+      "B",
+      "C",
+      "A",
+      "B",
+      "C",
+      "A",
+      "B",
+      "C",
+      "A",
+      "B",
+      "C"
+    ],
+    "request": "pure POST /cycle",
+    "rss": "service PID sampled every 10 ms",
+    "canonical_response": "sorted JSON with shadow.cycle removed"
+  },
+  "results": {
+    "A": {
+      "median_post_ms": 1974.2083540186286,
+      "p95_post_ms": 2095.2471187338233,
+      "max_post_ms": 2144.27512511611,
+      "median_rss_bytes": 140853248.0,
+      "p95_rss_bytes": 141452083.2,
+      "max_rss_bytes": 141459456,
+      "canonical_response_hashes": [
+        "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2"
+      ]
+    },
+    "B": {
+      "median_post_ms": 3288.0975622683764,
+      "p95_post_ms": 3370.037362491712,
+      "max_post_ms": 3377.7506249025464,
+      "median_rss_bytes": 81666048.0,
+      "p95_rss_bytes": 82861260.8,
+      "max_rss_bytes": 83738624,
+      "canonical_response_hashes": [
+        "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2"
+      ]
+    },
+    "C": {
+      "median_post_ms": 1421.7353956773877,
+      "p95_post_ms": 1463.2147230673581,
+      "max_post_ms": 1475.1569163054228,
+      "median_rss_bytes": 51994624.0,
+      "p95_rss_bytes": 52002816.0,
+      "max_rss_bytes": 52002816,
+      "canonical_response_hashes": [
+        "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2"
+      ]
+    }
+  },
+  "profile_events": {
+    "A": [],
+    "B": [],
+    "C": []
+  },
+  "raw_samples_tsv": "/private/tmp/mota-phase25-profile-2026-07-18-final/samples.tsv"
+}

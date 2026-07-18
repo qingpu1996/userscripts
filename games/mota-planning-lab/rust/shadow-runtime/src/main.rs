@@ -1,13 +1,16 @@
 use serde_json::{Value, json};
 #[cfg(test)]
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 // The browser accepts an 8 MiB engine model. Reserve another MiB for the
@@ -20,6 +23,282 @@ const SHADOW_REASON: &str =
     "Stage3 Rust shadow runtime analyzed bounded global routes; execution remains disabled.";
 const ALLOWED_ORIGIN: &str = "https://h5mota.com";
 const ALLOWED_REQUEST_HEADERS: [&str; 2] = ["content-type", "x-mota-lab"];
+
+// Profiling is deliberately an opt-in runtime diagnostic. The disabled path
+// is one predictable boolean branch and never creates a timer, HashSet, or
+// per-request allocation. A profile is held in TLS because the listener is
+// currently single threaded while keeping the instrumentation safe if the
+// transport is made concurrent later.
+static PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
+thread_local! {
+    static PROFILE_CONTEXT: RefCell<Option<ProfileStats>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone, Copy)]
+enum ProfilePhase {
+    PhaseA,
+    PhaseB,
+}
+
+impl Default for ProfilePhase {
+    fn default() -> Self {
+        Self::PhaseA
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MaterializeKind {
+    Door,
+    Resource,
+    Enemy,
+    Transition,
+    Event,
+    Shop,
+    Invalid,
+}
+
+impl MaterializeKind {
+    const ALL: [Self; 7] = [
+        Self::Door,
+        Self::Resource,
+        Self::Enemy,
+        Self::Transition,
+        Self::Event,
+        Self::Shop,
+        Self::Invalid,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Door => 0,
+            Self::Resource => 1,
+            Self::Enemy => 2,
+            Self::Transition => 3,
+            Self::Event => 4,
+            Self::Shop => 5,
+            Self::Invalid => 6,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Door => "door",
+            Self::Resource => "resource",
+            Self::Enemy => "enemy",
+            Self::Transition => "transition",
+            Self::Event => "event",
+            Self::Shop => "shop",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProfileStats {
+    phase: ProfilePhase,
+    phase_a_materialize_calls: [u64; 7],
+    phase_a_materialize_ns: [u64; 7],
+    phase_a_materialize_feasible: u64,
+    phase_a_materialize_infeasible: u64,
+    phase_b_materialize_calls: [u64; 7],
+    phase_b_materialize_ns: [u64; 7],
+    phase_b_materialize_feasible: u64,
+    phase_b_materialize_infeasible: u64,
+    work_items_popped: u64,
+    stale_source_work_items: u64,
+    connectivity_view_calls: u64,
+    connectivity_view_ns: u64,
+    local_reachable_calls: u64,
+    local_reachable_ns: u64,
+    structural_hash_calls: u64,
+    structural_hash_ns: u64,
+    structural_equality_checks: u64,
+    frontier_comparisons: u64,
+    frontier_ns: u64,
+    enqueue_actions_ns: u64,
+    topology_query_total: u64,
+    topology_unique_keys: HashSet<(usize, u64, u64)>,
+    phase_a_explored: u64,
+    phase_b_explored: u64,
+}
+
+#[inline(always)]
+fn profiling_enabled() -> bool {
+    *PROFILE_ENABLED.get_or_init(|| env::var("MOTA_SHADOW_PROFILE").as_deref() == Ok("1"))
+}
+
+#[inline]
+fn profile_with_stats<F>(update: F)
+where
+    F: FnOnce(&mut ProfileStats),
+{
+    if !profiling_enabled() {
+        return;
+    }
+    PROFILE_CONTEXT.with(|context| {
+        if let Some(stats) = context.borrow_mut().as_mut() {
+            update(stats);
+        }
+    });
+}
+
+#[inline]
+fn profile_start() -> Option<Instant> {
+    profiling_enabled().then(Instant::now)
+}
+
+#[inline]
+fn profile_elapsed(start: Option<Instant>, update: impl FnOnce(&mut ProfileStats, u64)) {
+    let Some(start) = start else {
+        return;
+    };
+    let nanos = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    profile_with_stats(|stats| update(stats, nanos));
+}
+
+fn profile_set_phase(phase: ProfilePhase) {
+    profile_with_stats(|stats| stats.phase = phase);
+}
+
+fn profile_materialize_attempt(kind: MaterializeKind, feasible: bool, elapsed: u64) {
+    profile_with_stats(|stats| {
+        let (calls, nanos, feasible_count, infeasible_count) = match stats.phase {
+            ProfilePhase::PhaseA => (
+                &mut stats.phase_a_materialize_calls,
+                &mut stats.phase_a_materialize_ns,
+                &mut stats.phase_a_materialize_feasible,
+                &mut stats.phase_a_materialize_infeasible,
+            ),
+            ProfilePhase::PhaseB => (
+                &mut stats.phase_b_materialize_calls,
+                &mut stats.phase_b_materialize_ns,
+                &mut stats.phase_b_materialize_feasible,
+                &mut stats.phase_b_materialize_infeasible,
+            ),
+        };
+        calls[kind.index()] += 1;
+        nanos[kind.index()] += elapsed;
+        if feasible {
+            *feasible_count += 1;
+        } else {
+            *infeasible_count += 1;
+        }
+    });
+}
+
+fn profile_finish_json(stats: &ProfileStats) -> Value {
+    let materialize = |calls: &[u64; 7], nanos: &[u64; 7], feasible: u64, infeasible: u64| {
+        let by_kind = MaterializeKind::ALL
+            .into_iter()
+            .map(|kind| {
+                (
+                    kind.name().to_owned(),
+                    json!({"calls": calls[kind.index()], "ns": nanos[kind.index()]}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        json!({
+            "feasible": feasible,
+            "infeasible": infeasible,
+            "calls": calls.iter().sum::<u64>(),
+            "ns": nanos.iter().sum::<u64>(),
+            "by_action_kind": by_kind,
+        })
+    };
+    let unique = stats.topology_unique_keys.len() as u64;
+    let repeated = stats.topology_query_total.saturating_sub(unique);
+    json!({
+        "event": "mota_shadow_profile_v1",
+        "phase_a_explored": stats.phase_a_explored,
+        "phase_b_explored": stats.phase_b_explored,
+        "work_items_popped": stats.work_items_popped,
+        "stale_source_work_items": stats.stale_source_work_items,
+        "materialize_feasible": stats.phase_a_materialize_feasible,
+        "materialize_infeasible": stats.phase_a_materialize_infeasible,
+        "materialize_calls": stats.phase_a_materialize_calls.iter().sum::<u64>(),
+        "materialize": {
+            "phase_a": materialize(
+                &stats.phase_a_materialize_calls,
+                &stats.phase_a_materialize_ns,
+                stats.phase_a_materialize_feasible,
+                stats.phase_a_materialize_infeasible,
+            ),
+            "phase_b": materialize(
+                &stats.phase_b_materialize_calls,
+                &stats.phase_b_materialize_ns,
+                stats.phase_b_materialize_feasible,
+                stats.phase_b_materialize_infeasible,
+            ),
+        },
+        "connectivity_view": {
+            "calls": stats.connectivity_view_calls,
+            "ns": stats.connectivity_view_ns,
+        },
+        "connectivity_view_calls": stats.connectivity_view_calls,
+        "connectivity_view_ns": stats.connectivity_view_ns,
+        "local_reachable": {
+            "calls": stats.local_reachable_calls,
+            "ns": stats.local_reachable_ns,
+        },
+        "local_reachable_calls": stats.local_reachable_calls,
+        "local_reachable_ns": stats.local_reachable_ns,
+        "structural_hash": {
+            "calls": stats.structural_hash_calls,
+            "ns": stats.structural_hash_ns,
+        },
+        "structural_hash_calls": stats.structural_hash_calls,
+        "structural_hash_ns": stats.structural_hash_ns,
+        "structural_equality_checks": stats.structural_equality_checks,
+        "frontier": {
+            "comparisons": stats.frontier_comparisons,
+            "ns": stats.frontier_ns,
+        },
+        "frontier_comparisons": stats.frontier_comparisons,
+        "frontier_ns": stats.frontier_ns,
+        "enqueue_actions_ns": stats.enqueue_actions_ns,
+        "topology": {
+            "query_total": stats.topology_query_total,
+            "unique_keys": unique,
+            "repeated_keys": repeated,
+            "key": "interned exact floor topology id + raw start x/y",
+        },
+        "topology_query_total": stats.topology_query_total,
+        "topology_unique_keys": unique,
+        "topology_repeated_keys": repeated,
+    })
+}
+
+struct ProfileGuard {
+    enabled: bool,
+}
+
+impl ProfileGuard {
+    fn new() -> Self {
+        let enabled = profiling_enabled();
+        if enabled {
+            PROFILE_CONTEXT.with(|context| {
+                *context.borrow_mut() = Some(ProfileStats {
+                    phase: ProfilePhase::PhaseA,
+                    ..ProfileStats::default()
+                });
+            });
+        }
+        Self { enabled }
+    }
+}
+
+impl Drop for ProfileGuard {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let stats = PROFILE_CONTEXT.with(|context| context.borrow_mut().take());
+        if let Some(stats) = stats {
+            eprintln!("{}", profile_finish_json(&stats));
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static PHASE2_CALLS: Cell<usize> = const { Cell::new(0) };
@@ -880,15 +1159,22 @@ struct PhaseALabelStore {
 
 impl PhaseALabelStore {
     fn structural_hash(node: &StructuralNode) -> u64 {
+        let started = profile_start();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         node.hash(&mut hasher);
-        hasher.finish()
+        let hash = hasher.finish();
+        profile_elapsed(started, |stats, nanos| {
+            stats.structural_hash_calls += 1;
+            stats.structural_hash_ns += nanos;
+        });
+        hash
     }
 
     fn find_structural(&self, node: &StructuralNode) -> Option<StructuralNodeId> {
         let hash = Self::structural_hash(node);
         self.structural_ids.get(&hash).and_then(|ids| {
             ids.iter().copied().find(|id| {
+                profile_with_stats(|stats| stats.structural_equality_checks += 1);
                 self.structural_nodes
                     .get(id.0)
                     .is_some_and(|existing| existing == node)
@@ -923,15 +1209,20 @@ impl PhaseALabelStore {
     }
 
     fn frontier_accepts(&self, structural_id: StructuralNodeId, resources: &ResourceLabel) -> bool {
-        self.frontiers
+        let started = profile_start();
+        let result = self
+            .frontiers
             .get(structural_id.0)
             .into_iter()
             .flatten()
             .all(|id| {
+                profile_with_stats(|stats| stats.frontier_comparisons += 1);
                 self.labels
                     .get(id.0)
                     .is_none_or(|label| !label.resources.dominates(resources))
-            })
+            });
+        profile_elapsed(started, |stats, nanos| stats.frontier_ns += nanos);
+        result
     }
 
     fn stale_dominated_labels(
@@ -939,6 +1230,7 @@ impl PhaseALabelStore {
         structural_id: StructuralNodeId,
         resources: &ResourceLabel,
     ) {
+        let started = profile_start();
         let dominated: Vec<LabelId> = self
             .frontiers
             .get(structural_id.0)
@@ -946,6 +1238,7 @@ impl PhaseALabelStore {
             .flatten()
             .copied()
             .filter(|id| {
+                profile_with_stats(|stats| stats.frontier_comparisons += 1);
                 self.labels
                     .get(id.0)
                     .is_some_and(|label| resources.dominates(&label.resources))
@@ -961,6 +1254,7 @@ impl PhaseALabelStore {
             .get_mut(structural_id.0)
             .expect("interned structural ID must have a frontier slot")
             .retain(|id| labels.get(id.0).is_some_and(|label| !label.stale));
+        profile_elapsed(started, |stats, nanos| stats.frontier_ns += nanos);
     }
 
     // Equality is intentionally covered here: `dominates` is reflexive, so a
@@ -1153,6 +1447,7 @@ fn enqueue_phase_a_actions(
     view: &ConnectivityView,
     shops: &[Value],
 ) {
+    let started = profile_start();
     for boundary in &view.boundaries {
         if let Some(action) = PhaseAActionRef::block(boundary)
             && let Some(item) = PhaseAWorkItem::new(source_label, action)
@@ -1179,6 +1474,7 @@ fn enqueue_phase_a_actions(
             }
         }
     }
+    profile_elapsed(started, |stats, nanos| stats.enqueue_actions_ns += nanos);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1489,6 +1785,17 @@ struct ConnectivityFloor {
     height: usize,
     cells: Vec<bool>,
     blocks_by_cell: Vec<Vec<usize>>,
+    // Profile-only identity. It is interned from the exact static topology
+    // (including block-index layout) and is otherwise just zero.
+    topology_id: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TopologyDescriptor {
+    width: usize,
+    height: usize,
+    cells: Vec<bool>,
+    blocks_by_cell: Vec<Vec<usize>>,
 }
 
 struct ConnectivityIndex {
@@ -1717,6 +2024,8 @@ fn reversible_transition_partner(index: usize, blocks: &[SolverBlock]) -> Option
 
 impl ConnectivityIndex {
     fn new(floors: &HashMap<String, SolverFloor>, blocks: &[SolverBlock]) -> Self {
+        let profile_topology = profiling_enabled();
+        let mut topology_descriptors = Vec::<TopologyDescriptor>::new();
         let floors = floors
             .iter()
             .map(|(id, floor)| {
@@ -1740,6 +2049,26 @@ impl ConnectivityIndex {
                         }
                     }
                 }
+                let topology_id = if profile_topology {
+                    let descriptor = TopologyDescriptor {
+                        width,
+                        height,
+                        cells: cells.clone(),
+                        blocks_by_cell: blocks_by_cell.clone(),
+                    };
+                    if let Some(existing) = topology_descriptors
+                        .iter()
+                        .position(|candidate| candidate == &descriptor)
+                    {
+                        existing
+                    } else {
+                        let id = topology_descriptors.len();
+                        topology_descriptors.push(descriptor);
+                        id
+                    }
+                } else {
+                    0
+                };
                 (
                     id.clone(),
                     ConnectivityFloor {
@@ -1747,6 +2076,7 @@ impl ConnectivityIndex {
                         height,
                         cells,
                         blocks_by_cell,
+                        topology_id,
                     },
                 )
             })
@@ -1758,6 +2088,30 @@ impl ConnectivityIndex {
     }
 
     fn local_reachable(
+        &self,
+        state: &SolverState,
+        floor_id: &str,
+        start: (u64, u64),
+        blocks: &[SolverBlock],
+    ) -> (Vec<bool>, Option<usize>) {
+        profile_with_stats(|stats| {
+            stats.topology_query_total += 1;
+            if let Some(floor) = self.floors.get(floor_id) {
+                stats
+                    .topology_unique_keys
+                    .insert((floor.topology_id, start.0, start.1));
+            }
+        });
+        let started = profile_start();
+        let result = self.local_reachable_inner(state, floor_id, start, blocks);
+        profile_elapsed(started, |stats, nanos| {
+            stats.local_reachable_calls += 1;
+            stats.local_reachable_ns += nanos;
+        });
+        result
+    }
+
+    fn local_reachable_inner(
         &self,
         state: &SolverState,
         floor_id: &str,
@@ -1839,6 +2193,23 @@ impl ConnectivityIndex {
     }
 
     fn view(
+        &self,
+        state: &SolverState,
+        floors: &HashMap<String, SolverFloor>,
+        blocks: &[SolverBlock],
+        terminals: &[(&str, (u64, u64))],
+        record_navigation: bool,
+    ) -> ConnectivityView {
+        let started = profile_start();
+        let result = self.view_inner(state, floors, blocks, terminals, record_navigation);
+        profile_elapsed(started, |stats, nanos| {
+            stats.connectivity_view_calls += 1;
+            stats.connectivity_view_ns += nanos;
+        });
+        result
+    }
+
+    fn view_inner(
         &self,
         state: &SolverState,
         floors: &HashMap<String, SolverFloor>,
@@ -2357,6 +2728,48 @@ fn materialize_pending_action(
     shops: &[Value],
     record_route: bool,
 ) -> Option<MaterializedCandidate> {
+    let kind = if profiling_enabled() {
+        match &pending_action {
+            PendingAction::Block { index, .. } => blocks
+                .get(*index)
+                .map(|block| match block.kind.as_str() {
+                    "door" => MaterializeKind::Door,
+                    "resource" => MaterializeKind::Resource,
+                    "enemy" => MaterializeKind::Enemy,
+                    "transition" => MaterializeKind::Transition,
+                    "event" => MaterializeKind::Event,
+                    _ => MaterializeKind::Invalid,
+                })
+                .unwrap_or(MaterializeKind::Invalid),
+            PendingAction::Shop { .. } => MaterializeKind::Shop,
+        }
+    } else {
+        MaterializeKind::Invalid
+    };
+    let started = profile_start();
+    let result =
+        materialize_pending_action_inner(source, pending_action, blocks, shops, record_route);
+    if started.is_some() {
+        profile_materialize_attempt(
+            kind,
+            result.is_some(),
+            started
+                .expect("profile timer exists when profiling is enabled")
+                .elapsed()
+                .as_nanos()
+                .min(u64::MAX as u128) as u64,
+        );
+    }
+    result
+}
+
+fn materialize_pending_action_inner(
+    source: &SolverState,
+    pending_action: PendingAction,
+    blocks: &[SolverBlock],
+    shops: &[Value],
+    record_route: bool,
+) -> Option<MaterializedCandidate> {
     let mut next = MaterializedCandidate {
         state: source.clone(),
         route_action: None,
@@ -2684,12 +3097,15 @@ fn enqueue_phase2_action(
     blocks: &[SolverBlock],
     shops: &[Value],
 ) {
+    let started = profile_start();
     let Some(materialized) =
         materialize_pending_action(&source.state, action.clone(), blocks, shops, true)
     else {
+        profile_elapsed(started, |stats, nanos| stats.enqueue_actions_ns += nanos);
         return;
     };
     let Some(route_action) = materialized.route_action else {
+        profile_elapsed(started, |stats, nanos| stats.enqueue_actions_ns += nanos);
         return;
     };
     let mut steps = source.steps.clone();
@@ -2709,6 +3125,7 @@ fn enqueue_phase2_action(
         segments,
         visited_states: source.visited_states.clone(),
     });
+    profile_elapsed(started, |stats, nanos| stats.enqueue_actions_ns += nanos);
 }
 
 fn replay_phase2_route(
@@ -2937,6 +3354,7 @@ fn run_numeric_proof(
     terminals: &[(&str, (u64, u64))],
     shops: &[Value],
 ) -> PhaseAResult {
+    profile_set_phase(ProfilePhase::PhaseA);
     #[cfg(test)]
     let _drop_probe = PhaseADropProbe;
     #[cfg(test)]
@@ -2982,15 +3400,28 @@ fn run_numeric_proof(
     }
 
     while let Some(work_item) = queue.pop_front() {
+        profile_with_stats(|stats| stats.work_items_popped += 1);
         // Labels are append-only. A dominated source stays addressable and its
         // already-enqueued action remains part of FIFO semantics.
         let Some(source_id) = work_item.source_label() else {
+            profile_materialize_attempt(MaterializeKind::Invalid, false, 0);
             continue;
         };
+        profile_with_stats(|stats| {
+            if store
+                .labels
+                .get(source_id.0)
+                .is_some_and(|label| label.stale)
+            {
+                stats.stale_source_work_items += 1;
+            }
+        });
         let Some(source) = store.state_for(source_id) else {
+            profile_materialize_attempt(MaterializeKind::Invalid, false, 0);
             continue;
         };
         let Some(action) = work_item.action.pending_action(blocks, shops) else {
+            profile_materialize_attempt(MaterializeKind::Invalid, false, 0);
             continue;
         };
         let Some(mut candidate) = materialize_pending_action(&source, action, blocks, shops, false)
@@ -3209,6 +3640,7 @@ fn global_analysis_with_stats(
         phase_a_explored: proof.explored,
         phase_b_explored: 0,
     };
+    profile_with_stats(|profile| profile.phase_a_explored = proof.explored as u64);
     let explored = proof.explored;
     match proof.outcome {
         PhaseAOutcome::BudgetExhausted => (
@@ -3217,6 +3649,7 @@ fn global_analysis_with_stats(
             stats,
         ),
         PhaseAOutcome::Complete(Some(target)) => {
+            profile_set_phase(ProfilePhase::PhaseB);
             match extract_route_witness(
                 &initial,
                 target,
@@ -3232,6 +3665,9 @@ fn global_analysis_with_stats(
                     explored: phase_b_explored,
                 } => {
                     stats.phase_b_explored = phase_b_explored;
+                    profile_with_stats(|profile| {
+                        profile.phase_b_explored = phase_b_explored as u64
+                    });
                     let first = best.steps.first().cloned();
                     (
                         json!({"scope":"global_terminal_route","proof":"proven","reason":"complete terminal route found","truncated":false,
@@ -3244,6 +3680,9 @@ fn global_analysis_with_stats(
                     explored: phase_b_explored,
                 } => {
                     stats.phase_b_explored = phase_b_explored;
+                    profile_with_stats(|profile| {
+                        profile.phase_b_explored = phase_b_explored as u64
+                    });
                     (
                         json!({"scope":"global_terminal_route","proof":"unproven","reason":"search_budget_exhausted",
                 "truncated":true,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null}),
@@ -3254,6 +3693,9 @@ fn global_analysis_with_stats(
                     explored: phase_b_explored,
                 } => {
                     stats.phase_b_explored = phase_b_explored;
+                    profile_with_stats(|profile| {
+                        profile.phase_b_explored = phase_b_explored as u64
+                    });
                     (
                         json!({"scope":"global_terminal_route","proof":"unproven","reason":"route_witness_unavailable",
                 "truncated":false,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null}),
@@ -3271,6 +3713,7 @@ fn global_analysis_with_stats(
 }
 
 fn shadow_response(body: &[u8], state: &Mutex<ShadowState>) -> Result<Value, Value> {
+    let _profile_guard = ProfileGuard::new();
     let request: Value = serde_json::from_slice(body)
         .map_err(|_| error("INVALID_JSON", "Request body must be JSON."))?;
     let request = request
