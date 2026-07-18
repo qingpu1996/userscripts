@@ -623,7 +623,7 @@ impl Default for ProfilePhase {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MaterializeKind {
     Door,
     Resource,
@@ -684,6 +684,9 @@ struct ProfileStats {
     work_items_popped: u64,
     stale_source_work_items: u64,
     skipped_stale_source_work_items: u64,
+    stale_source_by_action_kind: [u64; 7],
+    skipped_stale_by_action_kind: [u64; 7],
+    unproven_stale_by_action_kind: [u64; 7],
     connectivity_view_calls: u64,
     connectivity_view_ns: u64,
     local_reachable_calls: u64,
@@ -771,6 +774,28 @@ fn profile_materialize_attempt(kind: MaterializeKind, feasible: bool, elapsed: u
     });
 }
 
+#[inline(always)]
+fn profile_stale_source(
+    action: PhaseAActionRef,
+    blocks: &[SolverBlock],
+    shops: &[CompiledShop],
+    skipped: bool,
+) {
+    if !profiling_enabled() {
+        return;
+    }
+    let kind = action.materialize_kind(blocks, shops);
+    profile_with_stats(|stats| {
+        let index = kind.index();
+        stats.stale_source_by_action_kind[index] += 1;
+        if skipped {
+            stats.skipped_stale_by_action_kind[index] += 1;
+        } else {
+            stats.unproven_stale_by_action_kind[index] += 1;
+        }
+    });
+}
+
 fn profile_finish_json(stats: &ProfileStats) -> Value {
     let materialize = |calls: &[u64; 7], nanos: &[u64; 7], feasible: u64, infeasible: u64| {
         let by_kind = MaterializeKind::ALL
@@ -796,6 +821,12 @@ fn profile_finish_json(stats: &ProfileStats) -> Value {
     let signature_repeated = stats
         .passability_signature_request_total
         .saturating_sub(signature_unique);
+    let stale_by_kind = |counts: &[u64; 7]| {
+        MaterializeKind::ALL
+            .into_iter()
+            .map(|kind| (kind.name().to_owned(), Value::from(counts[kind.index()])))
+            .collect::<serde_json::Map<_, _>>()
+    };
     json!({
         "event": "mota_shadow_profile_v1",
         "phase_a_explored": stats.phase_a_explored,
@@ -806,6 +837,9 @@ fn profile_finish_json(stats: &ProfileStats) -> Value {
         "work_items_popped": stats.work_items_popped,
         "stale_source_work_items": stats.stale_source_work_items,
         "skipped_stale_source_work_items": stats.skipped_stale_source_work_items,
+        "stale_source_by_action_kind": stale_by_kind(&stats.stale_source_by_action_kind),
+        "skipped_stale_by_action_kind": stale_by_kind(&stats.skipped_stale_by_action_kind),
+        "unproven_stale_by_action_kind": stale_by_kind(&stats.unproven_stale_by_action_kind),
         "materialize_feasible": stats.phase_a_materialize_feasible,
         "materialize_infeasible": stats.phase_a_materialize_infeasible,
         "materialize_calls": stats.phase_a_materialize_calls.iter().sum::<u64>(),
@@ -2353,6 +2387,31 @@ impl PhaseAActionRef {
             floor: shop_block.floor.clone(),
             adjacent,
         })
+    }
+
+    fn materialize_kind(self, blocks: &[SolverBlock], shops: &[CompiledShop]) -> MaterializeKind {
+        if self.tagged_index & PHASE_A_SHOP_ACTION != 0 {
+            return self
+                .pending_action(blocks, shops)
+                .map(|_| MaterializeKind::Shop)
+                .unwrap_or(MaterializeKind::Invalid);
+        }
+        let Some(block) = usize::try_from(self.tagged_index)
+            .ok()
+            .and_then(|index| blocks.get(index))
+        else {
+            return MaterializeKind::Invalid;
+        };
+        match compiled_rule(block) {
+            CompiledBlockRule::Door { .. } => MaterializeKind::Door,
+            CompiledBlockRule::Resource { .. } => MaterializeKind::Resource,
+            CompiledBlockRule::Enemy { .. } => MaterializeKind::Enemy,
+            CompiledBlockRule::Transition { .. } => MaterializeKind::Transition,
+            CompiledBlockRule::Event { .. } => MaterializeKind::Event,
+            CompiledBlockRule::Shop { .. } | CompiledBlockRule::Unsupported => {
+                MaterializeKind::Invalid
+            }
+        }
     }
 
     // Only these rules have a Phase 3B preservation proof:
@@ -4748,6 +4807,7 @@ fn run_numeric_proof_with_stale_skip(
             let skip = stale_skip_enabled
                 && store.has_live_dominator(source_id)
                 && work_item.action.stale_source_skip_is_proven(blocks);
+            profile_stale_source(work_item.action, blocks, shops, skip);
             #[cfg(test)]
             record_phase_a_stale(true, skip);
             if skip {
@@ -5900,6 +5960,125 @@ mod tests {
     }
 
     #[test]
+    fn profile_stale_action_kind_fields_are_stable_and_partitioned() {
+        let mut stats = ProfileStats::default();
+        for (index, kind) in MaterializeKind::ALL.into_iter().enumerate() {
+            stats.stale_source_by_action_kind[index] = (index as u64) + 3;
+            stats.skipped_stale_by_action_kind[index] = (index as u64) % 2;
+            stats.unproven_stale_by_action_kind[index] = stats.stale_source_by_action_kind[index]
+                - stats.skipped_stale_by_action_kind[index];
+            assert_eq!(kind.index(), index);
+        }
+        let profile = profile_finish_json(&stats);
+        let stale = profile["stale_source_by_action_kind"].as_object().unwrap();
+        let skipped = profile["skipped_stale_by_action_kind"].as_object().unwrap();
+        let unproven = profile["unproven_stale_by_action_kind"]
+            .as_object()
+            .unwrap();
+        let names: Vec<_> = MaterializeKind::ALL
+            .into_iter()
+            .map(MaterializeKind::name)
+            .collect();
+        assert_eq!(stale.keys().map(String::as_str).collect::<Vec<_>>(), {
+            let mut sorted = names.clone();
+            sorted.sort_unstable();
+            sorted
+        });
+        for (index, name) in names.into_iter().enumerate() {
+            assert_eq!(
+                stale[name].as_u64().unwrap(),
+                skipped[name].as_u64().unwrap() + unproven[name].as_u64().unwrap()
+            );
+            assert_eq!(stale[name].as_u64().unwrap(), (index as u64) + 3);
+        }
+    }
+
+    #[test]
+    fn action_kind_classifier_covers_every_compiled_rule() {
+        let data = [
+            (
+                "door",
+                json!({"key_cost":{"yellow":0}}),
+                MaterializeKind::Door,
+            ),
+            (
+                "resource",
+                json!({"delta":{"gold":1}}),
+                MaterializeKind::Resource,
+            ),
+            (
+                "enemy",
+                json!({"enemy":{"hp":1,"attack":1,"defense":0,"gold":0,"experience":0}}),
+                MaterializeKind::Enemy,
+            ),
+            (
+                "transition",
+                json!({"target":{"floor_id":"G","x":0,"y":0}}),
+                MaterializeKind::Transition,
+            ),
+            (
+                "event",
+                json!({"event":{"id":"dialogue_once"}}),
+                MaterializeKind::Event,
+            ),
+        ];
+        for (index, (kind, data, expected)) in data.into_iter().enumerate() {
+            let block = SolverBlock {
+                floor: "F".into(),
+                x: index as u64,
+                y: 0,
+                id: format!("{kind}-{index}"),
+                kind: kind.into(),
+                data,
+                state_slot: Some(index),
+                ..SolverBlock::fixture_defaults()
+            };
+            let blocks = vec![block];
+            let action = PhaseAActionRef {
+                tagged_index: 0,
+                choice_index: 0,
+                adjacent_x: 0,
+                adjacent_y: 0,
+                shop_block_index: 0,
+            };
+            assert_eq!(action.materialize_kind(&blocks, &[]), expected);
+        }
+        let shop_block = SolverBlock {
+            floor: "F".into(),
+            x: 0,
+            y: 0,
+            id: "shop-block".into(),
+            kind: "shop".into(),
+            data: json!({"shop_id":"shop"}),
+            ..SolverBlock::fixture_defaults()
+        };
+        let blocks = vec![shop_block];
+        let shops = vec![
+            compile_shop(&json!({"shop_id":"shop","choices":[
+                {"choice_id":"one","currency":"gold","base_cost":0,
+                 "increment_per_purchase":0,"purchase_count":0,
+                 "effect":{"field":"attack","amount":1}}
+            ]}))
+            .unwrap(),
+        ];
+        let action = PhaseAActionRef::shop(
+            0,
+            0,
+            &ReachShop {
+                block_index: 0,
+                floor: "F".into(),
+                adjacent: (0, 0),
+                navigation: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            action.materialize_kind(&blocks, &shops),
+            MaterializeKind::Shop
+        );
+    }
+
+    #[test]
     fn proven_stale_actions_preserve_weak_feasibility_and_successor_dominance() {
         let door = SolverBlock {
             floor: "F".into(),
@@ -6201,6 +6380,155 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct TinyPrng(u64);
+
+    impl TinyPrng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        fn next(&mut self) -> u64 {
+            // xorshift64 is sufficient for a deterministic bounded test; the
+            // oracle deliberately has no external random dependency.
+            let mut value = self.0;
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            self.0 = value;
+            value
+        }
+
+        fn range(&mut self, upper: u64) -> u64 {
+            self.next() % upper
+        }
+    }
+
+    struct TinyDifferentialWorld {
+        initial: SolverState,
+        floors: HashMap<String, SolverFloor>,
+        blocks: Vec<SolverBlock>,
+        terminals: Vec<(String, (u64, u64))>,
+    }
+
+    fn tiny_differential_world(seed: u64) -> TinyDifferentialWorld {
+        let mut random = TinyPrng::new(seed | 1);
+        let resource_count = if seed == 0x82 {
+            1
+        } else {
+            2 + random.range(3) as usize
+        };
+        let proven_count = 1 + random.range(3) as usize;
+        let transition_world = random.range(2) == 1;
+        let width = (resource_count + proven_count + 2) as u64;
+        let mut blocks = Vec::new();
+        blocks.push(SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "resource_multiply".into(),
+            kind: "resource".into(),
+            data: json!({"delta":{"multiply":{"attack":2.0}}}),
+            state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
+        });
+        if resource_count >= 2 {
+            blocks.push(SolverBlock {
+                floor: "F".into(),
+                x: 0,
+                y: 1,
+                id: "resource_add".into(),
+                kind: "resource".into(),
+                data: json!({"delta":{"attack":1.0}}),
+                state_slot: Some(1),
+                ..SolverBlock::fixture_defaults()
+            });
+        }
+        let mut next_slot = 2;
+        for index in 2..resource_count {
+            let amount = 1 + random.range(4);
+            blocks.push(SolverBlock {
+                floor: "F".into(),
+                x: index as u64,
+                y: 0,
+                id: format!("resource_extra_{index}"),
+                kind: "resource".into(),
+                data: json!({"delta":{"attack":amount}}),
+                state_slot: Some(next_slot),
+                ..SolverBlock::fixture_defaults()
+            });
+            next_slot += 1;
+        }
+        for index in 0..proven_count {
+            let block_index = blocks.len();
+            if transition_world {
+                blocks.push(SolverBlock {
+                    floor: "F".into(),
+                    x: (resource_count + index) as u64,
+                    y: 0,
+                    id: format!("transition_{index}"),
+                    kind: "transition".into(),
+                    data: json!({"target":{"floor_id":"G","x":0,"y":0}}),
+                    ..SolverBlock::fixture_defaults()
+                });
+            } else {
+                blocks.push(SolverBlock {
+                    floor: "F".into(),
+                    x: (resource_count + index) as u64,
+                    y: 0,
+                    id: format!("door_{index}"),
+                    kind: "door".into(),
+                    data: json!({"key_cost":{"yellow":1,"blue":0,"red":0}}),
+                    state_slot: Some(next_slot),
+                    ..SolverBlock::fixture_defaults()
+                });
+                next_slot += 1;
+            }
+            debug_assert_eq!(block_index, resource_count + index);
+        }
+        let cells = (0..2)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .collect::<HashSet<_>>();
+        let floors = HashMap::from([
+            (
+                "F".into(),
+                SolverFloor {
+                    width,
+                    height: 2,
+                    cells,
+                    blocks: (0..blocks.len()).collect(),
+                },
+            ),
+            ("G".into(), indexed_floor(1, Vec::new())),
+        ]);
+        let mut initial = terminal_node(1, 1, 100, "random");
+        initial.consumed = ConsumedBits::from_bools(&vec![false; next_slot]);
+        initial.yellow = if transition_world {
+            0
+        } else {
+            proven_count as u64
+        };
+        let terminals = if transition_world {
+            vec![("G".into(), (0, 0))]
+        } else {
+            vec![("F".into(), (width - 1, 0))]
+        };
+        TinyDifferentialWorld {
+            initial,
+            floors,
+            blocks,
+            terminals,
+        }
+    }
+
+    fn phase_b_outcome_key(outcome: &Phase2Outcome) -> (u8, Option<Vec<Value>>) {
+        match outcome {
+            Phase2Outcome::Found { route, .. } => (0, Some(route.steps.clone())),
+            Phase2Outcome::BudgetExhausted { .. } => (1, None),
+            Phase2Outcome::NoWitness { .. } => (2, None),
+        }
+    }
+
     #[test]
     fn stale_door_and_pure_transition_skip_are_fifo_oracle_equivalent() {
         for action_kind in ["door", "transition"] {
@@ -6215,6 +6543,140 @@ mod tests {
             assert_eq!(phase_a_outcome_key(&pruned), phase_a_outcome_key(&oracle));
             assert!(phase_a_outcome_key(&pruned).1.is_some());
         }
+    }
+
+    #[test]
+    fn deterministic_random_small_world_differential_oracle_exercises_stale_fifo() {
+        // Each world has 1-4 resources and 1-3 proven door or pure-transition
+        // actions. Budget one proves the exhausted branch; 512 is sufficient
+        // for these bounded worlds to reach a complete Phase A and Phase B.
+        for seed in [0x11_u64, 0x23, 0x37, 0x82, 0x5b, 0x6d, 0x7f, 0x91] {
+            let world = tiny_differential_world(seed);
+            let terminals: Vec<_> = world
+                .terminals
+                .iter()
+                .map(|(floor, position)| (floor.as_str(), *position))
+                .collect();
+            let connectivity = ConnectivityIndex::new(&world.floors, &world.blocks);
+            let mut complete_target = None;
+            for budget in [1, 512] {
+                clear_rule_fault();
+                let pruned = run_numeric_proof(
+                    &world.initial,
+                    budget,
+                    &connectivity,
+                    &world.floors,
+                    &world.blocks,
+                    &terminals,
+                    &[],
+                );
+                let (observed, skipped) = take_phase_a_stale_counts();
+                clear_rule_fault();
+                let oracle = run_numeric_proof_without_stale_skip(
+                    &world.initial,
+                    budget,
+                    &connectivity,
+                    &world.floors,
+                    &world.blocks,
+                    &terminals,
+                    &[],
+                );
+                let (_, oracle_skipped) = take_phase_a_stale_counts();
+                assert_eq!(
+                    phase_a_outcome_key(&pruned),
+                    phase_a_outcome_key(&oracle),
+                    "seed={seed:#x} budget={budget}"
+                );
+                assert_eq!(oracle_skipped, 0, "oracle must retain stale work");
+                if budget == 512 {
+                    if seed != 0x82 {
+                        assert!(observed > 0, "seed={seed:#x} must observe stale work");
+                        assert!(skipped > 0, "seed={seed:#x} must skip proven stale work");
+                    }
+                    if let PhaseAOutcome::Complete(Some(target)) = pruned.outcome {
+                        complete_target = Some(target);
+                        let pruned_route = extract_route_witness(
+                            &world.initial,
+                            target,
+                            budget,
+                            &connectivity,
+                            &world.floors,
+                            &world.blocks,
+                            &terminals,
+                            &[],
+                        );
+                        let oracle_route = extract_route_witness(
+                            &world.initial,
+                            target,
+                            budget,
+                            &connectivity,
+                            &world.floors,
+                            &world.blocks,
+                            &terminals,
+                            &[],
+                        );
+                        assert_eq!(
+                            phase_b_outcome_key(&pruned_route),
+                            phase_b_outcome_key(&oracle_route),
+                            "seed={seed:#x} canonical route"
+                        );
+                        assert!(matches!(pruned_route, Phase2Outcome::Found { .. }));
+                    }
+                }
+            }
+            assert!(complete_target.is_some(), "seed={seed:#x} must complete");
+        }
+
+        // A/B/C are intentionally ordered in the label frontier. Their
+        // queued work remains FIFO even while A and B are stale; only C is
+        // live at the end of the dominance chain.
+        let door = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "fifo-door".into(),
+            kind: "door".into(),
+            data: json!({"key_cost":{"yellow":0}}),
+            state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
+        };
+        let blocks = vec![door];
+        let mut weak = terminal_node(1, 1, 10, "A");
+        weak.yellow = 1;
+        weak.consumed = ConsumedBits::from_bools(&[false]);
+        let mut middle = weak.clone();
+        middle.attack = F64Bits::new(2.0).unwrap();
+        middle.yellow = 2;
+        let mut strong = middle.clone();
+        strong.attack = F64Bits::new(3.0).unwrap();
+        strong.yellow = 3;
+        let mut store = empty_phase_a_store();
+        let a = store.accept(weak).unwrap();
+        let b = store.accept(middle).unwrap();
+        let c = store.accept(strong).unwrap();
+        assert!(store.is_stale(a));
+        assert!(store.is_stale(b));
+        assert!(!store.is_stale(c));
+        assert!(store.has_live_dominator(a));
+        assert!(store.has_live_dominator(b));
+        assert!(!store.has_live_dominator(c));
+        let action = PhaseAActionRef {
+            tagged_index: 0,
+            choice_index: 0,
+            adjacent_x: 0,
+            adjacent_y: 0,
+            shop_block_index: 0,
+        };
+        let mut queue = VecDeque::new();
+        for source in [a, b, c] {
+            queue.push_back(PhaseAWorkItem::new(source, action).unwrap());
+        }
+        let sources: Vec<_> = queue
+            .drain(..)
+            .map(|item| item.source_label().unwrap())
+            .collect();
+        assert_eq!(sources, vec![a, b, c]);
+        assert!(action.stale_source_skip_is_proven(&blocks));
     }
 
     #[test]
@@ -7803,6 +8265,23 @@ mod tests {
         assert!(stats.phase_a_explored > 0);
         assert!(stats.phase_b_explored > 0);
         PHASE2_SAW_PHASE_A_DROPPED.with(|seen| assert!(seen.get()));
+    }
+
+    #[test]
+    fn proven_phase_b_fixture_replays_and_repeats_canonical_route_json() {
+        let observation = fifo_same_state_tie_observation(false);
+        let (first, first_stats) = global_analysis_with_stats(observation.as_object().unwrap());
+        let (second, second_stats) = global_analysis_with_stats(observation.as_object().unwrap());
+        assert_eq!(first["proof"], "proven");
+        assert_eq!(second["proof"], "proven");
+        assert!(first_stats.phase_b_explored > 0);
+        assert!(second_stats.phase_b_explored > 0);
+        assert_eq!(first["route"], second["route"]);
+        assert_eq!(
+            first["route"]["steps"][0]["block_id"], "a_later",
+            "Phase B must retain the canonical tie-break witness"
+        );
+        assert_eq!(first["route"]["step_count"], 2);
     }
 
     #[test]
