@@ -34,6 +34,569 @@ thread_local! {
     static PROFILE_CONTEXT: RefCell<Option<ProfileStats>> = const { RefCell::new(None) };
 }
 
+fn compiled_number(value: Option<&Value>, default: f64, name: &str) -> Result<f64, String> {
+    let number = value.map_or(Ok(default), |value| {
+        value.as_f64().ok_or_else(|| format!("{name}_invalid"))
+    })?;
+    number
+        .is_finite()
+        .then_some(number)
+        .ok_or_else(|| format!("{name}_non_finite"))
+}
+
+fn compiled_u64(value: Option<&Value>, default: u64, name: &str) -> Result<u64, String> {
+    value.map_or(Ok(default), |value| {
+        value.as_u64().ok_or_else(|| format!("{name}_invalid"))
+    })
+}
+
+fn required_compiled_u64(value: Option<&Value>, name: &str) -> Result<u64, String> {
+    value
+        .ok_or_else(|| format!("{name}_missing"))
+        .and_then(|value| value.as_u64().ok_or_else(|| format!("{name}_invalid")))
+}
+
+fn compile_delta(value: &Value) -> Result<CompiledDelta, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "resource_delta_invalid".to_owned())?;
+    let multiply = match object.get("multiply") {
+        None => None,
+        Some(Value::Object(items)) => Some(items),
+        _ => return Err("resource_multiply_invalid".to_owned()),
+    };
+    let keys = match object.get("keys") {
+        None => None,
+        Some(Value::Object(items)) => Some(items),
+        _ => return Err("resource_keys_invalid".to_owned()),
+    };
+    let inventory = match object.get("inventory") {
+        None => Vec::new(),
+        Some(Value::Object(items)) => items
+            .iter()
+            .map(|(id, count)| {
+                Ok((
+                    id.clone(),
+                    compiled_u64(Some(count), 0, "resource_inventory_count")?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        _ => return Err("resource_inventory_invalid".to_owned()),
+    };
+    Ok(CompiledDelta {
+        hp: compiled_number(object.get("hp"), 0.0, "resource_hp")?,
+        attack: compiled_number(object.get("attack"), 0.0, "resource_attack")?,
+        defense: compiled_number(object.get("defense"), 0.0, "resource_defense")?,
+        gold: compiled_u64(object.get("gold"), 0, "resource_gold")?,
+        experience: compiled_u64(object.get("experience"), 0, "resource_experience")?,
+        level: compiled_u64(object.get("level"), 0, "resource_level")?,
+        multiply_hp: compiled_number(
+            multiply.and_then(|items| items.get("hp")),
+            1.0,
+            "resource_multiply_hp",
+        )?,
+        multiply_attack: compiled_number(
+            multiply.and_then(|items| items.get("attack")),
+            1.0,
+            "resource_multiply_attack",
+        )?,
+        multiply_defense: compiled_number(
+            multiply.and_then(|items| items.get("defense")),
+            1.0,
+            "resource_multiply_defense",
+        )?,
+        yellow: compiled_u64(
+            keys.and_then(|items| items.get("yellow")),
+            0,
+            "resource_yellow",
+        )?,
+        blue: compiled_u64(keys.and_then(|items| items.get("blue")), 0, "resource_blue")?,
+        red: compiled_u64(keys.and_then(|items| items.get("red")), 0, "resource_red")?,
+        inventory,
+    })
+}
+
+fn rule_metadata(
+    reads: RuleReads,
+    writes: RuleWrites,
+    monotonicity: MonotonicityClass,
+) -> RuleMetadata {
+    RuleMetadata {
+        reads,
+        writes,
+        monotonicity,
+    }
+}
+
+fn resource_metadata(delta: &CompiledDelta) -> RuleMetadata {
+    let mut reads = ResourceMask(0);
+    let mut writes = ResourceMask(0);
+    for (amount, multiplier, mask) in [
+        (delta.hp, delta.multiply_hp, ResourceMask::HP),
+        (delta.attack, delta.multiply_attack, ResourceMask::ATTACK),
+        (delta.defense, delta.multiply_defense, ResourceMask::DEFENSE),
+    ] {
+        if amount != 0.0 || multiplier != 1.0 {
+            writes = writes.union(mask);
+        }
+        if multiplier != 1.0 {
+            reads = reads.union(mask);
+        }
+    }
+    for (amount, mask) in [
+        (delta.gold, ResourceMask::GOLD),
+        (delta.experience, ResourceMask::EXPERIENCE),
+        (delta.level, ResourceMask::LEVEL),
+        (delta.yellow, ResourceMask::YELLOW),
+        (delta.blue, ResourceMask::BLUE),
+        (delta.red, ResourceMask::RED),
+    ] {
+        if amount != 0 {
+            writes = writes.union(mask);
+        }
+    }
+    rule_metadata(
+        RuleReads {
+            resources: reads,
+            inventory: false,
+            flags: false,
+            consumed_slots: true,
+            shop_counts: false,
+            topology: false,
+        },
+        RuleWrites {
+            resources: writes,
+            inventory: !delta.inventory.is_empty(),
+            flags: false,
+            consumed_slots: true,
+            shop_counts: false,
+            topology: false,
+            monotone_structure_only: true,
+        },
+        MonotonicityClass::Unproven,
+    )
+}
+
+fn compile_block_rule(kind: &str, data: &Value) -> Result<CompiledBlockRule, String> {
+    let object = data
+        .as_object()
+        .ok_or_else(|| "block_data_invalid".to_owned())?;
+    let all_resources = ResourceMask::HP
+        .union(ResourceMask::ATTACK)
+        .union(ResourceMask::DEFENSE)
+        .union(ResourceMask::GOLD)
+        .union(ResourceMask::EXPERIENCE)
+        .union(ResourceMask::YELLOW)
+        .union(ResourceMask::BLUE)
+        .union(ResourceMask::RED)
+        .union(ResourceMask::LEVEL);
+    match kind {
+        "door" => {
+            let costs = match object.get("key_cost") {
+                None => None,
+                Some(Value::Object(items)) => Some(items),
+                _ => return Err("door_key_cost_invalid".to_owned()),
+            };
+            let inventory = match object.get("inventory_cost") {
+                None => Vec::new(),
+                Some(Value::Object(items)) => items
+                    .iter()
+                    .map(|(id, count)| {
+                        Ok((
+                            id.clone(),
+                            compiled_u64(Some(count), 0, "door_inventory_cost")?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+                _ => return Err("door_inventory_cost_invalid".to_owned()),
+            };
+            let mut key_mask = ResourceMask(0);
+            for (count, mask) in [
+                (
+                    compiled_u64(costs.and_then(|v| v.get("yellow")), 0, "door_yellow")?,
+                    ResourceMask::YELLOW,
+                ),
+                (
+                    compiled_u64(costs.and_then(|v| v.get("blue")), 0, "door_blue")?,
+                    ResourceMask::BLUE,
+                ),
+                (
+                    compiled_u64(costs.and_then(|v| v.get("red")), 0, "door_red")?,
+                    ResourceMask::RED,
+                ),
+            ] {
+                if count != 0 {
+                    key_mask = key_mask.union(mask);
+                }
+            }
+            let uses_inventory = !inventory.is_empty();
+            Ok(CompiledBlockRule::Door {
+                yellow: if key_mask.0 & ResourceMask::YELLOW.0 != 0 {
+                    compiled_u64(costs.and_then(|v| v.get("yellow")), 0, "door_yellow")?
+                } else {
+                    0
+                },
+                blue: if key_mask.0 & ResourceMask::BLUE.0 != 0 {
+                    compiled_u64(costs.and_then(|v| v.get("blue")), 0, "door_blue")?
+                } else {
+                    0
+                },
+                red: if key_mask.0 & ResourceMask::RED.0 != 0 {
+                    compiled_u64(costs.and_then(|v| v.get("red")), 0, "door_red")?
+                } else {
+                    0
+                },
+                inventory,
+                meta: rule_metadata(
+                    RuleReads {
+                        resources: key_mask,
+                        inventory: uses_inventory,
+                        flags: false,
+                        consumed_slots: true,
+                        shop_counts: false,
+                        topology: false,
+                    },
+                    RuleWrites {
+                        resources: key_mask,
+                        inventory: uses_inventory,
+                        flags: false,
+                        consumed_slots: true,
+                        shop_counts: false,
+                        topology: false,
+                        monotone_structure_only: true,
+                    },
+                    MonotonicityClass::Unproven,
+                ),
+            })
+        }
+        "resource" => {
+            let delta = compile_delta(
+                object
+                    .get("delta")
+                    .ok_or_else(|| "resource_delta_missing".to_owned())?,
+            )?;
+            let metadata = resource_metadata(&delta);
+            Ok(CompiledBlockRule::Resource {
+                delta,
+                meta: metadata,
+            })
+        }
+        "enemy" => {
+            let enemy = object
+                .get("enemy")
+                .and_then(Value::as_object)
+                .ok_or_else(|| "enemy_invalid".to_owned())?;
+            Ok(CompiledBlockRule::Enemy {
+                enemy: CompiledEnemy {
+                    hp: required_compiled_u64(enemy.get("hp"), "enemy_hp")?,
+                    attack: required_compiled_u64(enemy.get("attack"), "enemy_attack")?,
+                    defense: required_compiled_u64(enemy.get("defense"), "enemy_defense")?,
+                    gold: required_compiled_u64(enemy.get("gold"), "enemy_gold")?,
+                    experience: required_compiled_u64(enemy.get("experience"), "enemy_experience")?,
+                },
+                meta: rule_metadata(
+                    RuleReads {
+                        resources: ResourceMask::HP
+                            .union(ResourceMask::ATTACK)
+                            .union(ResourceMask::DEFENSE),
+                        inventory: false,
+                        flags: false,
+                        consumed_slots: true,
+                        shop_counts: false,
+                        topology: false,
+                    },
+                    RuleWrites {
+                        resources: ResourceMask::HP
+                            .union(ResourceMask::GOLD)
+                            .union(ResourceMask::EXPERIENCE),
+                        inventory: false,
+                        flags: false,
+                        consumed_slots: true,
+                        shop_counts: false,
+                        topology: false,
+                        monotone_structure_only: true,
+                    },
+                    MonotonicityClass::Unproven,
+                ),
+            })
+        }
+        "transition" => {
+            let target = object
+                .get("target")
+                .and_then(Value::as_object)
+                .ok_or_else(|| "transition_target_invalid".to_owned())?;
+            // Disabled-at-start is represented by the consumed-slot state,
+            // not a hidden transition effect. Only extra producer fields make
+            // this transition semantically impure and globally unsupported.
+            let pure = object.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "block_id"
+                        | "floor_id"
+                        | "initial_active"
+                        | "kind"
+                        | "numeric_id"
+                        | "target"
+                        | "x"
+                        | "y"
+                )
+            });
+            Ok(CompiledBlockRule::Transition {
+                floor: required_string(target, "floor_id")
+                    .map_err(|_| "transition_floor_invalid".to_owned())?
+                    .to_owned(),
+                x: required_compiled_u64(target.get("x"), "transition_x")?,
+                y: required_compiled_u64(target.get("y"), "transition_y")?,
+                pure,
+                meta: rule_metadata(
+                    RuleReads {
+                        resources: ResourceMask(0),
+                        inventory: false,
+                        flags: false,
+                        consumed_slots: false,
+                        shop_counts: false,
+                        topology: true,
+                    },
+                    RuleWrites {
+                        resources: ResourceMask(0),
+                        inventory: false,
+                        flags: false,
+                        consumed_slots: false,
+                        shop_counts: false,
+                        topology: true,
+                        monotone_structure_only: false,
+                    },
+                    MonotonicityClass::Unproven,
+                ),
+            })
+        }
+        "event" => {
+            let id = object
+                .get("event")
+                .and_then(Value::as_object)
+                .and_then(|event| event.get("id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| "event_id_invalid".to_owned())?;
+            let event =
+                CompiledAuditedEvent::parse(id).ok_or_else(|| "event_unsupported".to_owned())?;
+            Ok(CompiledBlockRule::Event {
+                event,
+                meta: rule_metadata(
+                    RuleReads {
+                        resources: all_resources,
+                        inventory: true,
+                        flags: true,
+                        consumed_slots: true,
+                        shop_counts: false,
+                        topology: true,
+                    },
+                    RuleWrites {
+                        resources: all_resources,
+                        inventory: true,
+                        flags: true,
+                        consumed_slots: true,
+                        shop_counts: false,
+                        topology: true,
+                        monotone_structure_only: false,
+                    },
+                    MonotonicityClass::Unproven,
+                ),
+            })
+        }
+        "shop" => Ok(CompiledBlockRule::Shop {
+            shop_id: required_string(object, "shop_id")
+                .map_err(|_| "shop_id_invalid".to_owned())?
+                .to_owned(),
+            meta: RuleMetadata {
+                reads: RuleReads {
+                    resources: all_resources,
+                    inventory: false,
+                    flags: false,
+                    consumed_slots: false,
+                    shop_counts: true,
+                    topology: false,
+                },
+                writes: RuleWrites {
+                    resources: all_resources,
+                    inventory: false,
+                    flags: false,
+                    consumed_slots: false,
+                    shop_counts: true,
+                    topology: false,
+                    monotone_structure_only: true,
+                },
+                monotonicity: MonotonicityClass::Unproven,
+            },
+        }),
+        // Opaque and terrain tiles are producer-declared static topology
+        // representations, not unknown executable rules. They never
+        // materialize; every other unknown kind fails at compilation.
+        "opaque" | "terrain" => Ok(CompiledBlockRule::Unsupported),
+        _ => Err("block_kind_unsupported".to_owned()),
+    }
+}
+
+fn compiled_rule(block: &SolverBlock) -> &CompiledBlockRule {
+    block.rule.get_or_init(|| {
+        compile_block_rule(&block.kind, &block.data).unwrap_or(CompiledBlockRule::Unsupported)
+    })
+}
+
+#[derive(Clone, Debug)]
+struct CompiledShopEffect {
+    field: String,
+    amount: u64,
+}
+
+fn shop_resource_mask(field: &str) -> ResourceMask {
+    match field {
+        "hp" => ResourceMask::HP,
+        "attack" => ResourceMask::ATTACK,
+        "defense" => ResourceMask::DEFENSE,
+        "gold" => ResourceMask::GOLD,
+        "experience" => ResourceMask::EXPERIENCE,
+        "yellow" => ResourceMask::YELLOW,
+        "blue" => ResourceMask::BLUE,
+        "red" => ResourceMask::RED,
+        "level" => ResourceMask::LEVEL,
+        _ => ResourceMask(0),
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct CompiledShopChoice {
+    choice_id: String,
+    currency: String,
+    base_cost: u64,
+    increment_per_purchase: u64,
+    purchase_count: u64,
+    effects: Vec<CompiledShopEffect>,
+    meta: RuleMetadata,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledShop {
+    shop_id: String,
+    choices: Vec<CompiledShopChoice>,
+}
+
+fn compile_shop(value: &Value) -> Result<CompiledShop, String> {
+    let shop = value.as_object().ok_or_else(|| "shop_invalid".to_owned())?;
+    let shop_id = required_string(shop, "shop_id")
+        .map_err(|_| "shop_id_invalid".to_owned())?
+        .to_owned();
+    if shop_id.is_empty() {
+        return Err("shop_id_empty".to_owned());
+    }
+    let choices = shop
+        .get("choices")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "shop_choices_invalid".to_owned())?;
+    if choices.is_empty() {
+        return Err("shop_choices_empty".to_owned());
+    }
+    let choices = choices
+        .iter()
+        .map(|choice| {
+            let choice = choice
+                .as_object()
+                .ok_or_else(|| "shop_choice_invalid".to_owned())?;
+            let effects = match choice.get("effects") {
+                Some(Value::Array(items)) => Some(items.as_slice()),
+                Some(_) => return Err("shop_effects_invalid".to_owned()),
+                None => choice.get("effect").map(std::slice::from_ref),
+            };
+            let effects = effects.ok_or_else(|| "shop_effects_missing".to_owned())?;
+            if effects.is_empty() {
+                return Err("shop_effects_empty".to_owned());
+            }
+            let mut compiled_effects = Vec::with_capacity(effects.len());
+            for effect in effects {
+                let effect = effect
+                    .as_object()
+                    .ok_or_else(|| "shop_effect_invalid".to_owned())?;
+                let field = required_string(effect, "field")
+                    .map_err(|_| "shop_effect_field_invalid".to_owned())?;
+                if !matches!(
+                    field,
+                    "level"
+                        | "hp"
+                        | "attack"
+                        | "defense"
+                        | "gold"
+                        | "experience"
+                        | "yellow"
+                        | "blue"
+                        | "red"
+                ) {
+                    return Err("shop_effect_field_unsupported".to_owned());
+                }
+                let amount = required_compiled_u64(effect.get("amount"), "shop_effect_amount")?;
+                if amount == 0 {
+                    return Err("shop_effect_amount_zero".to_owned());
+                }
+                compiled_effects.push(CompiledShopEffect {
+                    field: field.to_owned(),
+                    amount,
+                });
+            }
+            let currency = required_string(choice, "currency")
+                .map_err(|_| "shop_currency_missing".to_owned())?;
+            if !matches!(currency, "gold" | "experience" | "yellow" | "blue" | "red") {
+                return Err("shop_currency_unsupported".to_owned());
+            }
+            let choice_id = required_string(choice, "choice_id")
+                .map_err(|_| "shop_choice_id_missing".to_owned())?;
+            if choice_id.is_empty() || currency.is_empty() {
+                return Err("shop_required_string_empty".to_owned());
+            }
+            let base_cost = required_compiled_u64(choice.get("base_cost"), "shop_base_cost")?;
+            let currency_mask = shop_resource_mask(currency);
+            let effect_mask = compiled_effects
+                .iter()
+                .fold(ResourceMask(0), |mask, effect| {
+                    mask.union(shop_resource_mask(&effect.field))
+                });
+            Ok(CompiledShopChoice {
+                choice_id: choice_id.to_owned(),
+                currency: currency.to_owned(),
+                base_cost,
+                increment_per_purchase: required_compiled_u64(
+                    choice.get("increment_per_purchase"),
+                    "shop_increment",
+                )?,
+                purchase_count: required_compiled_u64(
+                    choice.get("purchase_count"),
+                    "shop_purchase_count",
+                )?,
+                effects: compiled_effects,
+                meta: RuleMetadata {
+                    reads: RuleReads {
+                        resources: currency_mask,
+                        inventory: false,
+                        flags: false,
+                        consumed_slots: false,
+                        shop_counts: true,
+                        topology: false,
+                    },
+                    writes: RuleWrites {
+                        resources: currency_mask.union(effect_mask),
+                        inventory: false,
+                        flags: false,
+                        consumed_slots: false,
+                        shop_counts: true,
+                        topology: false,
+                        monotone_structure_only: true,
+                    },
+                    monotonicity: MonotonicityClass::Unproven,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(CompiledShop { shop_id, choices })
+}
+
 #[derive(Clone, Copy)]
 enum ProfilePhase {
     PhaseA,
@@ -921,8 +1484,251 @@ struct SolverBlock {
     y: u64,
     id: String,
     kind: String,
+    // Raw wire data is retained only for compatibility diagnostics. Search
+    // reads `rule`, never this JSON payload.
     data: Value,
+    rule: Arc<OnceLock<CompiledBlockRule>>,
+    initial_active: bool,
+    numeric_id: Option<u64>,
     state_slot: Option<usize>,
+}
+
+impl SolverBlock {
+    fn fixture_defaults() -> Self {
+        Self {
+            floor: String::new(),
+            x: 0,
+            y: 0,
+            id: String::new(),
+            kind: String::new(),
+            data: Value::Null,
+            rule: Arc::new(OnceLock::new()),
+            initial_active: true,
+            numeric_id: None,
+            state_slot: None,
+        }
+    }
+}
+
+// Phase 3A keeps rule interpretation out of the search loops.  `data` is
+// intentionally retained on SolverBlock only for the wire-compatible route
+// diagnostic; every supported action is validated into one of these values
+// before a proof starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResourceMask(u16);
+
+impl ResourceMask {
+    const HP: Self = Self(1 << 0);
+    const ATTACK: Self = Self(1 << 1);
+    const DEFENSE: Self = Self(1 << 2);
+    const GOLD: Self = Self(1 << 3);
+    const EXPERIENCE: Self = Self(1 << 4);
+    const YELLOW: Self = Self(1 << 5);
+    const BLUE: Self = Self(1 << 6);
+    const RED: Self = Self(1 << 7);
+    const LEVEL: Self = Self(1 << 8);
+
+    const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuleReads {
+    resources: ResourceMask,
+    inventory: bool,
+    flags: bool,
+    consumed_slots: bool,
+    shop_counts: bool,
+    topology: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuleWrites {
+    resources: ResourceMask,
+    inventory: bool,
+    flags: bool,
+    consumed_slots: bool,
+    shop_counts: bool,
+    topology: bool,
+    // State changes which are not false -> true invalidate the simple
+    // dominance proof used by a later stale-source optimization.
+    monotone_structure_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MonotonicityClass {
+    // Under one StructuralNode, a stronger ResourceLabel may safely replace a
+    // weaker one for this rule. Phase 3A records this only; it does not skip
+    // stale work.
+    Proven,
+    Unproven,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct RuleMetadata {
+    reads: RuleReads,
+    writes: RuleWrites,
+    monotonicity: MonotonicityClass,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledDelta {
+    hp: f64,
+    attack: f64,
+    defense: f64,
+    gold: u64,
+    experience: u64,
+    level: u64,
+    multiply_hp: f64,
+    multiply_attack: f64,
+    multiply_defense: f64,
+    yellow: u64,
+    blue: u64,
+    red: u64,
+    inventory: Vec<(String, u64)>,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledEnemy {
+    hp: u64,
+    attack: u64,
+    defense: u64,
+    gold: u64,
+    experience: u64,
+}
+
+#[derive(Clone, Debug)]
+enum CompiledAuditedEvent {
+    FairyMt0,
+    BookReward,
+    Sword2Reward,
+    Shield2Reward,
+    CrossReward,
+    FlyReward,
+    IcePickaxeReward,
+    ExpSwordTrade,
+    GoldShieldTrade,
+    IceWandReward,
+    DialogueOnce,
+    ThiefQuest,
+    PrincessQuest,
+    WandGateRemoveOnFailure,
+    WandGateRetry,
+}
+
+impl CompiledAuditedEvent {
+    fn parse(id: &str) -> Option<Self> {
+        Some(match id {
+            "fairy_mt0" => Self::FairyMt0,
+            "book_reward" => Self::BookReward,
+            "sword2_reward" => Self::Sword2Reward,
+            "shield2_reward" => Self::Shield2Reward,
+            "cross_reward" => Self::CrossReward,
+            "fly_reward" => Self::FlyReward,
+            "ice_pickaxe_reward" => Self::IcePickaxeReward,
+            "exp_sword_trade" => Self::ExpSwordTrade,
+            "gold_shield_trade" => Self::GoldShieldTrade,
+            "ice_wand_reward" => Self::IceWandReward,
+            "dialogue_once" => Self::DialogueOnce,
+            "thief_quest" => Self::ThiefQuest,
+            "princess_quest" => Self::PrincessQuest,
+            "wand_gate_remove_on_failure" => Self::WandGateRemoveOnFailure,
+            "wand_gate_retry" => Self::WandGateRetry,
+            _ => return None,
+        })
+    }
+    fn id(&self) -> &'static str {
+        match self {
+            Self::FairyMt0 => "fairy_mt0",
+            Self::BookReward => "book_reward",
+            Self::Sword2Reward => "sword2_reward",
+            Self::Shield2Reward => "shield2_reward",
+            Self::CrossReward => "cross_reward",
+            Self::FlyReward => "fly_reward",
+            Self::IcePickaxeReward => "ice_pickaxe_reward",
+            Self::ExpSwordTrade => "exp_sword_trade",
+            Self::GoldShieldTrade => "gold_shield_trade",
+            Self::IceWandReward => "ice_wand_reward",
+            Self::DialogueOnce => "dialogue_once",
+            Self::ThiefQuest => "thief_quest",
+            Self::PrincessQuest => "princess_quest",
+            Self::WandGateRemoveOnFailure => "wand_gate_remove_on_failure",
+            Self::WandGateRetry => "wand_gate_retry",
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+enum CompiledBlockRule {
+    Door {
+        yellow: u64,
+        blue: u64,
+        red: u64,
+        inventory: Vec<(String, u64)>,
+        meta: RuleMetadata,
+    },
+    Resource {
+        delta: CompiledDelta,
+        meta: RuleMetadata,
+    },
+    Enemy {
+        enemy: CompiledEnemy,
+        meta: RuleMetadata,
+    },
+    Transition {
+        floor: String,
+        x: u64,
+        y: u64,
+        pure: bool,
+        meta: RuleMetadata,
+    },
+    Event {
+        event: CompiledAuditedEvent,
+        meta: RuleMetadata,
+    },
+    Shop {
+        shop_id: String,
+        meta: RuleMetadata,
+    },
+    Unsupported,
+}
+
+#[allow(dead_code)]
+impl CompiledBlockRule {
+    fn metadata(&self) -> Option<&RuleMetadata> {
+        match self {
+            Self::Door { meta, .. }
+            | Self::Resource { meta, .. }
+            | Self::Enemy { meta, .. }
+            | Self::Transition { meta, .. }
+            | Self::Event { meta, .. }
+            | Self::Shop { meta, .. } => Some(meta),
+            Self::Unsupported => None,
+        }
+    }
+}
+
+thread_local! {
+    // Faults are deliberately global to the analysis: an arithmetic/model
+    // fault is neither a blocked edge nor an infeasible candidate.
+    static RULE_FAULT: RefCell<Option<&'static str>> = const { RefCell::new(None) };
+}
+
+fn clear_rule_fault() {
+    RULE_FAULT.with(|fault| *fault.borrow_mut() = None);
+}
+fn rule_fault() -> Option<&'static str> {
+    RULE_FAULT.with(|fault| *fault.borrow())
+}
+fn record_rule_fault(reason: &'static str) {
+    RULE_FAULT.with(|fault| {
+        if fault.borrow().is_none() {
+            *fault.borrow_mut() = Some(reason);
+        }
+    });
 }
 
 fn audited_event_state_target(floor: &str, x: u64, y: u64) -> bool {
@@ -942,7 +1748,7 @@ fn audited_event_state_target(floor: &str, x: u64, y: u64) -> bool {
 
 fn block_needs_state_slot(block: &SolverBlock) -> bool {
     matches!(block.kind.as_str(), "door" | "enemy" | "resource" | "event")
-        || block.data.get("initial_active").and_then(Value::as_bool) == Some(false)
+        || !block.initial_active
         || audited_event_state_target(&block.floor, block.x, block.y)
 }
 
@@ -1412,7 +2218,11 @@ impl PhaseAActionRef {
         })
     }
 
-    fn pending_action(self, blocks: &[SolverBlock], shops: &[Value]) -> Option<PendingAction> {
+    fn pending_action(
+        self,
+        blocks: &[SolverBlock],
+        shops: &[CompiledShop],
+    ) -> Option<PendingAction> {
         let adjacent = (u64::from(self.adjacent_x), u64::from(self.adjacent_y));
         if self.tagged_index & PHASE_A_SHOP_ACTION == 0 {
             return Some(PendingAction::Block {
@@ -1423,9 +2233,8 @@ impl PhaseAActionRef {
         let shop_index = usize::try_from(self.tagged_index & !PHASE_A_SHOP_ACTION).ok()?;
         let choice_index = usize::try_from(self.choice_index).ok()?;
         let shop_block = blocks.get(usize::try_from(self.shop_block_index).ok()?)?;
-        let shop_id = shops.get(shop_index)?.get("shop_id")?.as_str()?;
-        (shop_block.kind == "shop"
-            && shop_block.data.get("shop_id").and_then(Value::as_str) == Some(shop_id))
+        let shop_id = &shops.get(shop_index)?.shop_id;
+        (matches!(compiled_rule(shop_block), CompiledBlockRule::Shop { shop_id: block_shop_id, .. } if block_shop_id == shop_id))
         .then_some(PendingAction::Shop {
             shop_index,
             choice_index,
@@ -1449,12 +2258,12 @@ impl PhaseAWorkItem {
     }
 }
 
-fn phase_a_shop_choice_offset(shops: &[Value], shop_index: usize) -> Option<usize> {
+fn phase_a_shop_choice_offset(shops: &[CompiledShop], shop_index: usize) -> Option<usize> {
     shops
         .iter()
         .take(shop_index)
         .try_fold(0usize, |offset, shop| {
-            offset.checked_add(shop.get("choices")?.as_array()?.len())
+            offset.checked_add(shop.choices.len())
         })
 }
 
@@ -1462,7 +2271,7 @@ fn enqueue_phase_a_actions(
     queue: &mut VecDeque<PhaseAWorkItem>,
     source_label: LabelId,
     view: &ConnectivityView,
-    shops: &[Value],
+    shops: &[CompiledShop],
 ) {
     let started = profile_start();
     for boundary in &view.boundaries {
@@ -1472,18 +2281,11 @@ fn enqueue_phase_a_actions(
             queue.push_back(item);
         }
     }
-    for (shop_index, shop_value) in shops.iter().enumerate() {
-        let Some(shop_id) = shop_value.get("shop_id").and_then(Value::as_str) else {
+    for (shop_index, compiled_shop) in shops.iter().enumerate() {
+        let Some(shop) = view.shops.get(&compiled_shop.shop_id) else {
             continue;
         };
-        let Some(shop) = view.shops.get(shop_id) else {
-            continue;
-        };
-        let choice_count = shop_value
-            .get("choices")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        for choice_index in 0..choice_count {
+        for choice_index in 0..compiled_shop.choices.len() {
             if let Some(action) = PhaseAActionRef::shop(shop_index, choice_index, shop)
                 && let Some(item) = PhaseAWorkItem::new(source_label, action)
             {
@@ -1503,11 +2305,18 @@ struct NumericObjective {
 
 impl NumericObjective {
     fn from_state(state: &SolverState) -> Self {
-        Self {
+        let result = Self {
             attack_and_defense: state.attack.get() + state.defense.get(),
             balanced_stat: state.attack.get().min(state.defense.get()),
             hp: state.hp.get(),
+        };
+        if !result.attack_and_defense.is_finite()
+            || !result.balanced_stat.is_finite()
+            || !result.hp.is_finite()
+        {
+            record_rule_fault("numeric_objective_non_finite");
         }
+        result
     }
 
     fn cmp(self, other: Self) -> Ordering {
@@ -1858,6 +2667,42 @@ fn solver_u64(object: &serde_json::Map<String, Value>, name: &str) -> Result<u64
         .ok_or_else(|| format!("invalid {name}"))
 }
 
+fn validate_terminal(value: &Value) -> Result<(), String> {
+    let terminal = value
+        .as_object()
+        .ok_or_else(|| "terminal_invalid".to_owned())?;
+    let validate_location = |location: &serde_json::Map<String, Value>| {
+        if location.get("kind").and_then(Value::as_str) != Some("location") {
+            return Err("terminal_kind_unsupported".to_owned());
+        }
+        required_string(location, "floor_id").map_err(|_| "terminal_floor_invalid".to_owned())?;
+        solver_u64(location, "x").map_err(|_| "terminal_x_invalid".to_owned())?;
+        solver_u64(location, "y").map_err(|_| "terminal_y_invalid".to_owned())?;
+        Ok(())
+    };
+    match terminal.get("kind").and_then(Value::as_str) {
+        Some("location") => validate_location(terminal),
+        Some("any_location") => {
+            let locations = terminal
+                .get("locations")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "terminal_locations_invalid".to_owned())?;
+            if locations.is_empty() {
+                return Err("terminal_locations_empty".to_owned());
+            }
+            for location in locations {
+                validate_location(
+                    location
+                        .as_object()
+                        .ok_or_else(|| "terminal_location_invalid".to_owned())?,
+                )?;
+            }
+            Ok(())
+        }
+        _ => Err("terminal_kind_unsupported".to_owned()),
+    }
+}
+
 fn parse_solver_world(
     observation: &serde_json::Map<String, Value>,
 ) -> Result<
@@ -1866,7 +2711,7 @@ fn parse_solver_world(
         Vec<SolverBlock>,
         usize,
         Value,
-        Vec<Value>,
+        Vec<CompiledShop>,
         Vec<Value>,
     ),
     String,
@@ -1882,16 +2727,17 @@ fn parse_solver_world(
         .filter(|value| !value.is_null())
         .cloned()
         .ok_or_else(|| "terminal_unsupported".to_owned())?;
+    validate_terminal(&terminal)?;
     let blockers = model
         .get("blockers")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| "blockers_invalid".to_owned())?;
     let shops = model
         .get("shops")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| "shops_invalid".to_owned())?;
     let mut floors = HashMap::new();
     let mut blocks = Vec::new();
     for floor in model
@@ -1939,6 +2785,28 @@ fn parse_solver_world(
                 .as_object()
                 .ok_or_else(|| "block_invalid".to_owned())?;
             let index = blocks.len();
+            let kind = required_string(object, "kind")
+                .map_err(|_| "block_kind_invalid".to_owned())?
+                .to_owned();
+            let data = block.clone();
+            let initial_active = match object.get("initial_active") {
+                None => true,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => return Err("block_initial_active_invalid".to_owned()),
+            };
+            let numeric_id = match object.get("numeric_id") {
+                None => None,
+                Some(Value::Number(value)) => value
+                    .as_u64()
+                    .ok_or_else(|| "block_numeric_id_invalid".to_owned())
+                    .map(Some)?,
+                Some(_) => return Err("block_numeric_id_invalid".to_owned()),
+            };
+            let compiled = compile_block_rule(&kind, &data)?;
+            if matches!(compiled, CompiledBlockRule::Transition { pure: false, .. }) {
+                return Err("transition_impure_unsupported".to_owned());
+            }
+            let rule = Arc::new(OnceLock::from(compiled));
             blocks.push(SolverBlock {
                 floor: floor_id.clone(),
                 x: solver_u64(object, "x")?,
@@ -1946,10 +2814,11 @@ fn parse_solver_world(
                 id: required_string(object, "block_id")
                     .map_err(|_| "block_id_invalid".to_owned())?
                     .to_owned(),
-                kind: required_string(object, "kind")
-                    .map_err(|_| "block_kind_invalid".to_owned())?
-                    .to_owned(),
-                data: block.clone(),
+                kind,
+                data,
+                rule,
+                initial_active,
+                numeric_id,
                 state_slot: None,
             });
             indices.push(index);
@@ -1971,36 +2840,27 @@ fn parse_solver_world(
             next_slot += 1;
         }
     }
+    // Shops are compiled once with blocks and are the only representation
+    // consulted by Phase A, Phase B, and replay.
+    let shops = shops
+        .iter()
+        .map(compile_shop)
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((floors, blocks, next_slot, terminal, shops, blockers))
 }
 
-fn transition_target(block: &SolverBlock) -> Option<(&str, u64, u64)> {
-    let target = block.data.get("target")?.as_object()?;
-    Some((
-        target.get("floor_id")?.as_str()?,
-        target.get("x")?.as_u64()?,
-        target.get("y")?.as_u64()?,
-    ))
+fn transition_target(block: &SolverBlock) -> Option<(String, u64, u64)> {
+    match compiled_rule(block) {
+        CompiledBlockRule::Transition { floor, x, y, .. } => Some((floor.clone(), *x, *y)),
+        _ => None,
+    }
 }
 
 fn transition_is_pure(block: &SolverBlock) -> bool {
-    block.kind == "transition"
-        && block.data.get("initial_active").and_then(Value::as_bool) != Some(false)
-        && block.data.as_object().is_some_and(|data| {
-            data.keys().all(|key| {
-                matches!(
-                    key.as_str(),
-                    "block_id"
-                        | "floor_id"
-                        | "initial_active"
-                        | "kind"
-                        | "numeric_id"
-                        | "target"
-                        | "x"
-                        | "y"
-                )
-            })
-        })
+    matches!(
+        compiled_rule(block),
+        CompiledBlockRule::Transition { pure: true, .. }
+    ) && block.initial_active
 }
 
 fn reversible_transition_candidates(index: usize, blocks: &[SolverBlock]) -> Vec<usize> {
@@ -2315,15 +3175,13 @@ impl ConnectivityIndex {
                     continue;
                 }
                 if block.kind == "shop" {
-                    if let Some(shop_id) = block.data.get("shop_id").and_then(Value::as_str) {
-                        shops
-                            .entry(shop_id.to_owned())
-                            .or_insert_with(|| ReachShop {
-                                block_index: index,
-                                floor: floor_id.clone(),
-                                adjacent,
-                                navigation: navigation.clone(),
-                            });
+                    if let CompiledBlockRule::Shop { shop_id, .. } = compiled_rule(block) {
+                        shops.entry(shop_id.clone()).or_insert_with(|| ReachShop {
+                            block_index: index,
+                            floor: floor_id.clone(),
+                            adjacent,
+                            navigation: navigation.clone(),
+                        });
                     }
                     continue;
                 }
@@ -2410,6 +3268,7 @@ impl ConnectivityIndex {
     }
 }
 
+#[cfg(test)]
 fn add_delta(state: &mut SolverState, delta: &Value) -> Result<(), String> {
     let delta = delta
         .as_object()
@@ -2465,6 +3324,68 @@ fn add_delta(state: &mut SolverState, delta: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn add_compiled_delta(state: &mut SolverState, delta: &CompiledDelta) -> Result<(), String> {
+    state.gold = state
+        .gold
+        .checked_add(delta.gold)
+        .ok_or_else(|| "stat_overflow".to_owned())?;
+    state.experience = state
+        .experience
+        .checked_add(delta.experience)
+        .ok_or_else(|| "stat_overflow".to_owned())?;
+    state.hp = state
+        .hp
+        .add(delta.hp)
+        .ok_or_else(|| "stat_overflow".to_owned())?;
+    state.attack = state
+        .attack
+        .add(delta.attack)
+        .ok_or_else(|| "stat_overflow".to_owned())?;
+    state.defense = state
+        .defense
+        .add(delta.defense)
+        .ok_or_else(|| "stat_overflow".to_owned())?;
+    state.level = state
+        .level
+        .checked_add(delta.level)
+        .ok_or_else(|| "stat_overflow".to_owned())?;
+    state.hp = state
+        .hp
+        .mul(delta.multiply_hp)
+        .ok_or_else(|| "stat_overflow".to_owned())?;
+    state.attack = state
+        .attack
+        .mul(delta.multiply_attack)
+        .ok_or_else(|| "stat_overflow".to_owned())?;
+    state.defense = state
+        .defense
+        .mul(delta.multiply_defense)
+        .ok_or_else(|| "stat_overflow".to_owned())?;
+    state.yellow = state
+        .yellow
+        .checked_add(delta.yellow)
+        .ok_or_else(|| "stat_overflow".to_owned())?;
+    state.blue = state
+        .blue
+        .checked_add(delta.blue)
+        .ok_or_else(|| "stat_overflow".to_owned())?;
+    state.red = state
+        .red
+        .checked_add(delta.red)
+        .ok_or_else(|| "stat_overflow".to_owned())?;
+    if !delta.inventory.is_empty() {
+        let mut inventory: BTreeMap<String, u64> = state.inventory.iter().cloned().collect();
+        for (id, count) in &delta.inventory {
+            let value = inventory.entry(id.clone()).or_default();
+            *value = value
+                .checked_add(*count)
+                .ok_or_else(|| "inventory_overflow".to_owned())?;
+        }
+        state.inventory = Arc::new(inventory.into_iter().collect());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct ShopEffectValues {
     level: u64,
@@ -2493,19 +3414,17 @@ impl ShopEffectValues {
         }
     }
 
-    fn apply(&mut self, effect: &Value) -> Option<()> {
-        let field = effect["field"].as_str().unwrap_or_default();
-        let amount = effect["amount"].as_u64().unwrap_or(0);
-        match field {
-            "level" => self.level = self.level.saturating_add(amount),
-            "hp" => self.hp = self.hp.add(amount as f64)?,
-            "attack" => self.attack = self.attack.add(amount as f64)?,
-            "defense" => self.defense = self.defense.add(amount as f64)?,
-            "gold" => self.gold = self.gold.saturating_add(amount),
-            "experience" => self.experience = self.experience.saturating_add(amount),
-            "yellow" => self.yellow = self.yellow.saturating_add(amount),
-            "blue" => self.blue = self.blue.saturating_add(amount),
-            "red" => self.red = self.red.saturating_add(amount),
+    fn apply_compiled(&mut self, effect: &CompiledShopEffect) -> Option<()> {
+        match effect.field.as_str() {
+            "level" => self.level = self.level.checked_add(effect.amount)?,
+            "hp" => self.hp = self.hp.add(effect.amount as f64)?,
+            "attack" => self.attack = self.attack.add(effect.amount as f64)?,
+            "defense" => self.defense = self.defense.add(effect.amount as f64)?,
+            "gold" => self.gold = self.gold.checked_add(effect.amount)?,
+            "experience" => self.experience = self.experience.checked_add(effect.amount)?,
+            "yellow" => self.yellow = self.yellow.checked_add(effect.amount)?,
+            "blue" => self.blue = self.blue.checked_add(effect.amount)?,
+            "red" => self.red = self.red.checked_add(effect.amount)?,
             _ => return None,
         }
         Some(())
@@ -2524,17 +3443,36 @@ impl ShopEffectValues {
     }
 }
 
-fn enemy_loss(state: &SolverState, enemy: &Value) -> Option<f64> {
-    let enemy = enemy.as_object()?;
-    let hp = enemy.get("hp")?.as_u64()?;
-    let attack = enemy.get("attack")?.as_u64()?;
-    let defense = enemy.get("defense")?.as_u64()?;
+fn compiled_enemy_loss(state: &SolverState, enemy: &CompiledEnemy) -> Option<f64> {
+    let hp = enemy.hp;
+    let attack = enemy.attack;
+    let defense = enemy.defense;
     let hero_damage = state.attack.get() - defense as f64;
     if hero_damage <= 0.0 {
         return None;
     }
     let rounds = (hp as f64 / hero_damage).ceil();
-    Some((rounds - 1.0).max(0.0) * (attack as f64 - state.defense.get()).max(0.0))
+    let loss = (rounds - 1.0).max(0.0) * (attack as f64 - state.defense.get()).max(0.0);
+    if !loss.is_finite() {
+        record_rule_fault("rule_arithmetic_invalid");
+        return None;
+    }
+    Some(loss)
+}
+
+#[cfg(test)]
+fn enemy_loss(state: &SolverState, enemy: &Value) -> Option<f64> {
+    let enemy = enemy.as_object()?;
+    compiled_enemy_loss(
+        state,
+        &CompiledEnemy {
+            hp: enemy.get("hp")?.as_u64()?,
+            attack: enemy.get("attack")?.as_u64()?,
+            defense: enemy.get("defense")?.as_u64()?,
+            gold: enemy.get("gold").and_then(Value::as_u64).unwrap_or(0),
+            experience: enemy.get("experience").and_then(Value::as_u64).unwrap_or(0),
+        },
+    )
 }
 
 fn state_count(entries: &[(String, u64)], id: &str) -> u64 {
@@ -2566,7 +3504,7 @@ fn initial_consumed_bits(blocks: &[SolverBlock], bit_len: usize) -> Result<Consu
     let mut consumed = ConsumedBits::new(bit_len);
     let changes: Option<Vec<_>> = blocks
         .iter()
-        .filter(|block| block.data.get("initial_active").and_then(Value::as_bool) == Some(false))
+        .filter(|block| !block.initial_active)
         .map(|block| block.state_slot.map(|slot| (slot, true)))
         .collect();
     consumed.set_many(&changes.ok_or(())?)?;
@@ -2575,9 +3513,14 @@ fn initial_consumed_bits(blocks: &[SolverBlock], bit_len: usize) -> Result<Consu
 
 fn set_block_consumed(state: &mut SolverState, block: &SolverBlock, value: bool) -> bool {
     let Some(slot) = block.state_slot else {
+        record_rule_fault("event_state_slot_missing");
         return false;
     };
-    state.consumed.set(slot, value).is_ok()
+    let result = state.consumed.set(slot, value).is_ok();
+    if !result {
+        record_rule_fault("event_state_slot_invalid");
+    }
+    result
 }
 
 fn set_at(
@@ -2597,9 +3540,14 @@ fn set_at(
         .map(|block| block.state_slot.map(|slot| (slot, value)))
         .collect();
     let Some(changes) = changes else {
+        record_rule_fault("event_state_slot_missing");
         return false;
     };
-    !targets.is_empty() && state.consumed.set_many(&changes).is_ok()
+    let result = !targets.is_empty() && state.consumed.set_many(&changes).is_ok();
+    if !result {
+        record_rule_fault("event_target_missing");
+    }
+    result
 }
 
 fn consume_at(
@@ -2636,7 +3584,7 @@ fn replace_at(
         .collect();
     let replacement = targets
         .iter()
-        .find(|block| block.data.get("numeric_id").and_then(Value::as_u64) == Some(numeric_id));
+        .find(|block| block.numeric_id == Some(numeric_id));
     let changes: Option<Vec<_>> = targets
         .iter()
         .map(|block| block.state_slot.map(|slot| (slot, true)))
@@ -2644,10 +3592,21 @@ fn replace_at(
             replacement.and_then(|block| block.state_slot.map(|slot| (slot, false))),
         ))
         .collect();
-    !targets.is_empty()
+    let result = !targets.is_empty()
         && changes
             .as_deref()
-            .is_some_and(|changes| state.consumed.set_many(changes).is_ok())
+            .is_some_and(|changes| state.consumed.set_many(changes).is_ok());
+    if !result {
+        record_rule_fault("event_replacement_missing");
+    }
+    result
+}
+
+fn audited_f64(value: Option<F64Bits>) -> Option<F64Bits> {
+    if value.is_none() {
+        record_rule_fault("rule_arithmetic_invalid");
+    }
+    value
 }
 
 fn apply_audited_event(
@@ -2656,10 +3615,19 @@ fn apply_audited_event(
     _block_index: usize,
     blocks: &[SolverBlock],
 ) -> Option<Value> {
-    let id = block.data.get("event")?.get("id")?.as_str()?;
-    let add_item = |state: &mut SolverState, name: &str, amount: u64| {
+    let event = match compiled_rule(block) {
+        CompiledBlockRule::Event { event, .. } => event.clone(),
+        _ => return None,
+    };
+    let id = event.id();
+    let add_item = |state: &mut SolverState, name: &str, amount: u64| -> bool {
         let old = state_count(&state.inventory, name);
-        state_set(&mut state.inventory, name, old.saturating_add(amount));
+        let Some(value) = old.checked_add(amount) else {
+            record_rule_fault("rule_arithmetic_invalid");
+            return false;
+        };
+        state_set(&mut state.inventory, name, value);
+        true
     };
     let consume_item = |state: &mut SolverState, name: &str, amount: u64| -> bool {
         let old = state_count(&state.inventory, name);
@@ -2675,9 +3643,9 @@ fn apply_audited_event(
                 state_set(&mut state.flags, "16", 0);
                 state_set(&mut state.flags, "22", 1);
             } else if consume_item(state, "cross", 1) {
-                state.hp = state.hp.mul(4.0)?.div(3.0)?;
-                state.attack = state.attack.mul(4.0)?.div(3.0)?;
-                state.defense = state.defense.mul(4.0)?.div(3.0)?;
+                state.hp = audited_f64(audited_f64(state.hp.mul(4.0))?.div(3.0))?;
+                state.attack = audited_f64(audited_f64(state.attack.mul(4.0))?.div(3.0))?;
+                state.defense = audited_f64(audited_f64(state.defense.mul(4.0))?.div(3.0))?;
                 if !set_block_consumed(state, block, true)
                     || !activate_at(state, blocks, "MT20", 6, 8)
                 {
@@ -2688,30 +3656,30 @@ fn apply_audited_event(
             }
         }
         "book_reward" => {
-            add_item(state, "book", 1);
+            add_item(state, "book", 1).then_some(())?;
             set_block_consumed(state, block, true).then_some(())?;
         }
         "sword2_reward" => {
-            state.attack = state.attack.add(70.0)?;
+            state.attack = audited_f64(state.attack.add(70.0))?;
             set_block_consumed(state, block, true).then_some(())?;
         }
         "shield2_reward" => {
-            state.defense = state.defense.add(30.0)?;
+            state.defense = audited_f64(state.defense.add(30.0))?;
             set_block_consumed(state, block, true).then_some(())?;
         }
         "cross_reward" => {
-            add_item(state, "cross", 1);
+            add_item(state, "cross", 1).then_some(())?;
             if !set_block_consumed(state, block, true) || !consume_at(state, blocks, "MT16", 5, 5) {
                 return None;
             }
         }
         "fly_reward" => {
-            add_item(state, "fly", 1);
+            add_item(state, "fly", 1).then_some(())?;
             state_set(&mut state.flags, "fly", 1);
             set_block_consumed(state, block, true).then_some(())?;
         }
         "ice_pickaxe_reward" => {
-            add_item(state, "icePickaxe", 1);
+            add_item(state, "icePickaxe", 1).then_some(())?;
             set_block_consumed(state, block, true).then_some(())?;
         }
         "exp_sword_trade" => {
@@ -2719,7 +3687,7 @@ fn apply_audited_event(
                 return None;
             }
             state.experience -= 500;
-            state.attack = state.attack.add(120.0)?;
+            state.attack = audited_f64(state.attack.add(120.0))?;
             set_block_consumed(state, block, true).then_some(())?;
         }
         "gold_shield_trade" => {
@@ -2727,7 +3695,7 @@ fn apply_audited_event(
                 return None;
             }
             state.gold -= 500;
-            state.defense = state.defense.add(120.0)?;
+            state.defense = audited_f64(state.defense.add(120.0))?;
             set_block_consumed(state, block, true).then_some(())?;
         }
         "ice_wand_reward" => {
@@ -2812,7 +3780,7 @@ fn materialize_pending_action(
     source: &SolverState,
     pending_action: PendingAction,
     blocks: &[SolverBlock],
-    shops: &[Value],
+    shops: &[CompiledShop],
     record_route: bool,
 ) -> Option<MaterializedCandidate> {
     let kind = if profiling_enabled() {
@@ -2854,31 +3822,27 @@ fn materialize_pending_action_inner(
     source: &SolverState,
     pending_action: PendingAction,
     blocks: &[SolverBlock],
-    shops: &[Value],
+    shops: &[CompiledShop],
     record_route: bool,
 ) -> Option<MaterializedCandidate> {
     match pending_action {
         PendingAction::Block { index, adjacent } => {
             let block = blocks.get(index)?;
-            match block.kind.as_str() {
-                "door" => {
-                    let cost = &block.data["key_cost"];
-                    let (yellow, blue, red) = (
-                        cost["yellow"].as_u64().unwrap_or(0),
-                        cost["blue"].as_u64().unwrap_or(0),
-                        cost["red"].as_u64().unwrap_or(0),
-                    );
-                    if source.yellow < yellow || source.blue < blue || source.red < red {
+            match compiled_rule(block) {
+                CompiledBlockRule::Door {
+                    yellow,
+                    blue,
+                    red,
+                    inventory: inventory_cost,
+                    ..
+                } => {
+                    if source.yellow < *yellow || source.blue < *blue || source.red < *red {
                         return None;
                     }
-                    let inventory_cost =
-                        block.data.get("inventory_cost").and_then(Value::as_object);
-                    let inventory_cost = inventory_cost.filter(|costs| !costs.is_empty());
-                    if inventory_cost.is_some_and(|costs| {
-                        costs.iter().any(|(id, count)| {
-                            state_count(&source.inventory, id) < count.as_u64().unwrap_or(u64::MAX)
-                        })
-                    }) {
+                    if inventory_cost
+                        .iter()
+                        .any(|(id, count)| state_count(&source.inventory, id) < *count)
+                    {
                         return None;
                     }
                     let mut next = MaterializedCandidate {
@@ -2890,11 +3854,11 @@ fn materialize_pending_action_inner(
                     next.state.yellow -= yellow;
                     next.state.blue -= blue;
                     next.state.red -= red;
-                    if let Some(costs) = inventory_cost {
+                    if !inventory_cost.is_empty() {
                         let mut inventory: BTreeMap<String, u64> =
                             next.state.inventory.iter().cloned().collect();
-                        for (id, count) in costs {
-                            *inventory.entry(id.clone()).or_default() -= count.as_u64()?;
+                        for (id, count) in inventory_cost {
+                            *inventory.entry(id.clone()).or_default() -= count;
                         }
                         next.state.inventory = Arc::new(
                             inventory
@@ -2909,19 +3873,26 @@ fn materialize_pending_action_inner(
                     if record_route {
                         next.route_action = Some(RouteAction::Block {
                             index,
-                            action: BlockRouteAction::Door { yellow, blue, red },
+                            action: BlockRouteAction::Door {
+                                yellow: *yellow,
+                                blue: *blue,
+                                red: *red,
+                            },
                         });
                     }
                     Some(next)
                 }
-                "resource" => {
+                CompiledBlockRule::Resource { delta, .. } => {
                     let mut next = MaterializedCandidate {
                         state: clone_materialize_source(source),
                         route_action: None,
                     };
                     next.state.floor = block.floor.clone();
                     (next.state.x, next.state.y) = adjacent;
-                    add_delta(&mut next.state, &block.data["delta"]).ok()?;
+                    if add_compiled_delta(&mut next.state, &delta).is_err() {
+                        record_rule_fault("rule_arithmetic_invalid");
+                        return None;
+                    }
                     if !set_block_consumed(&mut next.state, block, true) {
                         return None;
                     }
@@ -2933,18 +3904,20 @@ fn materialize_pending_action_inner(
                     }
                     Some(next)
                 }
-                "enemy" => {
-                    let loss = enemy_loss(source, &block.data["enemy"])?;
+                CompiledBlockRule::Enemy { enemy, .. } => {
+                    let loss = compiled_enemy_loss(source, &enemy)?;
                     if loss >= source.hp.get() {
                         return None;
                     }
                     let hp = F64Bits::new(source.hp.get() - loss)?;
-                    let gold = source
-                        .gold
-                        .checked_add(block.data["enemy"]["gold"].as_u64().unwrap_or(0))?;
-                    let experience = source
-                        .experience
-                        .checked_add(block.data["enemy"]["experience"].as_u64().unwrap_or(0))?;
+                    let Some(gold) = source.gold.checked_add(enemy.gold) else {
+                        record_rule_fault("rule_arithmetic_invalid");
+                        return None;
+                    };
+                    let Some(experience) = source.experience.checked_add(enemy.experience) else {
+                        record_rule_fault("rule_arithmetic_invalid");
+                        return None;
+                    };
                     let mut next = MaterializedCandidate {
                         state: clone_materialize_source(source),
                         route_action: None,
@@ -2967,17 +3940,22 @@ fn materialize_pending_action_inner(
                     }
                     Some(next)
                 }
-                "transition" => {
+                CompiledBlockRule::Transition {
+                    floor,
+                    x,
+                    y,
+                    pure: true,
+                    ..
+                } => {
                     let mut next = MaterializedCandidate {
                         state: clone_materialize_source(source),
                         route_action: None,
                     };
                     next.state.floor = block.floor.clone();
                     (next.state.x, next.state.y) = adjacent;
-                    let target = &block.data["target"];
-                    next.state.floor = target["floor_id"].as_str().unwrap_or_default().to_owned();
-                    next.state.x = target["x"].as_u64().unwrap_or(0);
-                    next.state.y = target["y"].as_u64().unwrap_or(0);
+                    next.state.floor = floor.clone();
+                    next.state.x = *x;
+                    next.state.y = *y;
                     if record_route {
                         next.route_action = Some(RouteAction::Block {
                             index,
@@ -2986,7 +3964,11 @@ fn materialize_pending_action_inner(
                     }
                     Some(next)
                 }
-                "event" => {
+                CompiledBlockRule::Transition { pure: false, .. } => {
+                    record_rule_fault("transition_impure_unsupported");
+                    None
+                }
+                CompiledBlockRule::Event { .. } => {
                     let mut next = MaterializedCandidate {
                         state: clone_materialize_source(source),
                         route_action: None,
@@ -3018,23 +4000,18 @@ fn materialize_pending_action_inner(
             adjacent,
         } => {
             let shop = shops.get(shop_index)?;
-            let shop_id = shop
-                .get("shop_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let choice = shop.get("choices")?.as_array()?.get(choice_index)?;
+            let choice = shop.choices.get(choice_index)?;
             let count_index = choice_offset.checked_add(choice_index)?;
             let purchase_count = *source.shop_counts.get(count_index)?;
-            let cost = choice["base_cost"].as_u64()?.checked_add(
-                choice["increment_per_purchase"]
-                    .as_u64()?
-                    .checked_mul(purchase_count)?,
-            )?;
-            let currency = choice
-                .get("currency")
-                .and_then(Value::as_str)
-                .unwrap_or("gold");
-            let balance = match currency {
+            let Some(increment) = choice.increment_per_purchase.checked_mul(purchase_count) else {
+                record_rule_fault("rule_arithmetic_invalid");
+                return None;
+            };
+            let Some(cost) = choice.base_cost.checked_add(increment) else {
+                record_rule_fault("rule_arithmetic_invalid");
+                return None;
+            };
+            let balance = match choice.currency.as_str() {
                 "gold" => source.gold,
                 "experience" => source.experience,
                 "yellow" => source.yellow,
@@ -3045,13 +4022,8 @@ fn materialize_pending_action_inner(
             if balance < cost {
                 return None;
             }
-            let effects = choice
-                .get("effects")
-                .and_then(Value::as_array)
-                .map(Vec::as_slice)
-                .or_else(|| choice.get("effect").map(std::slice::from_ref))?;
             let mut values = ShopEffectValues::from_state(source);
-            match currency {
+            match choice.currency.as_str() {
                 "gold" => values.gold -= cost,
                 "experience" => values.experience -= cost,
                 "yellow" => values.yellow -= cost,
@@ -3059,8 +4031,11 @@ fn materialize_pending_action_inner(
                 "red" => values.red -= cost,
                 _ => unreachable!(),
             }
-            for effect in effects {
-                values.apply(effect)?;
+            for effect in &choice.effects {
+                if values.apply_compiled(effect).is_none() {
+                    record_rule_fault("rule_arithmetic_invalid");
+                    return None;
+                }
             }
             let mut next = MaterializedCandidate {
                 state: clone_materialize_source(source),
@@ -3069,21 +4044,26 @@ fn materialize_pending_action_inner(
             next.state.floor = floor.clone();
             (next.state.x, next.state.y) = adjacent;
             values.write_to(&mut next.state);
-            Arc::make_mut(&mut next.state.shop_counts)[count_index] += 1;
+            let Some(next_purchase_count) = purchase_count.checked_add(1) else {
+                record_rule_fault("rule_arithmetic_invalid");
+                return None;
+            };
+            Arc::make_mut(&mut next.state.shop_counts)[count_index] = next_purchase_count;
             if record_route {
                 next.route_action = Some(RouteAction::Shop {
                     floor,
-                    shop_id: shop_id.to_owned(),
-                    choice_id: choice["choice_id"].as_str().unwrap_or_default().to_owned(),
-                    currency: currency.to_owned(),
+                    shop_id: shop.shop_id.clone(),
+                    choice_id: choice.choice_id.clone(),
+                    currency: choice.currency.clone(),
                     cost,
                     purchase_count_before: purchase_count,
-                    effects: effects
+                    effects: choice
+                        .effects
                         .iter()
                         .map(|effect| {
                             Some(ShopRouteEffect {
-                                field: effect["field"].as_str().unwrap_or_default().to_owned(),
-                                amount: effect["amount"].as_u64().unwrap_or(0),
+                                field: effect.field.clone(),
+                                amount: effect.amount,
                             })
                         })
                         .collect::<Option<Vec<_>>>()?,
@@ -3207,7 +4187,7 @@ fn enqueue_phase2_action(
     navigation: Vec<usize>,
     action: PendingAction,
     blocks: &[SolverBlock],
-    shops: &[Value],
+    shops: &[CompiledShop],
 ) {
     let started = profile_start();
     let Some(materialized) =
@@ -3244,13 +4224,16 @@ fn replay_phase2_route(
     initial: &SolverState,
     route: &Phase2Route,
     blocks: &[SolverBlock],
-    shops: &[Value],
+    shops: &[CompiledShop],
 ) -> Option<SolverState> {
     let mut state = initial.clone();
     for segment in &route.segments {
         for &index in &segment.navigation {
             let transition = blocks.get(index)?;
-            if transition.kind != "transition" || block_is_consumed(&state, transition) {
+            if transition.kind != "transition"
+                || !transition_is_pure(transition)
+                || block_is_consumed(&state, transition)
+            {
                 return None;
             }
             let (floor, x, y) = transition_target(transition)?;
@@ -3263,7 +4246,10 @@ fn replay_phase2_route(
     }
     for &index in &route.terminal_navigation {
         let transition = blocks.get(index)?;
-        if transition.kind != "transition" || block_is_consumed(&state, transition) {
+        if transition.kind != "transition"
+            || !transition_is_pure(transition)
+            || block_is_consumed(&state, transition)
+        {
             return None;
         }
         let (floor, x, y) = transition_target(transition)?;
@@ -3292,7 +4278,7 @@ fn extract_route_witness(
     floors: &HashMap<String, SolverFloor>,
     blocks: &[SolverBlock],
     terminals: &[(&str, (u64, u64))],
-    shops: &[Value],
+    shops: &[CompiledShop],
 ) -> Phase2Outcome {
     #[cfg(test)]
     {
@@ -3373,18 +4359,9 @@ fn extract_route_witness(
             );
         }
         let mut choice_offset = 0usize;
-        for (shop_index, shop) in shops.iter().enumerate() {
-            let shop_id = shop
-                .get("shop_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let choices = shop
-                .get("choices")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if let Some(shop) = view.shops.get(shop_id) {
-                for choice_index in 0..choices.len() {
+        for (shop_index, compiled_shop) in shops.iter().enumerate() {
+            if let Some(shop) = view.shops.get(&compiled_shop.shop_id) {
+                for choice_index in 0..compiled_shop.choices.len() {
                     enqueue_phase2_action(
                         &mut queue,
                         &mut serial,
@@ -3402,7 +4379,7 @@ fn extract_route_witness(
                     );
                 }
             }
-            choice_offset += choices.len();
+            choice_offset += compiled_shop.choices.len();
         }
     }
     best.map_or(Phase2Outcome::NoWitness { explored }, |(_, route)| {
@@ -3464,7 +4441,7 @@ fn run_numeric_proof(
     floors: &HashMap<String, SolverFloor>,
     blocks: &[SolverBlock],
     terminals: &[(&str, (u64, u64))],
-    shops: &[Value],
+    shops: &[CompiledShop],
 ) -> PhaseAResult {
     profile_set_phase(ProfilePhase::PhaseA);
     #[cfg(test)]
@@ -3607,10 +4584,34 @@ fn global_analysis_with_stats(
         );
     }
     let connectivity = ConnectivityIndex::new(&floors, &blocks);
-    let hero = observation.get("hero").and_then(Value::as_object).unwrap();
-    let loc = hero.get("loc").and_then(Value::as_object).unwrap();
-    let keys = observation.get("keys").and_then(Value::as_object).unwrap();
-    let inventory = observation
+    let hero = match observation.get("hero").and_then(Value::as_object) {
+        Some(value) => value,
+        None => {
+            return (
+                json!({"scope":"global_terminal_route","proof":"unsupported","reason":"initial_hero_invalid","truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null}),
+                TwoPhaseStats::default(),
+            );
+        }
+    };
+    let loc = match hero.get("loc").and_then(Value::as_object) {
+        Some(value) => value,
+        None => {
+            return (
+                json!({"scope":"global_terminal_route","proof":"unsupported","reason":"initial_location_invalid","truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null}),
+                TwoPhaseStats::default(),
+            );
+        }
+    };
+    let keys = match observation.get("keys").and_then(Value::as_object) {
+        Some(value) => value,
+        None => {
+            return (
+                json!({"scope":"global_terminal_route","proof":"unsupported","reason":"initial_keys_invalid","truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null}),
+                TwoPhaseStats::default(),
+            );
+        }
+    };
+    let inventory: Result<Vec<(String, u64)>, &'static str> = observation
         .get("engine_model")
         .and_then(Value::as_object)
         .and_then(|m| m.get("inventory"))
@@ -3618,25 +4619,79 @@ fn global_analysis_with_stats(
         .and_then(|i| i.get("classes"))
         .and_then(Value::as_object)
         .map(|classes| {
-            classes
-                .values()
-                .filter_map(Value::as_object)
-                .flat_map(|items| items.iter())
-                .filter_map(|(id, count)| count.as_u64().map(|count| (id.clone(), count)))
-                .collect()
+            let mut seen = HashSet::new();
+            let mut values = Vec::new();
+            for items in classes.values().filter_map(Value::as_object) {
+                for (id, count) in items {
+                    if let Some(count) = count.as_u64() {
+                        if !seen.insert(id.clone()) {
+                            return Err("inventory_item_id_ambiguous");
+                        }
+                        values.push((id.clone(), count));
+                    }
+                }
+            }
+            Ok(values)
         })
-        .unwrap_or_default();
+        .unwrap_or(Ok(Vec::new()));
+    let inventory = match inventory {
+        Ok(inventory) => inventory,
+        Err(reason) => {
+            return (
+                json!({"scope":"global_terminal_route","proof":"unsupported","reason":reason,
+                "truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null}),
+                TwoPhaseStats::default(),
+            );
+        }
+    };
+    let (Some(initial_hp), Some(initial_attack), Some(initial_defense)) = (
+        hero.get("hp")
+            .and_then(Value::as_f64)
+            .and_then(F64Bits::new),
+        hero.get("attack")
+            .and_then(Value::as_f64)
+            .and_then(F64Bits::new),
+        hero.get("defense")
+            .and_then(Value::as_f64)
+            .and_then(F64Bits::new),
+    ) else {
+        return (
+            json!({"scope":"global_terminal_route","proof":"unsupported","reason":"initial_stat_non_finite",
+                "truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null}),
+            TwoPhaseStats::default(),
+        );
+    };
     let initial = SolverState {
-        floor: observation
-            .get("floor_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        x: loc.get("x").and_then(Value::as_u64).unwrap_or(0),
-        y: loc.get("y").and_then(Value::as_u64).unwrap_or(0),
-        hp: F64Bits::new(hero.get("hp").and_then(Value::as_f64).unwrap_or(0.0)).unwrap(),
-        attack: F64Bits::new(hero.get("attack").and_then(Value::as_f64).unwrap_or(0.0)).unwrap(),
-        defense: F64Bits::new(hero.get("defense").and_then(Value::as_f64).unwrap_or(0.0)).unwrap(),
+        floor: match observation.get("floor_id").and_then(Value::as_str) {
+            Some(value) => value.to_owned(),
+            None => {
+                return (
+                    json!({"scope":"global_terminal_route","proof":"unsupported","reason":"initial_floor_invalid","truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null}),
+                    TwoPhaseStats::default(),
+                );
+            }
+        },
+        x: match loc.get("x").and_then(Value::as_u64) {
+            Some(value) => value,
+            None => {
+                return (
+                    json!({"scope":"global_terminal_route","proof":"unsupported","reason":"initial_location_invalid","truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null}),
+                    TwoPhaseStats::default(),
+                );
+            }
+        },
+        y: match loc.get("y").and_then(Value::as_u64) {
+            Some(value) => value,
+            None => {
+                return (
+                    json!({"scope":"global_terminal_route","proof":"unsupported","reason":"initial_location_invalid","truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null}),
+                    TwoPhaseStats::default(),
+                );
+            }
+        },
+        hp: initial_hp,
+        attack: initial_attack,
+        defense: initial_defense,
         level: observation
             .get("engine_model")
             .and_then(Value::as_object)
@@ -3649,9 +4704,33 @@ fn global_analysis_with_stats(
             .unwrap_or(0),
         gold: hero.get("gold").and_then(Value::as_u64).unwrap_or(0),
         experience: hero.get("experience").and_then(Value::as_u64).unwrap_or(0),
-        yellow: keys.get("yellow").and_then(Value::as_u64).unwrap_or(0),
-        blue: keys.get("blue").and_then(Value::as_u64).unwrap_or(0),
-        red: keys.get("red").and_then(Value::as_u64).unwrap_or(0),
+        yellow: match keys.get("yellow").and_then(Value::as_u64) {
+            Some(value) => value,
+            None => {
+                return (
+                    json!({"scope":"global_terminal_route","proof":"unsupported","reason":"initial_keys_invalid","truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null}),
+                    TwoPhaseStats::default(),
+                );
+            }
+        },
+        blue: match keys.get("blue").and_then(Value::as_u64) {
+            Some(value) => value,
+            None => {
+                return (
+                    json!({"scope":"global_terminal_route","proof":"unsupported","reason":"initial_keys_invalid","truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null}),
+                    TwoPhaseStats::default(),
+                );
+            }
+        },
+        red: match keys.get("red").and_then(Value::as_u64) {
+            Some(value) => value,
+            None => {
+                return (
+                    json!({"scope":"global_terminal_route","proof":"unsupported","reason":"initial_keys_invalid","truncated":false,"explored_states":0,"blockers":source_blockers,"route":null,"first_suggestion":null}),
+                    TwoPhaseStats::default(),
+                );
+            }
+        },
         inventory: Arc::new(inventory),
         consumed: match initial_consumed_bits(&blocks, state_slot_count) {
             Ok(consumed) => consumed,
@@ -3667,18 +4746,7 @@ fn global_analysis_with_stats(
         shop_counts: Arc::new(
             shops
                 .iter()
-                .flat_map(|shop| {
-                    shop.get("choices")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                })
-                .map(|choice| {
-                    choice
-                        .get("purchase_count")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                })
+                .flat_map(|shop| shop.choices.iter().map(|choice| choice.purchase_count))
                 .collect(),
         ),
         flags: Arc::new(
@@ -3739,6 +4807,7 @@ fn global_analysis_with_stats(
         PHASE_A_DROPPED.with(|dropped| dropped.set(false));
         PHASE2_SAW_PHASE_A_DROPPED.with(|seen| seen.set(false));
     }
+    clear_rule_fault();
     let proof = run_numeric_proof(
         &initial,
         max_states,
@@ -3754,6 +4823,13 @@ fn global_analysis_with_stats(
     };
     profile_with_stats(|profile| profile.phase_a_explored = proof.explored as u64);
     let explored = proof.explored;
+    if let Some(reason) = rule_fault() {
+        return (
+            json!({"scope":"global_terminal_route","proof":"unsupported","reason":reason,
+                "truncated":false,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null}),
+            stats,
+        );
+    }
     match proof.outcome {
         PhaseAOutcome::BudgetExhausted => (
             json!({"scope":"global_terminal_route","proof":"unproven","reason":"search_budget_exhausted",
@@ -3762,7 +4838,7 @@ fn global_analysis_with_stats(
         ),
         PhaseAOutcome::Complete(Some(target)) => {
             profile_set_phase(ProfilePhase::PhaseB);
-            match extract_route_witness(
+            let phase2 = extract_route_witness(
                 &initial,
                 target,
                 max_states,
@@ -3771,7 +4847,15 @@ fn global_analysis_with_stats(
                 &blocks,
                 &terminals,
                 &shops,
-            ) {
+            );
+            if let Some(reason) = rule_fault() {
+                return (
+                    json!({"scope":"global_terminal_route","proof":"unsupported","reason":reason,
+                        "truncated":false,"explored_states":explored,"blockers":blockers,"route":null,"first_suggestion":null}),
+                    stats,
+                );
+            }
+            match phase2 {
                 Phase2Outcome::Found {
                     route: best,
                     explored: phase_b_explored,
@@ -4188,6 +5272,7 @@ mod tests {
             data: json!({"delta":{"hp":0,"attack":0,"defense":0,"gold":0,"experience":0,
                 "keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}),
             state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
         }];
         let floors = HashMap::from([("F".to_owned(), indexed_floor(2, vec![0]))]);
         let connectivity = ConnectivityIndex::new(&floors, &blocks);
@@ -4217,6 +5302,7 @@ mod tests {
                 kind: "door".into(),
                 data: json!({}),
                 state_slot: Some(0),
+                ..SolverBlock::fixture_defaults()
             },
             SolverBlock {
                 floor: "F".into(),
@@ -4227,6 +5313,7 @@ mod tests {
                 data: json!({"delta":{"hp":0,"attack":3,"defense":0,"gold":0,
                     "experience":0,"keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}),
                 state_slot: Some(1),
+                ..SolverBlock::fixture_defaults()
             },
         ];
         let steps = vec![
@@ -4270,6 +5357,7 @@ mod tests {
             kind: "door".into(),
             data: json!({"key_cost":{"yellow":1,"blue":0,"red":0}}),
             state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
         }];
         let mut source = terminal_node(10, 10, 100, "root");
         source.yellow = 1;
@@ -4507,7 +5595,7 @@ mod tests {
         floors: &HashMap<String, SolverFloor>,
         blocks: &[SolverBlock],
         terminals: &[(&str, (u64, u64))],
-        shops: &[Value],
+        shops: &[CompiledShop],
     ) -> Vec<SolverState> {
         let mut store = empty_phase_a_store();
         let mut queue = VecDeque::<LabelId>::new();
@@ -4562,6 +5650,7 @@ mod tests {
                 data: json!({"delta":{"hp":1,"attack":0,"defense":0,"gold":0,"experience":0,
                     "keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}),
                 state_slot: Some(0),
+                ..SolverBlock::fixture_defaults()
             },
             SolverBlock {
                 floor: "F".into(),
@@ -4572,6 +5661,7 @@ mod tests {
                 data: json!({"delta":{"hp":0,"attack":1,"defense":0,"gold":0,"experience":0,
                     "keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}),
                 state_slot: Some(1),
+                ..SolverBlock::fixture_defaults()
             },
         ];
         let floors = HashMap::from([("F".into(), indexed_floor(3, vec![0, 1]))]);
@@ -4628,8 +5718,13 @@ mod tests {
             terminals: Vec::new(),
         };
         let shops = vec![
-            json!({"shop_id":"first","choices":[{},{}]}),
-            json!({"shop_id":"unreachable","choices":[{}]}),
+            compile_shop(&json!({"shop_id":"first","choices":[
+                {"choice_id":"one","currency":"gold","base_cost":1,"increment_per_purchase":0,"purchase_count":0,"effect":{"field":"attack","amount":1}},
+                {"choice_id":"two","currency":"gold","base_cost":1,"increment_per_purchase":0,"purchase_count":0,"effect":{"field":"attack","amount":1}}
+            ]})).unwrap(),
+            compile_shop(&json!({"shop_id":"unreachable","choices":[
+                {"choice_id":"three","currency":"gold","base_cost":1,"increment_per_purchase":0,"purchase_count":0,"effect":{"field":"attack","amount":1}}
+            ]})).unwrap(),
         ];
         let mut queue = VecDeque::new();
         enqueue_phase_a_actions(&mut queue, LabelId(4), &view, &shops);
@@ -4682,6 +5777,7 @@ mod tests {
             data: json!({"delta":{"hp":1,"attack":0,"defense":0,"gold":0,"experience":0,
                 "keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}),
             state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
         }];
         let floors = HashMap::from([("F".into(), indexed_floor(2, vec![0]))]);
         let index = ConnectivityIndex::new(&floors, &blocks);
@@ -4757,7 +5853,9 @@ mod tests {
             id: kind.into(),
             kind: kind.into(),
             data: initial_active.map_or_else(|| json!({}), |value| json!({"initial_active":value})),
+            initial_active: initial_active != Some(false),
             state_slot: None,
+            ..SolverBlock::fixture_defaults()
         };
         for kind in ["door", "enemy", "resource", "event"] {
             assert!(block_needs_state_slot(&block("F", 0, 0, kind, None)));
@@ -4804,6 +5902,7 @@ mod tests {
                 kind: "terrain".into(),
                 data: json!({}),
                 state_slot: None,
+                ..SolverBlock::fixture_defaults()
             },
             SolverBlock {
                 floor: "F".into(),
@@ -4813,6 +5912,7 @@ mod tests {
                 kind: "door".into(),
                 data: json!({}),
                 state_slot: Some(0),
+                ..SolverBlock::fixture_defaults()
             },
             SolverBlock {
                 floor: "F".into(),
@@ -4821,7 +5921,9 @@ mod tests {
                 id: "hidden".into(),
                 kind: "opaque".into(),
                 data: json!({"initial_active":false}),
+                initial_active: false,
                 state_slot: Some(1),
+                ..SolverBlock::fixture_defaults()
             },
             SolverBlock {
                 floor: "F".into(),
@@ -4831,6 +5933,7 @@ mod tests {
                 kind: "transition".into(),
                 data: json!({}),
                 state_slot: None,
+                ..SolverBlock::fixture_defaults()
             },
         ];
         let legacy = [false, true, false, false];
@@ -4900,7 +6003,9 @@ mod tests {
             data: json!({"block_id":id,"floor_id":floor,"initial_active":true,
                 "kind":"transition","numeric_id":1,"x":x,"y":0,
                 "target":{"floor_id":target_floor,"x":target_x,"y":0}}),
+            numeric_id: Some(1),
             state_slot: None,
+            ..SolverBlock::fixture_defaults()
         }
     }
 
@@ -4923,10 +6028,11 @@ mod tests {
         assert_eq!(reversible_transition_partner(1, &blocks), Some(0));
 
         let mut inactive = blocks.clone();
-        inactive[1].data["initial_active"] = json!(false);
+        inactive[1].initial_active = false;
         assert_eq!(reversible_transition_partner(0, &inactive), None);
         let mut effectful = blocks.clone();
         effectful[1].data["event"] = json!({"id":"side-effect"});
+        effectful[1].rule = Arc::new(OnceLock::new());
         assert_eq!(reversible_transition_partner(0, &effectful), None);
         assert_eq!(reversible_transition_partner(0, &blocks[..1]), None);
 
@@ -4949,6 +6055,7 @@ mod tests {
                 kind: "door".into(),
                 data: json!({"key_cost":{"yellow":1,"blue":0,"red":0}}),
                 state_slot: Some(0),
+                ..SolverBlock::fixture_defaults()
             },
             SolverBlock {
                 floor: "B".into(),
@@ -4958,6 +6065,7 @@ mod tests {
                 kind: "shop".into(),
                 data: json!({"shop_id":"remoteShop"}),
                 state_slot: None,
+                ..SolverBlock::fixture_defaults()
             },
         ];
         let floors = HashMap::from([
@@ -5015,6 +6123,7 @@ mod tests {
                 kind: "resource".into(),
                 data: json!({"delta":{}}),
                 state_slot: Some(0),
+                ..SolverBlock::fixture_defaults()
             },
         ];
         let floors = HashMap::from([
@@ -5142,6 +6251,7 @@ mod tests {
             kind: "event".into(),
             data: json!({"event":{"id":"fairy_mt0"}}),
             state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
         };
         let target = SolverBlock {
             floor: "MT20".into(),
@@ -5150,7 +6260,9 @@ mod tests {
             id: "hidden".into(),
             kind: "opaque".into(),
             data: json!({"initial_active":false}),
+            initial_active: false,
             state_slot: Some(1),
+            ..SolverBlock::fixture_defaults()
         };
         state.consumed = ConsumedBits::from_bools(&[false, true]);
         let details = apply_audited_event(&mut state, &block, 0, &[block.clone(), target]).unwrap();
@@ -5187,9 +6299,11 @@ mod tests {
             kind: "door".into(),
             data: json!({"key_cost":{"yellow":1,"blue":0,"red":0}}),
             state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
         };
         let mut inventory_door = ordinary.clone();
         inventory_door.data["inventory_cost"] = json!({"cross":1});
+        inventory_door.rule = Arc::new(OnceLock::new());
         let ordinary_successor = materialize_pending_action_inner(
             &source,
             PendingAction::Block {
@@ -5234,11 +6348,15 @@ mod tests {
             kind: "door".into(),
             data: json!({"key_cost":{"yellow":1,"blue":0,"red":0}}),
             state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
         };
-        let shops = vec![json!({"shop_id":"shop","choices":[
-            {"choice_id":"choice","base_cost":10,"increment_per_purchase":0,
-             "currency":"gold","effect":{"field":"attack","amount":1}}
-        ]})];
+        let shops = vec![
+            compile_shop(&json!({"shop_id":"shop","choices":[
+                {"choice_id":"choice","base_cost":10,"increment_per_purchase":0,
+                 "currency":"gold","purchase_count":0,"effect":{"field":"attack","amount":1}}
+            ]}))
+            .unwrap(),
+        ];
         source.shop_counts = Arc::new(vec![0]);
         let enemy = SolverBlock {
             floor: "F".into(),
@@ -5248,6 +6366,7 @@ mod tests {
             kind: "enemy".into(),
             data: json!({"enemy":{"hp":30,"attack":100,"defense":0,"gold":0,"experience":0}}),
             state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
         };
         for action in [PendingAction::Block {
             index: 0,
@@ -5300,12 +6419,15 @@ mod tests {
         let mut source = terminal_node(10, 10, 100, "x");
         source.gold = 50;
         source.shop_counts = Arc::new(vec![0]);
-        let shops = vec![json!({"shop_id":"shop","choices":[
-            {"choice_id":"choice","base_cost":10,"increment_per_purchase":0,
-             "currency":"gold","effects":[
-                {"field":"attack","amount":3},{"field":"gold","amount":2}
-             ]}
-        ]})];
+        let shops = vec![
+            compile_shop(&json!({"shop_id":"shop","choices":[
+                {"choice_id":"choice","base_cost":10,"increment_per_purchase":0,
+                 "currency":"gold","purchase_count":0,"effects":[
+                    {"field":"attack","amount":3},{"field":"gold","amount":2}
+                 ]}
+            ]}))
+            .unwrap(),
+        ];
         let phase_a = materialize_pending_action_inner(
             &source,
             PendingAction::Shop {
@@ -5388,6 +6510,7 @@ mod tests {
             kind: "event".into(),
             data: json!({"event":{"id":"wand_gate_remove_on_failure"}}),
             state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
         };
         let gate_retry = SolverBlock {
             floor: "MT22".into(),
@@ -5397,6 +6520,7 @@ mod tests {
             kind: "event".into(),
             data: json!({"event":{"id":"wand_gate_retry"}}),
             state_slot: Some(1),
+            ..SolverBlock::fixture_defaults()
         };
         let wand = SolverBlock {
             floor: "MT23w".into(),
@@ -5406,6 +6530,7 @@ mod tests {
             kind: "resource".into(),
             data: json!({}),
             state_slot: Some(2),
+            ..SolverBlock::fixture_defaults()
         };
         let blocks = vec![gate_once.clone(), gate_retry.clone(), wand];
         let mut once = terminal_node(10, 10, 100, "x");
@@ -5427,7 +6552,9 @@ mod tests {
             id: "old-event".into(),
             kind: "opaque".into(),
             data: json!({"numeric_id":99}),
+            numeric_id: Some(99),
             state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
         };
         let floor = SolverFloor {
             width: 3,
@@ -5453,7 +6580,9 @@ mod tests {
             id: "fairy".into(),
             kind: "event".into(),
             data: json!({"numeric_id":0,"event":{"id":"wand_gate_retry"}}),
+            numeric_id: Some(0),
             state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
         };
         let positions = [
             (5, 2, 189, 181),
@@ -5475,7 +6604,9 @@ mod tests {
                 id: format!("old{old}"),
                 kind: if old == 257 { "enemy" } else { "terrain" }.into(),
                 data: json!({"numeric_id":old}),
+                numeric_id: Some(old),
                 state_slot: Some(blocks.len()),
+                ..SolverBlock::fixture_defaults()
             });
             blocks.push(SolverBlock {
                 floor: "MT_1".into(),
@@ -5493,7 +6624,9 @@ mod tests {
                 } else {
                     json!({"numeric_id":new})
                 },
+                numeric_id: Some(new),
                 state_slot: Some(blocks.len()),
+                ..SolverBlock::fixture_defaults()
             });
         }
         let mut state = terminal_node(5001, 5000, 200000, "x");
@@ -5552,6 +6685,7 @@ mod tests {
             kind: "event".into(),
             data: json!({"event":{"id":"thief_quest"}}),
             state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
         };
         let mt2_door = SolverBlock {
             floor: "MT2".into(),
@@ -5561,6 +6695,7 @@ mod tests {
             kind: "door".into(),
             data: json!({}),
             state_slot: Some(1),
+            ..SolverBlock::fixture_defaults()
         };
         let road_a = SolverBlock {
             floor: "MT18".into(),
@@ -5570,6 +6705,7 @@ mod tests {
             kind: "opaque".into(),
             data: json!({}),
             state_slot: Some(2),
+            ..SolverBlock::fixture_defaults()
         };
         let road_b = SolverBlock {
             floor: "MT18".into(),
@@ -5579,6 +6715,7 @@ mod tests {
             kind: "opaque".into(),
             data: json!({}),
             state_slot: Some(3),
+            ..SolverBlock::fixture_defaults()
         };
         let blocks = vec![thief.clone(), mt2_door, road_a, road_b];
         let mut state = terminal_node(10, 10, 100, "x");
@@ -5599,6 +6736,7 @@ mod tests {
             kind: "event".into(),
             data: json!({"event":{"id":"princess_quest"}}),
             state_slot: Some(4),
+            ..SolverBlock::fixture_defaults()
         };
         state.flags = Arc::new(vec![("switch:MT18:6,5:A".into(), 1)]);
         state.consumed = ConsumedBits::from_bools(&[false; 5]);
@@ -5641,7 +6779,7 @@ mod tests {
             "terminal": {"kind":"location","floor_id":"F2","x":4,"y":0},
             "blockers": [], "shops": [{"supported":true,"shop_id":"moneyShop","repeatable":true,"choices":[
                 {"choice_id":"moneyShop:0:attack:5:10","index":0,"text":"attack+5","cost":10,
-                 "base_cost":10,"increment_per_purchase":0,
+                 "currency":"gold","base_cost":10,"increment_per_purchase":0,
                  "effect":{"field":"attack","amount":5},"counter_flag":"shop_atk","purchase_count":0}
             ]}],
             "floors": [
@@ -5836,6 +6974,60 @@ mod tests {
         ] {
             assert!(!serialized.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn shadow_response_rejects_transition_target_without_x_globally() {
+        let mut observation = global_observation(None);
+        observation["engine_model"]["solver_model"]["floors"][0]["blocks"][2]["target"]
+            .as_object_mut()
+            .unwrap()
+            .remove("x");
+        let response = shadow_response(
+            &request_with(observation),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        let global = &response["shadow"]["analysis"]["global"];
+        assert_eq!(global["proof"], "unsupported");
+        assert_eq!(global["reason"], "transition_x_missing");
+        assert_eq!(global["explored_states"], 0);
+        assert_eq!(global["route"], Value::Null);
+    }
+
+    #[test]
+    fn shadow_response_rejects_transition_target_without_y_globally() {
+        let mut observation = global_observation(None);
+        observation["engine_model"]["solver_model"]["floors"][0]["blocks"][2]["target"]
+            .as_object_mut()
+            .unwrap()
+            .remove("y");
+        let response = shadow_response(
+            &request_with(observation),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        let global = &response["shadow"]["analysis"]["global"];
+        assert_eq!(global["proof"], "unsupported");
+        assert_eq!(global["reason"], "transition_y_missing");
+        assert_eq!(global["explored_states"], 0);
+        assert_eq!(global["route"], Value::Null);
+    }
+
+    #[test]
+    fn shadow_response_rejects_finite_attack_defense_sum_overflow() {
+        let mut observation = any_location_terminal_observation(&[(0, 0)]);
+        observation["hero"]["attack"] = json!(1.0e308);
+        observation["hero"]["defense"] = json!(1.0e308);
+        let response = shadow_response(
+            &request_with(observation),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        let global = &response["shadow"]["analysis"]["global"];
+        assert_eq!(global["proof"], "unsupported");
+        assert_eq!(global["reason"], "numeric_objective_non_finite");
+        assert_eq!(global["route"], Value::Null);
     }
 
     #[test]
@@ -6208,6 +7400,319 @@ mod tests {
         let error = shadow_response(br#"{}"#, &state).expect_err("invalid request");
         assert_eq!(error["status"], "error");
         assert_eq!(error["error_code"], "INVALID_REQUEST");
+    }
+
+    #[test]
+    fn compiled_model_malformed_inputs_fail_closed_without_panicking() {
+        let cases: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+            (
+                "terminal_invalid",
+                Box::new(|v| v["engine_model"]["solver_model"]["terminal"] = json!("F2")),
+            ),
+            (
+                "shops_invalid",
+                Box::new(|v| v["engine_model"]["solver_model"]["shops"] = json!({})),
+            ),
+            (
+                "shop_effects_invalid",
+                Box::new(|v| {
+                    let c = &mut v["engine_model"]["solver_model"]["shops"][0]["choices"][0];
+                    c["effects"] = json!(false);
+                    c["effect"] = json!({"field":"attack","amount":1});
+                }),
+            ),
+            (
+                "block_initial_active_invalid",
+                Box::new(|v| {
+                    v["engine_model"]["solver_model"]["floors"][0]["blocks"][0]["initial_active"] =
+                        json!(1)
+                }),
+            ),
+            (
+                "block_numeric_id_invalid",
+                Box::new(|v| {
+                    v["engine_model"]["solver_model"]["floors"][0]["blocks"][0]["numeric_id"] =
+                        json!("1")
+                }),
+            ),
+            (
+                "initial_keys_invalid",
+                Box::new(|v| {
+                    v["keys"].as_object_mut().unwrap().remove("yellow");
+                }),
+            ),
+            (
+                "block_kind_unsupported",
+                Box::new(|v| {
+                    v["engine_model"]["solver_model"]["floors"][0]["blocks"][0]["kind"] =
+                        json!("unmodelled")
+                }),
+            ),
+        ];
+        for (reason, alter) in cases {
+            let mut observation = global_observation(None);
+            alter(&mut observation);
+            let response = shadow_response(
+                &request_with(observation),
+                &Mutex::new(ShadowState::default()),
+            )
+            .expect("well-formed cycle envelope");
+            let global = &response["shadow"]["analysis"]["global"];
+            assert_eq!(global["proof"], "unsupported", "{reason}");
+            assert_eq!(global["reason"], reason, "{global}");
+            assert!(global["route"].is_null());
+        }
+    }
+
+    #[test]
+    fn impure_transition_is_globally_unsupported_and_never_emits_a_witness() {
+        let mut observation = global_observation(None);
+        observation["engine_model"]["solver_model"]["floors"][0]["blocks"][2]["side_effect"] =
+            json!(true);
+        let response = shadow_response(
+            &request_with(observation),
+            &Mutex::new(ShadowState::default()),
+        )
+        .unwrap();
+        let global = &response["shadow"]["analysis"]["global"];
+        assert_eq!(global["proof"], "unsupported");
+        assert_eq!(global["reason"], "transition_impure_unsupported");
+        assert!(global["route"].is_null());
+        assert!(global["first_suggestion"].is_null());
+    }
+
+    #[test]
+    fn compiled_rules_record_faults_but_ordinary_infeasibility_is_not_a_fault() {
+        let resource = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "overflow".into(),
+            kind: "resource".into(),
+            data: json!({"delta":{"gold":u64::MAX}}),
+            state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
+        };
+        let mut state = terminal_node(1, 1, 10, "x");
+        state.gold = 1;
+        state.consumed = ConsumedBits::from_bools(&[false]);
+        clear_rule_fault();
+        assert!(
+            materialize_pending_action_inner(
+                &state,
+                PendingAction::Block {
+                    index: 0,
+                    adjacent: (0, 0)
+                },
+                std::slice::from_ref(&resource),
+                &[],
+                false
+            )
+            .is_none()
+        );
+        assert_eq!(rule_fault(), Some("rule_arithmetic_invalid"));
+
+        let enemy = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "enemy".into(),
+            kind: "enemy".into(),
+            data: json!({"enemy":{"hp":1,"attack":0,"defense":0,"gold":u64::MAX,"experience":0}}),
+            state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
+        };
+        clear_rule_fault();
+        assert!(
+            materialize_pending_action_inner(
+                &state,
+                PendingAction::Block {
+                    index: 0,
+                    adjacent: (0, 0)
+                },
+                std::slice::from_ref(&enemy),
+                &[],
+                false
+            )
+            .is_none()
+        );
+        assert_eq!(rule_fault(), Some("rule_arithmetic_invalid"));
+
+        let overflowing_shop = compile_shop(&json!({"shop_id":"overflow","choices":[{"choice_id":"gold","currency":"gold","base_cost":1,"increment_per_purchase":1,"purchase_count":u64::MAX,"effect":{"field":"gold","amount":1}}]})).unwrap();
+        let mut rich = terminal_node(1, 1, 10, "x");
+        rich.gold = u64::MAX;
+        rich.shop_counts = Arc::new(vec![u64::MAX]);
+        clear_rule_fault();
+        assert!(
+            materialize_pending_action_inner(
+                &rich,
+                PendingAction::Shop {
+                    shop_index: 0,
+                    choice_index: 0,
+                    choice_offset: 0,
+                    floor: "F".into(),
+                    adjacent: (0, 0)
+                },
+                &[],
+                &[overflowing_shop],
+                false
+            )
+            .is_none()
+        );
+        assert_eq!(rule_fault(), Some("rule_arithmetic_invalid"));
+
+        let event = SolverBlock {
+            floor: "F".into(),
+            x: 0,
+            y: 0,
+            id: "book".into(),
+            kind: "event".into(),
+            data: json!({"event":{"id":"book_reward"}}),
+            state_slot: None,
+            ..SolverBlock::fixture_defaults()
+        };
+        clear_rule_fault();
+        assert!(
+            apply_audited_event(
+                &mut terminal_node(1, 1, 10, "x"),
+                &event,
+                0,
+                std::slice::from_ref(&event)
+            )
+            .is_none()
+        );
+        assert_eq!(rule_fault(), Some("event_state_slot_missing"));
+
+        let door = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "door".into(),
+            kind: "door".into(),
+            data: json!({"key_cost":{"yellow":1}}),
+            state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
+        };
+        let lethal = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "lethal".into(),
+            kind: "enemy".into(),
+            data: json!({"enemy":{"hp":3,"attack":10,"defense":0,"gold":0,"experience":0}}),
+            state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
+        };
+        let expensive = compile_shop(&json!({"shop_id":"s","choices":[{"choice_id":"c","currency":"gold","base_cost":1,"increment_per_purchase":0,"purchase_count":0,"effect":{"field":"attack","amount":1}}]})).unwrap();
+        clear_rule_fault();
+        let mut ordinary = terminal_node(1, 1, 10, "x");
+        ordinary.consumed = ConsumedBits::from_bools(&[false]);
+        for action in [
+            PendingAction::Block {
+                index: 0,
+                adjacent: (0, 0),
+            },
+            PendingAction::Block {
+                index: 1,
+                adjacent: (0, 0),
+            },
+        ] {
+            assert!(
+                materialize_pending_action_inner(
+                    &ordinary,
+                    action,
+                    &[door.clone(), lethal.clone()],
+                    &[],
+                    false
+                )
+                .is_none()
+            );
+        }
+        assert!(
+            materialize_pending_action_inner(
+                &ordinary,
+                PendingAction::Shop {
+                    shop_index: 0,
+                    choice_index: 0,
+                    choice_offset: 0,
+                    floor: "F".into(),
+                    adjacent: (0, 0)
+                },
+                &[],
+                &[expensive],
+                false
+            )
+            .is_none()
+        );
+        let trade = SolverBlock {
+            floor: "F".into(),
+            x: 0,
+            y: 0,
+            id: "trade".into(),
+            kind: "event".into(),
+            data: json!({"event":{"id":"exp_sword_trade"}}),
+            state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
+        };
+        assert!(
+            apply_audited_event(&mut ordinary, &trade, 0, std::slice::from_ref(&trade)).is_none()
+        );
+        assert_eq!(rule_fault(), None);
+    }
+
+    #[test]
+    fn compiled_metadata_is_precise_and_all_phase3a_rules_remain_unproven() {
+        let door = compile_block_rule(
+            "door",
+            &json!({"key_cost":{"yellow":1},"inventory_cost":{"wand":1}}),
+        )
+        .unwrap();
+        let resource = compile_block_rule(
+            "resource",
+            &json!({"delta":{"attack":2,"multiply":{"hp":2},"inventory":{"book":1}}}),
+        )
+        .unwrap();
+        let enemy = compile_block_rule(
+            "enemy",
+            &json!({"enemy":{"hp":1,"attack":1,"defense":1,"gold":1,"experience":1}}),
+        )
+        .unwrap();
+        let transition = compile_block_rule(
+            "transition",
+            &json!({"target":{"floor_id":"F","x":0,"y":0}}),
+        )
+        .unwrap();
+        for rule in [&door, &resource, &enemy, &transition] {
+            assert_eq!(
+                rule.metadata().unwrap().monotonicity,
+                MonotonicityClass::Unproven
+            );
+        }
+        let door = door.metadata().unwrap();
+        assert_eq!(door.reads.resources, ResourceMask::YELLOW);
+        assert!(door.reads.inventory && door.writes.consumed_slots);
+        let resource = resource.metadata().unwrap();
+        assert_eq!(resource.reads.resources, ResourceMask::HP);
+        assert_eq!(
+            resource.writes.resources,
+            ResourceMask::HP.union(ResourceMask::ATTACK)
+        );
+        assert!(resource.writes.inventory);
+        let transition = transition.metadata().unwrap();
+        assert!(
+            transition.reads.topology
+                && transition.writes.topology
+                && !transition.writes.monotone_structure_only
+        );
+    }
+
+    #[test]
+    fn numeric_objective_nonfinite_is_a_global_fault_reason() {
+        let mut state = terminal_node(1, 1, 1, "x");
+        state.attack = F64Bits(f64::INFINITY.to_bits());
+        clear_rule_fault();
+        let _ = NumericObjective::from_state(&state);
+        assert_eq!(rule_fault(), Some("numeric_objective_non_finite"));
     }
 
     #[test]
