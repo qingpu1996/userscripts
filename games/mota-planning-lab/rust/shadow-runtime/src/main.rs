@@ -265,7 +265,11 @@ fn compile_block_rule(kind: &str, data: &Value) -> Result<CompiledBlockRule, Str
                         topology: false,
                         monotone_structure_only: true,
                     },
-                    MonotonicityClass::Unproven,
+                    // For an equal StructuralNode, inventory is identical and
+                    // the three key balances are ordered by ResourceLabel.
+                    // Guarded subtraction preserves that order and cannot
+                    // overflow, while consuming this same door is identical.
+                    MonotonicityClass::Proven,
                 ),
             })
         }
@@ -316,6 +320,9 @@ fn compile_block_rule(kind: &str, data: &Value) -> Result<CompiledBlockRule, Str
                         topology: false,
                         monotone_structure_only: true,
                     },
+                    // Enemy loss and rewards include f64 arithmetic and
+                    // checked integer additions; they stay fail-closed until
+                    // a separate proof covers those fault domains.
                     MonotonicityClass::Unproven,
                 ),
             })
@@ -366,7 +373,14 @@ fn compile_block_rule(kind: &str, data: &Value) -> Result<CompiledBlockRule, Str
                         topology: true,
                         monotone_structure_only: false,
                     },
-                    MonotonicityClass::Unproven,
+                    // A pure transition only relocates the equal structural
+                    // state and leaves every ResourceLabel component intact.
+                    // Impure transitions are rejected by parse_solver_world.
+                    if pure {
+                        MonotonicityClass::Proven
+                    } else {
+                        MonotonicityClass::Unproven
+                    },
                 ),
             })
         }
@@ -669,6 +683,7 @@ struct ProfileStats {
     phase_b_materialize_infeasible: u64,
     work_items_popped: u64,
     stale_source_work_items: u64,
+    skipped_stale_source_work_items: u64,
     connectivity_view_calls: u64,
     connectivity_view_ns: u64,
     local_reachable_calls: u64,
@@ -681,8 +696,15 @@ struct ProfileStats {
     enqueue_actions_ns: u64,
     topology_query_total: u64,
     topology_unique_keys: HashSet<(usize, u64, u64)>,
+    passability_signature_request_total: u64,
+    // This exact set exists only while MOTA_SHADOW_PROFILE=1. It is a
+    // measurement of possible view reuse, never a connectivity cache.
+    passability_signature_unique_keys: HashSet<PassabilityRequestKey>,
     phase_a_explored: u64,
     phase_b_explored: u64,
+    phase_a_accepted: u64,
+    phase_a_rejected: u64,
+    phase_a_pending: u64,
 }
 
 #[inline(always)]
@@ -770,12 +792,20 @@ fn profile_finish_json(stats: &ProfileStats) -> Value {
     };
     let unique = stats.topology_unique_keys.len() as u64;
     let repeated = stats.topology_query_total.saturating_sub(unique);
+    let signature_unique = stats.passability_signature_unique_keys.len() as u64;
+    let signature_repeated = stats
+        .passability_signature_request_total
+        .saturating_sub(signature_unique);
     json!({
         "event": "mota_shadow_profile_v1",
         "phase_a_explored": stats.phase_a_explored,
         "phase_b_explored": stats.phase_b_explored,
+        "phase_a_accepted": stats.phase_a_accepted,
+        "phase_a_rejected": stats.phase_a_rejected,
+        "phase_a_pending": stats.phase_a_pending,
         "work_items_popped": stats.work_items_popped,
         "stale_source_work_items": stats.stale_source_work_items,
+        "skipped_stale_source_work_items": stats.skipped_stale_source_work_items,
         "materialize_feasible": stats.phase_a_materialize_feasible,
         "materialize_infeasible": stats.phase_a_materialize_infeasible,
         "materialize_calls": stats.phase_a_materialize_calls.iter().sum::<u64>(),
@@ -828,6 +858,20 @@ fn profile_finish_json(stats: &ProfileStats) -> Value {
         "topology_query_total": stats.topology_query_total,
         "topology_unique_keys": unique,
         "topology_repeated_keys": repeated,
+        "passability_signature": {
+            "request_total": stats.passability_signature_request_total,
+            "unique_keys": signature_unique,
+            "repeated_keys": signature_repeated,
+            "potential_hit_rate": if stats.passability_signature_request_total == 0 {
+                0.0
+            } else {
+                signature_repeated as f64 / stats.passability_signature_request_total as f64
+            },
+            "key": "exact passability signature + exact floor id + start cell id",
+        },
+        "passability_signature_request_total": stats.passability_signature_request_total,
+        "passability_signature_unique_keys": signature_unique,
+        "passability_signature_repeated_keys": signature_repeated,
     })
 }
 
@@ -870,6 +914,11 @@ thread_local! {
     static MATERIALIZE_SOURCE_CLONES: Cell<usize> = const { Cell::new(0) };
     // Test-only semantic evidence: it never crosses the shadow protocol.
     static PHASE_A_ACCEPTED_TRACE: RefCell<Vec<SolverState>> = const { RefCell::new(Vec::new()) };
+    // Keep the stale-pruning witness observable from a complete FIFO run.
+    // These counters are test-only and deliberately do not affect release
+    // search memory or scheduling.
+    static PHASE_A_STALE_OBSERVED: Cell<usize> = const { Cell::new(0) };
+    static PHASE_A_STALE_SKIPPED: Cell<usize> = const { Cell::new(0) };
 }
 
 #[derive(Default)]
@@ -1828,6 +1877,38 @@ impl ConsumedBits {
     }
 }
 
+// Connectivity reads only the state slots of non-terrain, non-shop blocks.
+// This is deliberately a projection rather than a hash of ConsumedBits: key
+// pickups, shop state, and any other consumed slot which cannot change the
+// flood-fill result must not split a potential-reuse class.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PassabilitySignature {
+    words: Arc<Vec<u64>>,
+}
+
+impl PassabilitySignature {
+    fn from_state(state: &SolverState, passability_slots: &[usize]) -> Self {
+        let mut words = vec![0_u64; passability_slots.len().div_ceil(64)];
+        for (signature_slot, state_slot) in passability_slots.iter().copied().enumerate() {
+            if state.consumed.read(state_slot).unwrap_or(false) {
+                words[signature_slot / 64] |= 1_u64 << (signature_slot % 64);
+            }
+        }
+        Self {
+            words: Arc::new(words),
+        }
+    }
+}
+
+// The request key retains the full signature, so its Hash implementation is
+// only an accelerator; equality resolves every possible fingerprint collision.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PassabilityRequestKey {
+    signature: PassabilitySignature,
+    floor_id: String,
+    start_cell_id: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SolverState {
     floor: String,
@@ -2022,6 +2103,34 @@ impl PhaseALabelStore {
         Some(node.with_resources(&label.resources))
     }
 
+    // A stale label may be skipped only when a current live frontier label in
+    // this *same* StructuralNode dominates it. This is the Phase 3B witness:
+    // every live label was accepted and enqueued with every action from the
+    // identical connectivity view. If that witness later becomes stale, the
+    // same argument follows its live dominator; the finite append-only arena
+    // therefore ends at a live maximal label before the FIFO can complete.
+    // Door/pure-transition actions preserve feasibility, successor structure,
+    // and resource dominance along that chain (enforced at the action gate).
+    fn has_live_dominator(&self, id: LabelId) -> bool {
+        let Some(label) = self.labels.get(id.0) else {
+            return false;
+        };
+        if !label.stale {
+            return false;
+        }
+        self.frontiers
+            .get(label.structural_id.0)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|candidate| *candidate != id)
+            .any(|candidate| {
+                self.labels.get(candidate.0).is_some_and(|strong| {
+                    !strong.stale && strong.resources.dominates(&label.resources)
+                })
+            })
+    }
+
     #[cfg(test)]
     fn is_stale(&self, id: LabelId) -> bool {
         self.labels
@@ -2087,6 +2196,7 @@ impl PhaseALabelStore {
         let structural_id = self.intern_structural(StructuralNode::from_state(&state));
         let resources = ResourceLabel::from_state(&state);
         if !self.admit_frontier(structural_id, &resources) {
+            profile_with_stats(|stats| stats.phase_a_rejected += 1);
             return None;
         }
         let id = LabelId(self.labels.len());
@@ -2099,6 +2209,7 @@ impl PhaseALabelStore {
             .get_mut(structural_id.0)
             .expect("interned structural ID must have a frontier slot")
             .push(id);
+        profile_with_stats(|stats| stats.phase_a_accepted += 1);
         Some(id)
     }
 }
@@ -2242,6 +2353,31 @@ impl PhaseAActionRef {
             floor: shop_block.floor.clone(),
             adjacent,
         })
+    }
+
+    // Only these rules have a Phase 3B preservation proof:
+    // - door: equal inventory/structure, guarded key subtraction, identical
+    //   consumed-slot write;
+    // - pure transition: no resource transform or mutable structural write.
+    // Resource, enemy, audited event, and shop each retain an unproven
+    // arithmetic, conditional, or structural fault domain and must execute.
+    fn stale_source_skip_is_proven(self, blocks: &[SolverBlock]) -> bool {
+        if self.tagged_index & PHASE_A_SHOP_ACTION != 0 {
+            return false;
+        }
+        let Some(block) = usize::try_from(self.tagged_index)
+            .ok()
+            .and_then(|index| blocks.get(index))
+        else {
+            return false;
+        };
+        match compiled_rule(block) {
+            CompiledBlockRule::Door { meta, .. } => meta.monotonicity == MonotonicityClass::Proven,
+            CompiledBlockRule::Transition {
+                pure: true, meta, ..
+            } => meta.monotonicity == MonotonicityClass::Proven,
+            _ => false,
+        }
     }
 }
 
@@ -2627,6 +2763,10 @@ struct TopologyDescriptor {
 struct ConnectivityIndex {
     floors: HashMap<String, ConnectivityFloor>,
     reversible: Vec<Option<usize>>,
+    // Compiled from the exact blocked predicate in local_reachable_inner.
+    // Slot ordering is stable for this parsed world and excludes consumed
+    // state that can never affect passability (notably shop/terrain slots).
+    passability_slots: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -2961,7 +3101,20 @@ impl ConnectivityIndex {
         let reversible = (0..blocks.len())
             .map(|index| reversible_transition_partner(index, blocks))
             .collect();
-        Self { floors, reversible }
+        let passability_slots = profiling_enabled()
+            .then(|| {
+                blocks
+                    .iter()
+                    .filter(|block| block.kind != "terrain" && block.kind != "shop")
+                    .filter_map(|block| block.state_slot)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            floors,
+            reversible,
+            passability_slots,
+        }
     }
 
     fn local_reachable(
@@ -2979,6 +3132,26 @@ impl ConnectivityIndex {
                     .insert((floor.topology_id, start.0, start.1));
             }
         });
+        if profiling_enabled() {
+            let start_cell_id = self.floors.get(floor_id).and_then(|floor| {
+                let x = usize::try_from(start.0).ok()?;
+                let y = usize::try_from(start.1).ok()?;
+                (x < floor.width && y < floor.height)
+                    .then(|| y.checked_mul(floor.width)?.checked_add(x))
+                    .flatten()
+            });
+            if let Some(start_cell_id) = start_cell_id {
+                let key = PassabilityRequestKey {
+                    signature: PassabilitySignature::from_state(state, &self.passability_slots),
+                    floor_id: floor_id.to_owned(),
+                    start_cell_id,
+                };
+                profile_with_stats(|stats| {
+                    stats.passability_signature_request_total += 1;
+                    stats.passability_signature_unique_keys.insert(key);
+                });
+            }
+        }
         let started = profile_start();
         let result = self.local_reachable_inner(state, floor_id, start, blocks);
         profile_elapsed(started, |stats, nanos| {
@@ -4409,6 +4582,29 @@ fn clear_phase_a_accepted_trace() {
 }
 
 #[cfg(test)]
+fn clear_phase_a_stale_counts() {
+    PHASE_A_STALE_OBSERVED.with(|count| count.set(0));
+    PHASE_A_STALE_SKIPPED.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn record_phase_a_stale(observed: bool, skipped: bool) {
+    if observed {
+        PHASE_A_STALE_OBSERVED.with(|count| count.set(count.get() + 1));
+    }
+    if skipped {
+        PHASE_A_STALE_SKIPPED.with(|count| count.set(count.get() + 1));
+    }
+}
+
+#[cfg(test)]
+fn take_phase_a_stale_counts() -> (usize, usize) {
+    let observed = PHASE_A_STALE_OBSERVED.with(|count| count.replace(0));
+    let skipped = PHASE_A_STALE_SKIPPED.with(|count| count.replace(0));
+    (observed, skipped)
+}
+
+#[cfg(test)]
 fn record_phase_a_accepted(state: &SolverState) {
     PHASE_A_ACCEPTED_TRACE.with(|trace| trace.borrow_mut().push(state.clone()));
 }
@@ -4443,11 +4639,57 @@ fn run_numeric_proof(
     terminals: &[(&str, (u64, u64))],
     shops: &[CompiledShop],
 ) -> PhaseAResult {
+    run_numeric_proof_with_stale_skip(
+        initial,
+        max_states,
+        connectivity,
+        floors,
+        blocks,
+        terminals,
+        shops,
+        true,
+    )
+}
+
+#[cfg(test)]
+fn run_numeric_proof_without_stale_skip(
+    initial: &SolverState,
+    max_states: usize,
+    connectivity: &ConnectivityIndex,
+    floors: &HashMap<String, SolverFloor>,
+    blocks: &[SolverBlock],
+    terminals: &[(&str, (u64, u64))],
+    shops: &[CompiledShop],
+) -> PhaseAResult {
+    run_numeric_proof_with_stale_skip(
+        initial,
+        max_states,
+        connectivity,
+        floors,
+        blocks,
+        terminals,
+        shops,
+        false,
+    )
+}
+
+fn run_numeric_proof_with_stale_skip(
+    initial: &SolverState,
+    max_states: usize,
+    connectivity: &ConnectivityIndex,
+    floors: &HashMap<String, SolverFloor>,
+    blocks: &[SolverBlock],
+    terminals: &[(&str, (u64, u64))],
+    shops: &[CompiledShop],
+    stale_skip_enabled: bool,
+) -> PhaseAResult {
     profile_set_phase(ProfilePhase::PhaseA);
     #[cfg(test)]
     let _drop_probe = PhaseADropProbe;
     #[cfg(test)]
     clear_phase_a_accepted_trace();
+    #[cfg(test)]
+    clear_phase_a_stale_counts();
     let mut store = PhaseALabelStore {
         structural_nodes: Vec::new(),
         structural_ids: HashMap::new(),
@@ -4477,6 +4719,7 @@ fn run_numeric_proof(
         }
         enqueue_phase_a_actions(&mut queue, initial_id, &initial_view, shops);
         if store.labels.len() == max_states {
+            profile_with_stats(|stats| stats.phase_a_pending = queue.len() as u64);
             return PhaseAResult {
                 outcome: if queue.is_empty() {
                     PhaseAOutcome::Complete(best)
@@ -4490,21 +4733,28 @@ fn run_numeric_proof(
 
     while let Some(work_item) = queue.pop_front() {
         profile_with_stats(|stats| stats.work_items_popped += 1);
-        // Labels are append-only. A dominated source stays addressable and its
-        // already-enqueued action remains part of FIFO semantics.
+        // Labels are append-only. A dominated source stays addressable, and
+        // pop order remains FIFO even when a proved action is skipped.
         let Some(source_id) = work_item.source_label() else {
             profile_materialize_attempt(MaterializeKind::Invalid, false, 0);
             continue;
         };
-        profile_with_stats(|stats| {
-            if store
-                .labels
-                .get(source_id.0)
-                .is_some_and(|label| label.stale)
-            {
-                stats.stale_source_work_items += 1;
+        let stale = store
+            .labels
+            .get(source_id.0)
+            .is_some_and(|label| label.stale);
+        if stale {
+            profile_with_stats(|stats| stats.stale_source_work_items += 1);
+            let skip = stale_skip_enabled
+                && store.has_live_dominator(source_id)
+                && work_item.action.stale_source_skip_is_proven(blocks);
+            #[cfg(test)]
+            record_phase_a_stale(true, skip);
+            if skip {
+                profile_with_stats(|stats| stats.skipped_stale_source_work_items += 1);
+                continue;
             }
-        });
+        }
         let Some(source) = store.state_for(source_id) else {
             profile_materialize_attempt(MaterializeKind::Invalid, false, 0);
             continue;
@@ -4535,6 +4785,7 @@ fn run_numeric_proof(
             }
             enqueue_phase_a_actions(&mut queue, label_id, &view, shops);
             if store.labels.len() == max_states {
+                profile_with_stats(|stats| stats.phase_a_pending = queue.len() as u64);
                 return PhaseAResult {
                     outcome: if queue.is_empty() {
                         PhaseAOutcome::Complete(best)
@@ -4546,6 +4797,7 @@ fn run_numeric_proof(
             }
         }
     }
+    profile_with_stats(|stats| stats.phase_a_pending = 0);
     PhaseAResult {
         outcome: PhaseAOutcome::Complete(best),
         explored: store.labels.len(),
@@ -5586,6 +5838,498 @@ mod tests {
             store.state_for(stale)
         );
         assert!(!store.is_stale(stronger));
+        assert!(store.has_live_dominator(stale));
+    }
+
+    #[test]
+    fn stale_skip_is_limited_to_proven_door_and_pure_transition_rules() {
+        let door = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "door".into(),
+            kind: "door".into(),
+            data: json!({"key_cost":{"yellow":1}}),
+            state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
+        };
+        let transition = SolverBlock {
+            floor: "F".into(),
+            x: 2,
+            y: 0,
+            id: "transition".into(),
+            kind: "transition".into(),
+            data: json!({"target":{"floor_id":"G","x":0,"y":0}}),
+            ..SolverBlock::fixture_defaults()
+        };
+        let resource = SolverBlock {
+            floor: "F".into(),
+            x: 3,
+            y: 0,
+            id: "resource".into(),
+            kind: "resource".into(),
+            data: json!({"delta":{"gold":1}}),
+            state_slot: Some(1),
+            ..SolverBlock::fixture_defaults()
+        };
+        let action = |index| PhaseAActionRef {
+            tagged_index: index,
+            choice_index: 0,
+            adjacent_x: 0,
+            adjacent_y: 0,
+            shop_block_index: 0,
+        };
+        let blocks = vec![door, transition, resource];
+        assert!(action(0).stale_source_skip_is_proven(&blocks));
+        assert!(action(1).stale_source_skip_is_proven(&blocks));
+        assert!(!action(2).stale_source_skip_is_proven(&blocks));
+        assert!(
+            !PhaseAActionRef::shop(
+                0,
+                0,
+                &ReachShop {
+                    block_index: 0,
+                    floor: "F".into(),
+                    adjacent: (0, 0),
+                    navigation: Vec::new(),
+                }
+            )
+            .unwrap()
+            .stale_source_skip_is_proven(&blocks)
+        );
+    }
+
+    #[test]
+    fn proven_stale_actions_preserve_weak_feasibility_and_successor_dominance() {
+        let door = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "door".into(),
+            kind: "door".into(),
+            data: json!({"key_cost":{"yellow":1}}),
+            state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
+        };
+        let transition = SolverBlock {
+            floor: "F".into(),
+            x: 2,
+            y: 0,
+            id: "transition".into(),
+            kind: "transition".into(),
+            data: json!({"target":{"floor_id":"G","x":0,"y":0}}),
+            ..SolverBlock::fixture_defaults()
+        };
+        let blocks = vec![door, transition];
+        let mut weak = terminal_node(1, 1, 10, "weak");
+        weak.yellow = 1;
+        weak.consumed = ConsumedBits::from_bools(&[false]);
+        let mut strong = weak.clone();
+        strong.yellow = 2;
+        for action in [
+            PendingAction::Block {
+                index: 0,
+                adjacent: (0, 0),
+            },
+            PendingAction::Block {
+                index: 1,
+                adjacent: (0, 0),
+            },
+        ] {
+            let weak_next =
+                materialize_pending_action_inner(&weak, action.clone(), &blocks, &[], false)
+                    .expect("weak action is feasible");
+            let strong_next =
+                materialize_pending_action_inner(&strong, action, &blocks, &[], false)
+                    .expect("strong action must remain feasible");
+            assert_eq!(
+                StructuralNode::from_state(&strong_next.state),
+                StructuralNode::from_state(&weak_next.state)
+            );
+            assert!(
+                ResourceLabel::from_state(&strong_next.state)
+                    .dominates(&ResourceLabel::from_state(&weak_next.state))
+            );
+        }
+    }
+
+    #[test]
+    fn unproven_resource_overflow_cannot_be_stale_skipped_or_misread_as_infeasible() {
+        let resource = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "overflow".into(),
+            kind: "resource".into(),
+            data: json!({"delta":{"gold":1}}),
+            state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
+        };
+        let action = PhaseAActionRef {
+            tagged_index: 0,
+            choice_index: 0,
+            adjacent_x: 0,
+            adjacent_y: 0,
+            shop_block_index: 0,
+        };
+        assert!(!action.stale_source_skip_is_proven(std::slice::from_ref(&resource)));
+        let mut weak = terminal_node(1, 1, 10, "weak");
+        weak.consumed = ConsumedBits::from_bools(&[false]);
+        let mut strong = weak.clone();
+        strong.gold = u64::MAX;
+        assert!(
+            materialize_pending_action_inner(
+                &weak,
+                PendingAction::Block {
+                    index: 0,
+                    adjacent: (0, 0)
+                },
+                std::slice::from_ref(&resource),
+                &[],
+                false
+            )
+            .is_some()
+        );
+        clear_rule_fault();
+        assert!(
+            materialize_pending_action_inner(
+                &strong,
+                PendingAction::Block {
+                    index: 0,
+                    adjacent: (0, 0)
+                },
+                std::slice::from_ref(&resource),
+                &[],
+                false
+            )
+            .is_none()
+        );
+        assert_eq!(rule_fault(), Some("rule_arithmetic_invalid"));
+        assert!(F64Bits::new(f64::NAN).is_none());
+        assert!(F64Bits::new(f64::INFINITY).is_none());
+    }
+
+    #[test]
+    fn passability_signature_is_exact_projection_of_blocking_slots() {
+        let blocks = vec![
+            SolverBlock {
+                kind: "door".into(),
+                state_slot: Some(0),
+                ..SolverBlock::fixture_defaults()
+            },
+            SolverBlock {
+                kind: "enemy".into(),
+                state_slot: Some(1),
+                ..SolverBlock::fixture_defaults()
+            },
+            SolverBlock {
+                kind: "event".into(),
+                state_slot: Some(2),
+                ..SolverBlock::fixture_defaults()
+            },
+            SolverBlock {
+                kind: "shop".into(),
+                state_slot: Some(3),
+                ..SolverBlock::fixture_defaults()
+            },
+        ];
+        let passability_slots: Vec<_> = blocks
+            .iter()
+            .filter(|block| block.kind != "terrain" && block.kind != "shop")
+            .filter_map(|block| block.state_slot)
+            .collect();
+        assert_eq!(passability_slots, vec![0, 1, 2]);
+        let mut state = terminal_node(1, 1, 10, "base");
+        state.consumed = ConsumedBits::from_bools(&[false, false, false, false]);
+        let base = PassabilitySignature::from_state(&state, &passability_slots);
+        let mut resource_only = state.clone();
+        resource_only.gold = 999;
+        resource_only.shop_counts = Arc::new(vec![42]);
+        let mut shop_consumed = state.clone();
+        shop_consumed.consumed.set(3, true).unwrap();
+        assert_eq!(
+            base,
+            PassabilitySignature::from_state(&resource_only, &passability_slots)
+        );
+        assert_eq!(
+            base,
+            PassabilitySignature::from_state(&shop_consumed, &passability_slots)
+        );
+        let mut keys = HashSet::new();
+        for slot in 0..3 {
+            let mut changed = state.clone();
+            changed.consumed.set(slot, true).unwrap();
+            let signature = PassabilitySignature::from_state(&changed, &passability_slots);
+            assert_ne!(base, signature);
+            keys.insert(PassabilityRequestKey {
+                signature,
+                floor_id: "F".into(),
+                start_cell_id: 0,
+            });
+        }
+        assert_eq!(
+            keys.len(),
+            3,
+            "HashSet equality retains distinct signatures"
+        );
+    }
+
+    fn stale_pruning_world(
+        action_kind: &str,
+    ) -> (
+        SolverState,
+        HashMap<String, SolverFloor>,
+        Vec<SolverBlock>,
+        Vec<(String, (u64, u64))>,
+    ) {
+        // The first two actions are intentionally ordered so the FIFO accepts
+        // the weak multiply-then-add label before the stronger add-then-
+        // multiply label. Both have consumed the same two slots. The third
+        // action is inaccessible initially, but queued by the weak source
+        // before that source becomes stale.
+        let mut blocks = vec![
+            SolverBlock {
+                floor: "F".into(),
+                x: 1,
+                y: 0,
+                id: "multiply".into(),
+                kind: "resource".into(),
+                data: json!({"delta":{"multiply":{"attack":2.0}}}),
+                state_slot: Some(0),
+                ..SolverBlock::fixture_defaults()
+            },
+            SolverBlock {
+                floor: "F".into(),
+                x: 0,
+                y: 1,
+                id: "add".into(),
+                kind: "resource".into(),
+                data: json!({"delta":{"attack":1.0}}),
+                state_slot: Some(1),
+                ..SolverBlock::fixture_defaults()
+            },
+        ];
+        let (action, terminals) = match action_kind {
+            "door" => (
+                SolverBlock {
+                    floor: "F".into(),
+                    x: 2,
+                    y: 0,
+                    id: "door".into(),
+                    kind: "door".into(),
+                    data: json!({"key_cost":{"yellow":0,"blue":0,"red":0}}),
+                    state_slot: Some(2),
+                    ..SolverBlock::fixture_defaults()
+                },
+                vec![("F".to_owned(), (2, 0))],
+            ),
+            "transition" => (
+                SolverBlock {
+                    floor: "F".into(),
+                    x: 2,
+                    y: 0,
+                    id: "oneWay".into(),
+                    kind: "transition".into(),
+                    data: json!({"target":{"floor_id":"G","x":0,"y":0}}),
+                    state_slot: None,
+                    ..SolverBlock::fixture_defaults()
+                },
+                vec![("G".to_owned(), (0, 0))],
+            ),
+            _ => panic!("test fixture only supports door or transition"),
+        };
+        blocks.push(action);
+        let floors = HashMap::from([
+            (
+                "F".to_owned(),
+                SolverFloor {
+                    width: 3,
+                    height: 2,
+                    cells: HashSet::from([(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)]),
+                    blocks: vec![0, 1, 2],
+                },
+            ),
+            ("G".to_owned(), indexed_floor(1, Vec::new())),
+        ]);
+        let mut initial = terminal_node(1, 1, 10, "stale-fixture");
+        initial.consumed = ConsumedBits::from_bools(&[false, false, false]);
+        (initial, floors, blocks, terminals)
+    }
+
+    fn run_stale_pruning_world(action_kind: &str, budget: usize, stale_skip: bool) -> PhaseAResult {
+        let (initial, floors, blocks, terminals) = stale_pruning_world(action_kind);
+        let terminal_refs: Vec<_> = terminals
+            .iter()
+            .map(|(floor, position)| (floor.as_str(), *position))
+            .collect();
+        let connectivity = ConnectivityIndex::new(&floors, &blocks);
+        if stale_skip {
+            run_numeric_proof(
+                &initial,
+                budget,
+                &connectivity,
+                &floors,
+                &blocks,
+                &terminal_refs,
+                &[],
+            )
+        } else {
+            run_numeric_proof_without_stale_skip(
+                &initial,
+                budget,
+                &connectivity,
+                &floors,
+                &blocks,
+                &terminal_refs,
+                &[],
+            )
+        }
+    }
+
+    fn phase_a_outcome_key(result: &PhaseAResult) -> (bool, Option<(u64, u64, u64)>) {
+        match &result.outcome {
+            PhaseAOutcome::BudgetExhausted => (true, None),
+            PhaseAOutcome::Complete(None) => (false, None),
+            PhaseAOutcome::Complete(Some(objective)) => (
+                false,
+                Some((
+                    objective.attack_and_defense.to_bits(),
+                    objective.balanced_stat.to_bits(),
+                    objective.hp.to_bits(),
+                )),
+            ),
+        }
+    }
+
+    #[test]
+    fn stale_door_and_pure_transition_skip_are_fifo_oracle_equivalent() {
+        for action_kind in ["door", "transition"] {
+            let pruned = run_stale_pruning_world(action_kind, 32, true);
+            let (observed, skipped) = take_phase_a_stale_counts();
+            let oracle = run_stale_pruning_world(action_kind, 32, false);
+            let (_, oracle_skipped) = take_phase_a_stale_counts();
+
+            assert!(observed > 0, "{action_kind} must pop a stale source");
+            assert!(skipped > 0, "{action_kind} must skip stale proved work");
+            assert_eq!(oracle_skipped, 0, "oracle keeps all stale work");
+            assert_eq!(phase_a_outcome_key(&pruned), phase_a_outcome_key(&oracle));
+            assert!(phase_a_outcome_key(&pruned).1.is_some());
+        }
+    }
+
+    #[test]
+    fn stale_skip_budget_boundary_never_upgrades_an_oracle_budget_and_is_deterministic() {
+        for budget in 1..=12 {
+            let first = run_stale_pruning_world("door", budget, true);
+            let first_counts = take_phase_a_stale_counts();
+            let second = run_stale_pruning_world("door", budget, true);
+            let second_counts = take_phase_a_stale_counts();
+            let oracle = run_stale_pruning_world("door", budget, false);
+            let oracle_key = phase_a_outcome_key(&oracle);
+            let first_key = phase_a_outcome_key(&first);
+
+            assert_eq!(first_key, phase_a_outcome_key(&second), "budget={budget}");
+            assert_eq!(first.explored, second.explored, "budget={budget}");
+            assert_eq!(first_counts, second_counts, "budget={budget}");
+            assert!(
+                !(first_key.0 == false && oracle_key.0),
+                "stale pruning must not turn an oracle budget exhaustion into proven: budget={budget}"
+            );
+            if !first_key.0 {
+                assert_eq!(first_key, oracle_key, "budget={budget}");
+            }
+        }
+    }
+
+    #[test]
+    fn dominance_chain_preserves_proved_successors_for_small_resource_exhaustion() {
+        let door = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "door".into(),
+            kind: "door".into(),
+            data: json!({"key_cost":{"yellow":1}}),
+            state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
+        };
+        let transition = SolverBlock {
+            floor: "F".into(),
+            x: 2,
+            y: 0,
+            id: "transition".into(),
+            kind: "transition".into(),
+            data: json!({"target":{"floor_id":"G","x":0,"y":0}}),
+            ..SolverBlock::fixture_defaults()
+        };
+        let blocks = vec![door, transition];
+        for weak_attack in 1..=3 {
+            for middle_attack in weak_attack..=3 {
+                for strong_attack in middle_attack..=3 {
+                    let mut weak = terminal_node(weak_attack, 1, 10, "weak");
+                    weak.yellow = 1;
+                    weak.consumed = ConsumedBits::from_bools(&[false]);
+                    let mut middle = weak.clone();
+                    middle.attack = F64Bits::new(middle_attack as f64).unwrap();
+                    middle.yellow = 2;
+                    let mut strong = middle.clone();
+                    strong.attack = F64Bits::new(strong_attack as f64).unwrap();
+                    strong.yellow = 3;
+                    let mut store = empty_phase_a_store();
+                    let weak_id = store.accept(weak.clone()).unwrap();
+                    let _middle_id = store.accept(middle.clone()).unwrap();
+                    let strong_id = store.accept(strong.clone()).unwrap();
+                    assert!(store.is_stale(weak_id));
+                    assert!(!store.is_stale(strong_id));
+                    assert!(store.has_live_dominator(weak_id));
+                    for index in [0, 1] {
+                        let weak_next = materialize_pending_action_inner(
+                            &weak,
+                            PendingAction::Block {
+                                index,
+                                adjacent: (0, 0),
+                            },
+                            &blocks,
+                            &[],
+                            false,
+                        )
+                        .unwrap();
+                        let strong_next = materialize_pending_action_inner(
+                            &strong,
+                            PendingAction::Block {
+                                index,
+                                adjacent: (0, 0),
+                            },
+                            &blocks,
+                            &[],
+                            false,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            StructuralNode::from_state(&weak_next.state),
+                            StructuralNode::from_state(&strong_next.state)
+                        );
+                        assert!(
+                            ResourceLabel::from_state(&strong_next.state)
+                                .dominates(&ResourceLabel::from_state(&weak_next.state))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unproven_overflow_rule_remains_a_global_unsupported_result() {
+        let mut observation = two_terminal_routes(16);
+        observation["hero"]["gold"] = json!(u64::MAX);
+        observation["engine_model"]["solver_model"]["floors"][0]["blocks"][0]["delta"]["gold"] =
+            json!(1);
+        let (global, _) = global_analysis_with_stats(observation.as_object().unwrap());
+        assert_eq!(global["proof"], "unsupported");
+        assert_eq!(global["reason"], "rule_arithmetic_invalid");
+        let (_, skipped) = take_phase_a_stale_counts();
+        assert_eq!(skipped, 0, "resource actions are never stale-skipped");
     }
 
     fn eager_phase_a_accepted_trace(
@@ -5688,6 +6432,26 @@ mod tests {
         );
         assert!(matches!(result.outcome, PhaseAOutcome::Complete(_)));
         assert_eq!(take_phase_a_accepted_trace(), expected);
+        let no_skip = run_numeric_proof_without_stale_skip(
+            &initial,
+            16,
+            &connectivity,
+            &floors,
+            &blocks,
+            &[("F", (0, 0))],
+            &[],
+        );
+        let objective = |outcome: &PhaseAOutcome| match outcome {
+            PhaseAOutcome::Complete(Some(value)) => Some((
+                value.attack_and_defense.to_bits(),
+                value.balanced_stat.to_bits(),
+                value.hp.to_bits(),
+            )),
+            PhaseAOutcome::Complete(None) => None,
+            PhaseAOutcome::BudgetExhausted => panic!("fixture must complete"),
+        };
+        assert_eq!(objective(&result.outcome), objective(&no_skip.outcome));
+        assert_eq!(result.explored, no_skip.explored);
     }
 
     #[test]
@@ -7661,7 +8425,7 @@ mod tests {
     }
 
     #[test]
-    fn compiled_metadata_is_precise_and_all_phase3a_rules_remain_unproven() {
+    fn compiled_metadata_is_precise_and_only_stale_safe_rules_are_proven() {
         let door = compile_block_rule(
             "door",
             &json!({"key_cost":{"yellow":1},"inventory_cost":{"wand":1}}),
@@ -7682,12 +8446,20 @@ mod tests {
             &json!({"target":{"floor_id":"F","x":0,"y":0}}),
         )
         .unwrap();
-        for rule in [&door, &resource, &enemy, &transition] {
+        for rule in [&resource, &enemy] {
             assert_eq!(
                 rule.metadata().unwrap().monotonicity,
                 MonotonicityClass::Unproven
             );
         }
+        assert_eq!(
+            door.metadata().unwrap().monotonicity,
+            MonotonicityClass::Proven
+        );
+        assert_eq!(
+            transition.metadata().unwrap().monotonicity,
+            MonotonicityClass::Proven
+        );
         let door = door.metadata().unwrap();
         assert_eq!(door.reads.resources, ResourceMask::YELLOW);
         assert!(door.reads.inventory && door.writes.consumed_slots);
