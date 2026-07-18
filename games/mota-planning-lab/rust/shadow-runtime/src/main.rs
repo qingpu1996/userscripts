@@ -692,6 +692,7 @@ struct ProfileStats {
     resource_closure_observed_by_action_kind: [u64; 7],
     resource_closure_eligible_by_action_kind: [u64; 7],
     connectivity_view_calls: u64,
+    phase_a_connectivity_view_calls: u64,
     connectivity_view_ns: u64,
     local_reachable_calls: u64,
     local_reachable_ns: u64,
@@ -717,6 +718,51 @@ struct ProfileStats {
     phase_a_rejected: u64,
     phase_a_pending: u64,
     accepted_semantic_trace_hash: u64,
+    phase5a1: Phase5A1Census,
+}
+
+#[derive(Clone, Default)]
+struct SlotDependency {
+    other_reads: bool,
+    other_set_true: bool,
+    set_false: bool,
+    replace: bool,
+    unknown: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct IntegralQualification {
+    taxonomy: &'static str,
+    statically_eligible: bool,
+    arithmetic_envelope_safe: bool,
+    closure_private_slot: bool,
+    final_eligible: bool,
+}
+
+#[derive(Default)]
+struct Phase5A1Census {
+    compiled: bool,
+    slot_dependencies: Vec<SlotDependency>,
+    resources: Vec<IntegralQualification>,
+    taxonomy: BTreeMap<&'static str, u64>,
+    envelope_safe: [bool; 5],
+    envelope_reason: [String; 5],
+    envelope_upper: [String; 5],
+    resource_attempts: u64,
+    static_eligible_attempts: u64,
+    final_eligible_attempts: u64,
+    accepted_with_eligible: u64,
+    eligible_attempts: u64,
+    batch_histogram: BTreeMap<u64, u64>,
+    wave_histogram: BTreeMap<u64, u64>,
+    projected_work_items_removed: u64,
+    dry_run_unsafe_states: u64,
+    shop_materializations: u64,
+    candidate_choices: u64,
+    candidate_shops: u64,
+    candidate_shop_ids: HashSet<String>,
+    candidate_choice_bounds: Vec<(String, String, String)>,
+    accepted_with_reachable_candidate_shop: u64,
 }
 
 #[inline(always)]
@@ -811,6 +857,23 @@ fn profile_resource_closure_observation(kind: MaterializeKind, eligible: bool) {
         return;
     }
     profile_with_stats(|stats| record_resource_closure_observation(stats, kind, eligible));
+}
+
+fn profile_phase5a1_materialization(index: Option<usize>, kind: MaterializeKind) {
+    profile_with_stats(|stats| {
+        let census = &mut stats.phase5a1;
+        if kind == MaterializeKind::Shop {
+            census.shop_materializations += 1;
+        }
+        if kind != MaterializeKind::Resource {
+            return;
+        }
+        census.resource_attempts += 1;
+        if let Some(qualification) = index.and_then(|index| census.resources.get(index)).copied() {
+            census.static_eligible_attempts += u64::from(qualification.statically_eligible);
+            census.final_eligible_attempts += u64::from(qualification.final_eligible);
+        }
+    });
 }
 
 fn record_resource_closure_observation(
@@ -944,6 +1007,7 @@ fn profile_finish_json(stats: &ProfileStats) -> Value {
         "passability_signature_unique_keys": signature_unique,
         "passability_signature_repeated_keys": signature_repeated,
     });
+    result["phase_a_connectivity_view_calls"] = Value::from(stats.phase_a_connectivity_view_calls);
     result["accepted_semantic_trace_hash"] =
         Value::from(format!("{:016x}", stats.accepted_semantic_trace_hash));
     result["resource_closure_contract"] = json!({
@@ -956,6 +1020,110 @@ fn profile_finish_json(stats: &ProfileStats) -> Value {
         "potential_merge_batches": Value::Null,
         "potential_merge_batches_reason":
             "Phase5A does not define a reachability-preserving batch boundary",
+    });
+    let census = &stats.phase5a1;
+    let envelope = Value::Object(
+        INTEGRAL_FIELDS
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                (
+                    (*field).to_owned(),
+                    json!({"safe":census.envelope_safe[index],
+            "reason":census.envelope_reason[index], "upper_bound":census.envelope_upper[index]}),
+                )
+            })
+            .collect(),
+    );
+    let qualification_counts = |field: fn(&IntegralQualification) -> bool| -> u64 {
+        census
+            .resources
+            .iter()
+            .filter(|q| !q.taxonomy.is_empty() && field(q))
+            .count() as u64
+    };
+    let batch_p50 = profile_histogram_quantile(&census.batch_histogram, 50);
+    let batch_p95 = profile_histogram_quantile(&census.batch_histogram, 95);
+    let wave_p50 = profile_histogram_quantile(&census.wave_histogram, 50);
+    let wave_p95 = profile_histogram_quantile(&census.wave_histogram, 95);
+    let batch_max = census
+        .batch_histogram
+        .keys()
+        .next_back()
+        .copied()
+        .unwrap_or(0);
+    let wave_max = census
+        .wave_histogram
+        .keys()
+        .next_back()
+        .copied()
+        .unwrap_or(0);
+    let resource_ratio = if census.resource_attempts == 0 {
+        0.0
+    } else {
+        census.final_eligible_attempts as f64 / census.resource_attempts as f64
+    };
+    let work_ratio = if stats.phase_a_connectivity_view_calls == 0 {
+        0.0
+    } else {
+        census.projected_work_items_removed as f64 / stats.phase_a_connectivity_view_calls as f64
+    };
+    let recommend_phase5b = resource_ratio >= 0.15 || work_ratio >= 0.10;
+    result["phase5a1_census"] = json!({
+        "mode":"profile_only_dry_run", "compiled":census.compiled,
+        "resource_taxonomy":census.taxonomy,
+        "resource_observed":census.taxonomy.values().sum::<u64>(),
+        "integral_gain":{
+            "statically_eligible":qualification_counts(|q| q.statically_eligible),
+            "arithmetic_envelope_safe":qualification_counts(|q| q.arithmetic_envelope_safe),
+            "closure_private_slot":qualification_counts(|q| q.closure_private_slot),
+            "final_eligible":qualification_counts(|q| q.final_eligible),
+            "resource_attempts":census.resource_attempts,
+            "statically_eligible_attempts":census.static_eligible_attempts,
+            "final_eligible_attempts":census.final_eligible_attempts,
+        },
+        "consumed_slot_dependency":{
+            "slots":census.slot_dependencies.len(),
+            "other_rule_reads":census.slot_dependencies.iter().filter(|d| d.other_reads).count(),
+            "other_set_true":census.slot_dependencies.iter().filter(|d| d.other_set_true).count(),
+            "set_false_or_reactivate":census.slot_dependencies.iter().filter(|d| d.set_false).count(),
+            "replace_same_coordinate_or_slot":census.slot_dependencies.iter().filter(|d| d.replace).count(),
+            "unknown_non_private":census.slot_dependencies.iter().filter(|d| d.unknown).count(),
+        },
+        "arithmetic_envelope":envelope,
+        "closure_dry_run":{
+            "accepted_states_with_eligible":census.accepted_with_eligible,
+            "eligible_attempts":census.eligible_attempts,
+            "batch_size":{"p50":batch_p50,"p95":batch_p95,"max":batch_max},
+            "wave_count":{"p50":wave_p50,"p95":wave_p95,"max":wave_max},
+            "projected_resource_work_items_removed":census.projected_work_items_removed,
+            "projected_resource_work_items_removed_denominator":{
+                "field":"phase_a_connectivity_view_calls",
+                "value":stats.phase_a_connectivity_view_calls,
+                "scope":"production Phase A connectivity views only; Phase B, replay, and dry-run views excluded"
+            },
+            "projected_accepted_states_removed":Value::Null,
+            "projected_accepted_states_removed_reason":"dry-run does not construct the quotient search needed to prove accepted-state removal",
+            "unsafe_states":census.dry_run_unsafe_states,
+        },
+        "shop_local_dp_opportunity":{
+            "observed_shop_materializations":census.shop_materializations,
+            "static_candidate_choices":census.candidate_choices,
+            "static_candidate_shops":census.candidate_shops,
+            "accepted_states_with_reachable_candidate_shop":census.accepted_with_reachable_candidate_shop,
+            "choice_cost_upper_bounds":census.candidate_choice_bounds.iter().map(|(shop,choice,bound)|
+                json!({"shop_id":shop,"choice_id":choice,"cost_upper_bound":bound})).collect::<Vec<_>>(),
+        },
+        "decision":{
+            "phase5b_recommended":recommend_phase5b,
+            "recommendation":if recommend_phase5b {"Phase5B"} else {"Phase6"},
+            "final_eligible_attempt_ratio":resource_ratio,
+            "projected_workitems_per_connectivity":work_ratio,
+            "projected_workitems_denominator_field":"phase_a_connectivity_view_calls",
+            "accepted_reduction_ratio":Value::Null,
+            "thresholds":{"resource_attempt_ratio":0.15,"accepted_reduction_ratio":0.05,
+                "workitems_per_connectivity":0.10},
+        }
     });
     result
 }
@@ -1898,6 +2066,411 @@ fn resource_closure_eligible(block: &SolverBlock) -> bool {
         && meta.writes.monotone_structure_only
 }
 
+const INTEGRAL_FIELDS: [&str; 5] = ["gold", "experience", "yellow", "blue", "red"];
+
+fn resource_unknown_wire_fields(block: &SolverBlock) -> bool {
+    let Some(object) = block.data.as_object() else {
+        return true;
+    };
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "block_id"
+                | "floor_id"
+                | "initial_active"
+                | "kind"
+                | "numeric_id"
+                | "delta"
+                | "x"
+                | "y"
+        )
+    }) {
+        return true;
+    }
+    let Some(delta) = object.get("delta").and_then(Value::as_object) else {
+        return true;
+    };
+    if delta.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "hp" | "attack"
+                | "defense"
+                | "gold"
+                | "experience"
+                | "level"
+                | "multiply"
+                | "keys"
+                | "inventory"
+        )
+    }) {
+        return true;
+    }
+    delta
+        .get("multiply")
+        .and_then(Value::as_object)
+        .is_some_and(|items| {
+            items
+                .keys()
+                .any(|key| !matches!(key.as_str(), "hp" | "attack" | "defense"))
+        })
+        || delta
+            .get("keys")
+            .and_then(Value::as_object)
+            .is_some_and(|items| {
+                items
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "yellow" | "blue" | "red"))
+            })
+}
+
+fn resource_taxonomy(block: &SolverBlock) -> (&'static str, bool) {
+    let CompiledBlockRule::Resource { delta, .. } = compiled_rule(block) else {
+        return ("mixed/unknown", false);
+    };
+    if resource_unknown_wire_fields(block) {
+        return ("mixed/unknown", false);
+    }
+    let integers = [
+        delta.gold,
+        delta.experience,
+        delta.yellow,
+        delta.blue,
+        delta.red,
+    ];
+    let integer_count = integers.into_iter().filter(|value| *value != 0).count();
+    let float_additive = delta.hp != 0.0 || delta.attack != 0.0 || delta.defense != 0.0;
+    let multiplier =
+        delta.multiply_hp != 1.0 || delta.multiply_attack != 1.0 || delta.multiply_defense != 1.0;
+    let inventory = !delta.inventory.is_empty();
+    let level = delta.level != 0;
+    let category_count = usize::from(integer_count > 0)
+        + usize::from(float_additive)
+        + usize::from(multiplier)
+        + usize::from(inventory)
+        + usize::from(level);
+    let taxonomy = if category_count == 0 {
+        "identity"
+    } else if category_count > 1 {
+        "mixed/unknown"
+    } else if integer_count == 1 {
+        "integer_single_field"
+    } else if integer_count > 1 {
+        "integer_multi_field"
+    } else if float_additive {
+        "float_additive"
+    } else if multiplier {
+        "multiplier"
+    } else if inventory {
+        "inventory"
+    } else if level {
+        "level"
+    } else {
+        "mixed/unknown"
+    };
+    let pure = matches!(taxonomy, "integer_single_field" | "integer_multi_field")
+        && delta.hp == 0.0
+        && delta.attack == 0.0
+        && delta.defense == 0.0
+        && delta.multiply_hp == 1.0
+        && delta.multiply_attack == 1.0
+        && delta.multiply_defense == 1.0
+        && delta.level == 0
+        && delta.inventory.is_empty();
+    (taxonomy, pure)
+}
+
+fn slots_at(blocks: &[SolverBlock], floor: &str, x: u64, y: u64) -> Vec<usize> {
+    blocks
+        .iter()
+        .filter(|block| block.floor == floor && block.x == x && block.y == y)
+        .filter_map(|block| block.state_slot)
+        .collect()
+}
+
+fn project_event_slot_dependencies(blocks: &[SolverBlock], dependencies: &mut [SlotDependency]) {
+    let mark = |dependencies: &mut [SlotDependency], targets: Vec<usize>, effect: &str| {
+        if targets.is_empty() {
+            return false;
+        }
+        for slot in targets {
+            if let Some(item) = dependencies.get_mut(slot) {
+                match effect {
+                    "read" => item.other_reads = true,
+                    "true" => item.other_set_true = true,
+                    "false" => item.set_false = true,
+                    "replace" => item.replace = true,
+                    _ => item.unknown = true,
+                }
+            }
+        }
+        true
+    };
+    for event_block in blocks {
+        let CompiledBlockRule::Event { event, .. } = compiled_rule(event_block) else {
+            continue;
+        };
+        let mut exact = true;
+        match event {
+            CompiledAuditedEvent::FairyMt0 => {
+                exact &= mark(dependencies, slots_at(blocks, "MT20", 6, 8), "false")
+            }
+            CompiledAuditedEvent::CrossReward => {
+                exact &= mark(dependencies, slots_at(blocks, "MT16", 5, 5), "true")
+            }
+            CompiledAuditedEvent::ThiefQuest => {
+                exact &= mark(dependencies, slots_at(blocks, "MT2", 2, 7), "true");
+                exact &= mark(dependencies, slots_at(blocks, "MT18", 6, 9), "true");
+                exact &= mark(dependencies, slots_at(blocks, "MT18", 6, 10), "true");
+            }
+            CompiledAuditedEvent::PrincessQuest => {
+                exact &= mark(dependencies, slots_at(blocks, "MT18", 11, 11), "false")
+            }
+            CompiledAuditedEvent::WandGateRemoveOnFailure | CompiledAuditedEvent::WandGateRetry => {
+                exact &= mark(dependencies, slots_at(blocks, "MT23w", 5, 6), "read");
+                exact &= mark(dependencies, slots_at(blocks, "MT23e", 7, 6), "read");
+                for y in 2..=4 {
+                    for x in 5..=7 {
+                        exact &= mark(dependencies, slots_at(blocks, "MT_1", x, y), "replace");
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !exact {
+            // A failed coordinate/slot projection cannot identify which slot
+            // the audited event may mutate. Conservatively invalidate every
+            // slot rather than attaching the uncertainty to the event itself.
+            for dependency in dependencies.iter_mut() {
+                dependency.unknown = true;
+            }
+        }
+    }
+}
+
+fn shop_cost_progression(choice: &CompiledShopChoice) -> Option<(u128, u128)> {
+    let initial = choice.purchase_count as u128;
+    let purchases = MAX_GLOBAL_STATES as u128;
+    // Production prices purchase N at base + increment * N, then increments
+    // the count. Prove both the first/last prices and the count after 50k
+    // purchases, so u64::MAX is unsafe even when the increment is zero.
+    let count_after = initial.checked_add(purchases)?;
+    if count_after > u64::MAX as u128 {
+        return None;
+    }
+    let first = (choice.increment_per_purchase as u128)
+        .checked_mul(initial)?
+        .checked_add(choice.base_cost as u128)?;
+    let last_index = count_after.checked_sub(1)?;
+    let last = (choice.increment_per_purchase as u128)
+        .checked_mul(last_index)?
+        .checked_add(choice.base_cost as u128)?;
+    (first <= u64::MAX as u128 && last <= u64::MAX as u128).then_some((first, last))
+}
+
+fn compile_phase5a1_census(initial: &SolverState, blocks: &[SolverBlock], shops: &[CompiledShop]) {
+    if !profiling_enabled() {
+        return;
+    }
+    let slot_count = blocks
+        .iter()
+        .filter_map(|block| block.state_slot)
+        .max()
+        .map_or(0, |v| v + 1);
+    let mut dependencies = vec![SlotDependency::default(); slot_count];
+    project_event_slot_dependencies(blocks, &mut dependencies);
+    let mut upper = [
+        initial.gold as u128,
+        initial.experience as u128,
+        initial.yellow as u128,
+        initial.blue as u128,
+        initial.red as u128,
+    ];
+    let mut safe = [true; 5];
+    let envelope_field_mapping_unknown = blocks.iter().any(|block| {
+        matches!(compiled_rule(block), CompiledBlockRule::Resource { .. })
+            && resource_unknown_wire_fields(block)
+    });
+    let mut reasons: [String; 5] =
+        std::array::from_fn(|_| "bounded_by_initial_one_shot_and_50000_actions".to_owned());
+    let mut add = |field: usize, amount: u128| {
+        if let Some(value) = upper[field].checked_add(amount) {
+            upper[field] = value;
+        } else {
+            safe[field] = false;
+            reasons[field] = "u128_overflow".to_owned();
+        }
+    };
+    for block in blocks {
+        match compiled_rule(block) {
+            CompiledBlockRule::Resource { delta, .. } => {
+                for (field, amount) in [
+                    delta.gold,
+                    delta.experience,
+                    delta.yellow,
+                    delta.blue,
+                    delta.red,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    add(field, amount as u128);
+                }
+            }
+            CompiledBlockRule::Enemy { enemy, .. } => {
+                add(0, enemy.gold as u128);
+                add(1, enemy.experience as u128);
+            }
+            _ => {}
+        }
+    }
+    let mut candidate_shop_ids = HashSet::new();
+    let mut candidate_choices = 0_u64;
+    let mut bounds = Vec::new();
+    let mut cross_resource_fields = [false; 5];
+    for shop in shops {
+        let mut all_candidate = true;
+        for choice in &shop.choices {
+            let progression = shop_cost_progression(choice);
+            let progression_safe = choice.base_cost > 0 && progression.is_some();
+            let no_currency_gain = choice
+                .effects
+                .iter()
+                .all(|effect| effect.field != choice.currency);
+            let candidate = progression_safe && no_currency_gain;
+            all_candidate &= candidate;
+            if candidate {
+                candidate_choices += 1;
+                let (_, max_cost) = progression.expect("candidate progression checked");
+                bounds.push((
+                    shop.shop_id.clone(),
+                    choice.choice_id.clone(),
+                    max_cost.to_string(),
+                ));
+            }
+            for effect in &choice.effects {
+                let currency = INTEGRAL_FIELDS
+                    .iter()
+                    .position(|name| *name == choice.currency)
+                    .expect("compiled shop currency is integral");
+                if effect.field != choice.currency {
+                    cross_resource_fields[currency] = true;
+                }
+                if let Some(field) = INTEGRAL_FIELDS
+                    .iter()
+                    .position(|name| *name == effect.field)
+                {
+                    add(field, effect.amount as u128 * MAX_GLOBAL_STATES as u128);
+                    if currency != field {
+                        cross_resource_fields[field] = true;
+                    }
+                }
+            }
+        }
+        if all_candidate {
+            candidate_shop_ids.insert(shop.shop_id.clone());
+        }
+    }
+    drop(add);
+    if envelope_field_mapping_unknown {
+        safe.fill(false);
+        reasons.fill("integral_field_mapping_unknown".to_owned());
+    }
+    for field in 0..5 {
+        if cross_resource_fields[field] {
+            safe[field] = false;
+            reasons[field] = "cross_resource_shop_conversion".to_owned();
+        }
+    }
+    for field in 0..5 {
+        if upper[field] > u64::MAX as u128 {
+            safe[field] = false;
+            reasons[field] = "upper_bound_exceeds_runtime_u64".to_owned();
+        }
+    }
+    // A false write to a resource slot permits repeated acquisition; only the
+    // fields gained by that target become unsafe.
+    for block in blocks {
+        let Some(slot) = block.state_slot else {
+            continue;
+        };
+        if !(dependencies[slot].set_false
+            || dependencies[slot].replace
+            || dependencies[slot].unknown)
+        {
+            continue;
+        }
+        if let CompiledBlockRule::Resource { delta, .. } = compiled_rule(block) {
+            for (field, amount) in [
+                delta.gold,
+                delta.experience,
+                delta.yellow,
+                delta.blue,
+                delta.red,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if amount != 0 {
+                    safe[field] = false;
+                    reasons[field] = "resource_reactivation_or_unknown_repeat".to_owned();
+                }
+            }
+        }
+    }
+    let mut resources = vec![IntegralQualification::default(); blocks.len()];
+    let mut taxonomy = BTreeMap::new();
+    for (index, block) in blocks.iter().enumerate() {
+        if !matches!(compiled_rule(block), CompiledBlockRule::Resource { .. }) {
+            continue;
+        }
+        let (class, pure) = resource_taxonomy(block);
+        *taxonomy.entry(class).or_default() += 1;
+        let private = block.state_slot.is_some_and(|slot| {
+            let d = &dependencies[slot];
+            !d.other_reads && !d.other_set_true && !d.set_false && !d.replace && !d.unknown
+        }) && block.initial_active;
+        let relevant_safe = if let CompiledBlockRule::Resource { delta, .. } = compiled_rule(block)
+        {
+            [
+                delta.gold,
+                delta.experience,
+                delta.yellow,
+                delta.blue,
+                delta.red,
+            ]
+            .into_iter()
+            .enumerate()
+            .all(|(field, amount)| amount == 0 || safe[field])
+        } else {
+            false
+        };
+        let single = class == "integer_single_field";
+        resources[index] = IntegralQualification {
+            taxonomy: class,
+            statically_eligible: pure && single,
+            arithmetic_envelope_safe: relevant_safe,
+            closure_private_slot: private,
+            final_eligible: pure && single && relevant_safe && private,
+        };
+    }
+    profile_with_stats(|stats| {
+        stats.phase5a1 = Phase5A1Census {
+            compiled: true,
+            slot_dependencies: dependencies,
+            resources,
+            taxonomy,
+            envelope_safe: safe,
+            envelope_reason: reasons,
+            envelope_upper: std::array::from_fn(|i| upper[i].to_string()),
+            candidate_choices,
+            candidate_shops: candidate_shop_ids.len() as u64,
+            candidate_shop_ids,
+            candidate_choice_bounds: bounds,
+            ..Phase5A1Census::default()
+        }
+    });
+}
+
 fn block_passability(block: &SolverBlock) -> BlockPassability {
     let dynamic_or_permanent = || {
         block
@@ -2759,6 +3332,150 @@ fn enqueue_phase_a_actions(
         }
     }
     profile_elapsed(started, |stats, nanos| stats.enqueue_actions_ns += nanos);
+}
+
+fn profile_histogram_quantile(histogram: &BTreeMap<u64, u64>, percentile: u64) -> u64 {
+    let total: u64 = histogram.values().sum();
+    if total == 0 {
+        return 0;
+    }
+    let target = (total * percentile).div_ceil(100);
+    let mut seen = 0;
+    for (value, count) in histogram {
+        seen += count;
+        if seen >= target {
+            return *value;
+        }
+    }
+    0
+}
+
+fn phase5a1_view_unprofiled(
+    connectivity: &ConnectivityIndex,
+    state: &SolverState,
+    floors: &HashMap<String, SolverFloor>,
+    blocks: &[SolverBlock],
+    terminals: &[(&str, (u64, u64))],
+) -> ConnectivityView {
+    if connectivity.region_graph_safe {
+        connectivity.view_region_inner(state, floors, blocks, terminals)
+    } else {
+        connectivity.view_inner(state, floors, blocks, terminals, false)
+    }
+}
+
+fn profile_phase5a1_accepted_state(
+    state: &SolverState,
+    initial_view: &ConnectivityView,
+    connectivity: &ConnectivityIndex,
+    floors: &HashMap<String, SolverFloor>,
+    blocks: &[SolverBlock],
+    terminals: &[(&str, (u64, u64))],
+    shops: &[CompiledShop],
+) {
+    if !profiling_enabled() {
+        return;
+    }
+    let (eligible, candidate_shops) = PROFILE_CONTEXT
+        .with(|context| {
+            let borrowed = context.borrow();
+            let census = &borrowed.as_ref()?.phase5a1;
+            Some((
+                census
+                    .resources
+                    .iter()
+                    .map(|q| q.final_eligible)
+                    .collect::<Vec<_>>(),
+                census.candidate_shop_ids.clone(),
+            ))
+        })
+        .unwrap_or_default();
+    let reachable_shop = initial_view
+        .shops
+        .keys()
+        .any(|id| candidate_shops.contains(id));
+    let has_eligible = initial_view
+        .boundaries
+        .iter()
+        .any(|b| eligible.get(b.index) == Some(&true));
+    if !has_eligible {
+        profile_with_stats(|stats| {
+            stats.phase5a1.accepted_with_reachable_candidate_shop += u64::from(reachable_shop)
+        });
+        return;
+    }
+    let previous_fault = rule_fault();
+    clear_rule_fault();
+    let mut diagnostic = state.clone();
+    let mut view_boundaries = initial_view.boundaries.clone();
+    let mut attempts = 0_u64;
+    let mut waves = 0_u64;
+    let limit = eligible
+        .iter()
+        .filter(|value| **value)
+        .count()
+        .saturating_add(1);
+    let mut unsafe_state = false;
+    for _ in 0..limit {
+        let mut wave: Vec<_> = view_boundaries
+            .iter()
+            .filter(|b| eligible.get(b.index) == Some(&true))
+            .cloned()
+            .collect();
+        wave.sort_by_key(|boundary| boundary.index);
+        if wave.is_empty() {
+            break;
+        }
+        waves += 1;
+        attempts += wave.len() as u64;
+        for boundary in wave {
+            let result = materialize_pending_action_inner(
+                &diagnostic,
+                PendingAction::Block {
+                    index: boundary.index,
+                    adjacent: boundary.adjacent,
+                },
+                blocks,
+                shops,
+                false,
+            );
+            let Some(candidate) = result else {
+                unsafe_state = true;
+                break;
+            };
+            diagnostic = candidate.state;
+        }
+        if unsafe_state || rule_fault().is_some() {
+            unsafe_state = true;
+            break;
+        }
+        let next = phase5a1_view_unprofiled(connectivity, &diagnostic, floors, blocks, terminals);
+        (diagnostic.floor, diagnostic.x, diagnostic.y) = next.representative.clone();
+        view_boundaries = next.boundaries;
+    }
+    if view_boundaries
+        .iter()
+        .any(|b| eligible.get(b.index) == Some(&true))
+    {
+        unsafe_state = true;
+    }
+    clear_rule_fault();
+    if let Some(reason) = previous_fault {
+        record_rule_fault(reason);
+    }
+    profile_with_stats(|stats| {
+        let census = &mut stats.phase5a1;
+        census.accepted_with_reachable_candidate_shop += u64::from(reachable_shop);
+        if unsafe_state {
+            census.dry_run_unsafe_states += 1;
+            return;
+        }
+        census.accepted_with_eligible += 1;
+        census.eligible_attempts += attempts;
+        *census.batch_histogram.entry(attempts).or_default() += 1;
+        *census.wave_histogram.entry(waves).or_default() += 1;
+        census.projected_work_items_removed += attempts.saturating_sub(waves);
+    });
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3842,6 +4559,7 @@ impl ConnectivityIndex {
         };
         profile_elapsed(started, |stats, nanos| {
             stats.connectivity_view_calls += 1;
+            stats.phase_a_connectivity_view_calls += 1;
             stats.connectivity_view_ns += nanos;
         });
         result
@@ -4677,7 +5395,7 @@ fn materialize_pending_action(
     shops: &[CompiledShop],
     record_route: bool,
 ) -> Option<MaterializedCandidate> {
-    let kind = if profiling_enabled() {
+    let (kind, block_index) = if profiling_enabled() {
         let (kind, closure_eligible) = match &pending_action {
             PendingAction::Block { index, .. } => {
                 blocks
@@ -4699,10 +5417,17 @@ fn materialize_pending_action(
             PendingAction::Shop { .. } => (MaterializeKind::Shop, false),
         };
         profile_resource_closure_observation(kind, closure_eligible);
-        kind
+        (
+            kind,
+            match &pending_action {
+                PendingAction::Block { index, .. } => Some(*index),
+                _ => None,
+            },
+        )
     } else {
-        MaterializeKind::Invalid
+        (MaterializeKind::Invalid, None)
     };
+    profile_phase5a1_materialization(block_index, kind);
     let started = profile_start();
     let result =
         materialize_pending_action_inner(source, pending_action, blocks, shops, record_route);
@@ -5448,6 +6173,15 @@ fn run_numeric_proof_with_stale_skip(
     (initial.floor, initial.x, initial.y) = initial_view.representative.clone();
     if let Some(initial_id) = store.accept(initial.clone()) {
         profile_record_accepted_semantic_trace(&initial, None, blocks, shops);
+        profile_phase5a1_accepted_state(
+            &initial,
+            &initial_view,
+            connectivity,
+            floors,
+            blocks,
+            terminals,
+            shops,
+        );
         #[cfg(test)]
         record_phase_a_accepted(&initial);
         if !initial_view.terminals.is_empty() {
@@ -5512,6 +6246,15 @@ fn run_numeric_proof_with_stale_skip(
         if let Some(label_id) = store.accept(candidate.state.clone()) {
             let node = candidate.state;
             profile_record_accepted_semantic_trace(&node, Some(work_item.action), blocks, shops);
+            profile_phase5a1_accepted_state(
+                &node,
+                &view,
+                connectivity,
+                floors,
+                blocks,
+                terminals,
+                shops,
+            );
             #[cfg(test)]
             record_phase_a_accepted(&node);
 
@@ -5792,6 +6535,7 @@ fn global_analysis_with_stats(
         .and_then(Value::as_u64)
         .map(|value| value.clamp(1, MAX_GLOBAL_STATES as u64) as usize)
         .unwrap_or(MAX_GLOBAL_STATES);
+    compile_phase5a1_census(&initial, &blocks, &shops);
     #[cfg(test)]
     {
         PHASE_A_DROPPED.with(|dropped| dropped.set(false));
@@ -6695,6 +7439,31 @@ mod tests {
     }
 
     #[test]
+    fn phase5a1_dry_run_and_other_phases_do_not_pollute_decision_denominator() {
+        let mut stats = ProfileStats {
+            connectivity_view_calls: 1_000,
+            phase_a_connectivity_view_calls: 10,
+            ..ProfileStats::default()
+        };
+        stats.phase5a1.projected_work_items_removed = 5;
+        let profile = profile_finish_json(&stats);
+        assert_eq!(profile["phase_a_connectivity_view_calls"], 10);
+        assert_eq!(
+            profile["phase5a1_census"]["closure_dry_run"]["projected_resource_work_items_removed_denominator"]
+                ["value"],
+            10
+        );
+        assert_eq!(
+            profile["phase5a1_census"]["decision"]["projected_workitems_per_connectivity"],
+            0.5
+        );
+        assert!(
+            profile["phase5a1_census"]["closure_dry_run"]["projected_accepted_states_removed"]
+                .is_null()
+        );
+    }
+
+    #[test]
     fn profile_on_resource_closure_fixture_uses_production_materialization() {
         // The ordinary full suite exercises the default-off path. The
         // Phase 5A validation command reruns this test in a fresh process with
@@ -6811,6 +7580,165 @@ mod tests {
             .is_none()
         );
         assert_eq!(rule_fault(), Some("rule_arithmetic_invalid"));
+    }
+
+    #[test]
+    fn phase5a1_resource_taxonomy_partitions_and_unknown_fields_fail_closed() {
+        let cases = [
+            (json!({}), "identity", false),
+            (json!({"gold":1}), "integer_single_field", true),
+            (
+                json!({"gold":1,"keys":{"yellow":1}}),
+                "integer_multi_field",
+                true,
+            ),
+            (json!({"hp":1.0}), "float_additive", false),
+            (json!({"multiply":{"attack":2.0}}), "multiplier", false),
+            (json!({"inventory":{"book":1}}), "inventory", false),
+            (json!({"level":1}), "level", false),
+            (json!({"gold":1,"hp":1.0}), "mixed/unknown", false),
+        ];
+        for (index, (delta, category, pure)) in cases.into_iter().enumerate() {
+            let block = closure_fixture_block(index, delta);
+            assert_eq!(resource_taxonomy(&block), (category, pure));
+        }
+        let unknown = closure_fixture_block(0, json!({"gold":1,"condition":"hidden"}));
+        assert_eq!(resource_taxonomy(&unknown), ("mixed/unknown", false));
+    }
+
+    #[test]
+    fn phase5a1_consumed_dependency_projects_exact_event_coordinates() {
+        let target = SolverBlock {
+            floor: "MT20".into(),
+            x: 6,
+            y: 8,
+            state_slot: Some(0),
+            ..closure_fixture_block(0, json!({"gold":1}))
+        };
+        let event = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 1,
+            id: "fairy".into(),
+            kind: "event".into(),
+            data: json!({"event":{"id":"fairy_mt0"}}),
+            state_slot: Some(1),
+            ..SolverBlock::fixture_defaults()
+        };
+        let mut dependencies = vec![SlotDependency::default(); 2];
+        project_event_slot_dependencies(&[target, event], &mut dependencies);
+        assert!(dependencies[0].set_false);
+        assert!(!dependencies[0].other_reads);
+        assert!(!dependencies[1].other_set_true);
+        assert!(!dependencies[1].unknown);
+
+        let cross_target = SolverBlock {
+            floor: "MT16".into(),
+            x: 5,
+            y: 5,
+            state_slot: Some(0),
+            ..closure_fixture_block(0, json!({"gold":1}))
+        };
+        let cross = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 1,
+            id: "cross".into(),
+            kind: "event".into(),
+            data: json!({"event":{"id":"cross_reward"}}),
+            state_slot: Some(1),
+            ..SolverBlock::fixture_defaults()
+        };
+        let mut dependencies = vec![SlotDependency::default(); 2];
+        project_event_slot_dependencies(&[cross_target, cross], &mut dependencies);
+        assert!(dependencies[0].other_set_true);
+        assert!(!dependencies[1].other_set_true);
+
+        let thief_targets = [("MT2", 2, 7), ("MT18", 6, 9), ("MT18", 6, 10)]
+            .into_iter()
+            .enumerate()
+            .map(|(slot, (floor, x, y))| SolverBlock {
+                floor: floor.into(),
+                x,
+                y,
+                state_slot: Some(slot),
+                ..closure_fixture_block(slot, json!({"yellow":1}))
+            });
+        let thief = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 1,
+            id: "thief".into(),
+            kind: "event".into(),
+            data: json!({"event":{"id":"thief_quest"}}),
+            state_slot: Some(3),
+            ..SolverBlock::fixture_defaults()
+        };
+        let blocks: Vec<_> = thief_targets.chain(std::iter::once(thief)).collect();
+        let mut dependencies = vec![SlotDependency::default(); 4];
+        project_event_slot_dependencies(&blocks, &mut dependencies);
+        assert!(dependencies[..3].iter().all(|d| d.other_set_true));
+        assert!(!dependencies[3].other_set_true);
+
+        let missing = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 1,
+            id: "fairy".into(),
+            kind: "event".into(),
+            data: json!({"event":{"id":"fairy_mt0"}}),
+            state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
+        };
+        let unrelated = closure_fixture_block(1, json!({"gold":1}));
+        let mut dependencies = vec![SlotDependency::default(); 2];
+        project_event_slot_dependencies(&[missing, unrelated], &mut dependencies);
+        assert!(dependencies.iter().all(|dependency| dependency.unknown));
+    }
+
+    #[test]
+    fn phase5a1_shop_progression_includes_initial_count_and_50k_limit() {
+        let normal = compile_shop(&json!({"shop_id":"s","choices":[{
+            "choice_id":"c","currency":"gold","base_cost":3,
+            "increment_per_purchase":2,"purchase_count":7,
+            "effect":{"field":"attack","amount":1}
+        }]}))
+        .unwrap();
+        assert_eq!(
+            shop_cost_progression(&normal.choices[0]),
+            Some((17, 100_015))
+        );
+
+        let overflow = compile_shop(&json!({"shop_id":"s","choices":[{
+            "choice_id":"c","currency":"gold","base_cost":1,
+            "increment_per_purchase":1,"purchase_count":u64::MAX,
+            "effect":{"field":"attack","amount":1}
+        }]}))
+        .unwrap();
+        assert_eq!(shop_cost_progression(&overflow.choices[0]), None);
+    }
+
+    #[test]
+    fn phase5a1_cross_resource_shop_invalidates_both_envelopes() {
+        if !profiling_enabled() {
+            return;
+        }
+        let _guard = ProfileGuard::new();
+        let blocks = vec![closure_fixture_block(0, json!({"gold":1}))];
+        let shop = compile_shop(&json!({"shop_id":"s","choices":[{
+            "choice_id":"key","currency":"gold","base_cost":1,
+            "increment_per_purchase":0,"purchase_count":0,
+            "effect":{"field":"yellow","amount":1}
+        }]}))
+        .unwrap();
+        compile_phase5a1_census(&terminal_node(1, 1, 10, "x"), &blocks, &[shop]);
+        PROFILE_CONTEXT.with(|context| {
+            let context = context.borrow();
+            let census = &context.as_ref().unwrap().phase5a1;
+            assert!(!census.envelope_safe[0]);
+            assert!(!census.envelope_safe[2]);
+            assert!(!census.resources[0].final_eligible);
+        });
     }
 
     #[test]

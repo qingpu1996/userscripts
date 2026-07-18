@@ -93,8 +93,17 @@ and independently verify all of the following:
    simultaneously applicable despite consumed-slot topology changes;
 2. a deterministic canonical order/representative that preserves exact final
    state, objective, fault ordering and route witness semantics;
-3. unchanged FIFO candidate order, 50k budget accounting, Pareto acceptance,
-   Phase B replay, protocol output and Shadow-only behavior;
+3. stable FIFO ordering for strategic candidates after closure; a hard 50k
+   limit counted in canonical closed states, with `BudgetExhausted` still
+   `unproven`; exhaustive safe shop-graph completion may be `proven`, and
+   Pareto comparisons apply only to closed canonical states; Phase B replay,
+   protocol output and Shadow-only behavior remain unchanged (the per-state
+   diagnostic trace need not equal the old unclosed search trace);
 4. differential tests against unclosed production materialization on broader
    topology fixtures, plus profile evidence that real eligible opportunities
    exist before taking optimization risk.
+
+The subsequent strict Phase 5A.1 census did not satisfy this gate: all five
+integral envelopes were unsafe under cross-resource shop conversions and final
+eligibility was zero. The current recommendation is Phase 6; these historical
+requirements do not authorize Phase 5B.
