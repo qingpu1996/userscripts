@@ -1,11 +1,12 @@
-# Phase 4B closeout candidate QA (2026-07-18)
+# Phase 4B closeout QA (2026-07-18)
 
 This archive compares the accepted Phase 3 baseline
-`c20ddd27a0342b9a7b827ae69588fe6784ef05f4` with the current **uncommitted
-closeout candidate**. The candidate contains the already accepted Phase 4B
-static region/portal graph from `299786b564e9d75b1db52b3eeab65451736a50ad`
-plus the pending shared passability classification and profile-only accepted
-semantic trace. It is not identified as commit `299786b` or as any future commit.
+`c20ddd27a0342b9a7b827ae69588fe6784ef05f4` with the Phase 4B closeout now
+committed as `c24d09d32d8b19d8daa30e07d8d2ee3dd6b967ac`. That commit contains the
+static region/portal graph from `299786b564e9d75b1db52b3eeab65451736a50ad`,
+the shared `BlockPassability` classification, profile-only accepted semantic
+trace, and this archive. The measured source identity remains the exact hash
+below; commit status does not change the neutral performance interpretation.
 
 ## Exact identities and provenance
 
@@ -19,15 +20,15 @@ semantic trace. It is not identified as commit `299786b` or as any future commit
   The source hash matches `main.rs` at commit `c20ddd2`; this binary was rebuilt
   from a `git archive` snapshot in an isolated `/private/tmp` Cargo target for
   this final run.
-- Uncommitted candidate source/binary SHA-256:
+- Closeout commit source/binary SHA-256:
   `f6e1149bf2daed46ff9458ac2b0723a7b2bcbe85a924cb73ecedf6ae385e05a6` /
   `7fd89633b925433e182d11990d7cdccd2cd039cd97d6842637389c8aa658cfa9`.
   The source was frozen before the isolated release build and matched the
-  working-tree `main.rs` again after the build and measurements. Pre-commit
-  review must recheck this exact blob hash.
+  working-tree `main.rs` again after the build and measurements; it is the
+  `main.rs` blob committed by `c24d09d`.
 - Measurement-time repository HEAD was
-  `299786b564e9d75b1db52b3eeab65451736a50ad`; the candidate source differed
-  from the historical `299786b` `main.rs` hash
+  `299786b564e9d75b1db52b3eeab65451736a50ad`; the subsequently committed
+  closeout source differed from the historical `299786b` `main.rs` hash
   `cc0f581af41dfb7a82a8c379953005d12593fc1f5de9df6145bf72be3a48ec51`.
 
 All builds, binaries, source snapshots, and the request body stayed under
@@ -50,7 +51,9 @@ is `/private/tmp/mota-phase4b-closeout-target.1bpam3`.
 Each resident release binary received one warmup followed by seven formal
 default-off requests, interleaved `A,B` on the same host. RSS was sampled from
 the service PID every 10 ms. Canonical JSON removes only `shadow.cycle` and is
-serialized with sorted keys.
+serialized with sorted keys. The transient measurement-time B artifact filename
+below predates the commit; its literal `uncommitted-closeout` label is provenance,
+not the current status of the source now committed by `c24d09d`.
 
 ```sh
 python3 /private/tmp/mota-phase4b-closeout-evidence.1bpam3/run_phase25_profile.py \
@@ -70,17 +73,17 @@ latency or the 65 MB default-off RSS gate.
 
 ## Result
 
-Baseline median POST was `1204.340708 ms`; candidate median POST was
+Baseline median POST was `1204.340708 ms`; closeout median POST was
 `1188.036749 ms`, a `1.3538%` reduction. This is a neutral result and **does not
 establish a meaningful performance improvement**. The previous archived
 `20.8852%` claim came from a differently hashed dirty source and is superseded;
-it must not be used for this candidate.
+it must not be used for this closeout.
 
-Candidate default-off max RSS was `50,020,352 B` = `50.020352` decimal MB =
+Closeout default-off max RSS was `50,020,352 B` = `50.020352` decimal MB =
 `47.703125` MiB, below the 65 MB gate. All 14 formal responses had canonical
 SHA-256 `af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2`.
 
-All four candidate profile events (warmup plus three formal samples) recorded
+All four closeout profile events (warmup plus three formal samples) recorded
 accepted semantic trace `7f0aeb674cd6f09f`. Search and budget counters were
 stable across all events and matched the baseline: 50,000 accepted/explored,
 126,119 rejected, 281,991 pending, 371,918 work items popped, 219,918 stale

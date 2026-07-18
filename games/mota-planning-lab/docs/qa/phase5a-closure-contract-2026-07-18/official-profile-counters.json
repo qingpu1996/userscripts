@@ -1,0 +1,18 @@
+{
+  "schema": "mota-phase5a-closure-profile-counters-v1",
+  "request_sha256": "508b4d25557b0c30b649d5e923a5ec9fa3470dc8555d8d49e3dcb9bad98ba55e",
+  "source_sha256": "a93be1c09057fe5bd1f044d21440e3f6abd14ef089e142911e5ae9fa63b9a5f0",
+  "binary_sha256": "0c3341fc036c114a5ea0a3e826d986e08a47b8f67f39dbeb7136681cde578f26",
+  "runs": {
+    "warmups": 1,
+    "formal_samples": 2
+  },
+  "stable_across_all_runs": {
+    "observed_resource_actions": 108374,
+    "eligible_resource_actions": 0,
+    "potential_merge_batches": null,
+    "accepted_semantic_trace_hash": "7f0aeb674cd6f09f",
+    "canonical_response_sha256": "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2"
+  },
+  "interpretation": "The official fixture has no action in the conservative Phase5A eligible domain; no closure opportunity is claimed."
+}

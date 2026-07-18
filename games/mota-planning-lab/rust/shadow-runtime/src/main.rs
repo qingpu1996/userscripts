@@ -689,6 +689,8 @@ struct ProfileStats {
     stale_source_by_action_kind: [u64; 7],
     skipped_stale_by_action_kind: [u64; 7],
     unproven_stale_by_action_kind: [u64; 7],
+    resource_closure_observed_by_action_kind: [u64; 7],
+    resource_closure_eligible_by_action_kind: [u64; 7],
     connectivity_view_calls: u64,
     connectivity_view_ns: u64,
     local_reachable_calls: u64,
@@ -801,6 +803,28 @@ fn profile_stale_source(
             stats.unproven_stale_by_action_kind[index] += 1;
         }
     });
+}
+
+#[inline(always)]
+fn profile_resource_closure_observation(kind: MaterializeKind, eligible: bool) {
+    if kind != MaterializeKind::Resource {
+        return;
+    }
+    profile_with_stats(|stats| record_resource_closure_observation(stats, kind, eligible));
+}
+
+fn record_resource_closure_observation(
+    stats: &mut ProfileStats,
+    kind: MaterializeKind,
+    eligible: bool,
+) {
+    if kind != MaterializeKind::Resource {
+        return;
+    }
+    stats.resource_closure_observed_by_action_kind[kind.index()] += 1;
+    if eligible {
+        stats.resource_closure_eligible_by_action_kind[kind.index()] += 1;
+    }
 }
 
 fn profile_finish_json(stats: &ProfileStats) -> Value {
@@ -922,6 +946,17 @@ fn profile_finish_json(stats: &ProfileStats) -> Value {
     });
     result["accepted_semantic_trace_hash"] =
         Value::from(format!("{:016x}", stats.accepted_semantic_trace_hash));
+    result["resource_closure_contract"] = json!({
+        "observed_by_action_kind": stale_by_kind(
+            &stats.resource_closure_observed_by_action_kind
+        ),
+        "eligible_by_action_kind": stale_by_kind(
+            &stats.resource_closure_eligible_by_action_kind
+        ),
+        "potential_merge_batches": Value::Null,
+        "potential_merge_batches_reason":
+            "Phase5A does not define a reachability-preserving batch boundary",
+    });
     result
 }
 
@@ -1818,6 +1853,49 @@ impl CompiledBlockRule {
             Self::Unsupported => None,
         }
     }
+}
+
+// Phase 5A is a qualification contract only; no caller uses this result to
+// merge, skip, or reorder an action. The eligible domain is intentionally the
+// smallest useful typed Resource subclass: materialization is an identity on
+// every resource and structural component except the resource block's own
+// false -> true consumed bit (and the transient adjacent position that the
+// existing connectivity canonicalization replaces). Any non-zero integer
+// addition retains a checked-overflow fault domain, and any floating addition
+// or multiplication retains IEEE/finiteness and order concerns, so those are
+// excluded rather than inferred safe from typical game values.
+fn resource_closure_eligible(block: &SolverBlock) -> bool {
+    let CompiledBlockRule::Resource { delta, meta } = compiled_rule(block) else {
+        return false;
+    };
+    block.state_slot.is_some()
+        && block.initial_active
+        && delta.hp == 0.0
+        && delta.attack == 0.0
+        && delta.defense == 0.0
+        && delta.gold == 0
+        && delta.experience == 0
+        && delta.level == 0
+        && delta.multiply_hp == 1.0
+        && delta.multiply_attack == 1.0
+        && delta.multiply_defense == 1.0
+        && delta.yellow == 0
+        && delta.blue == 0
+        && delta.red == 0
+        && delta.inventory.is_empty()
+        && meta.reads.resources.0 == 0
+        && !meta.reads.inventory
+        && !meta.reads.flags
+        && meta.reads.consumed_slots
+        && !meta.reads.shop_counts
+        && !meta.reads.topology
+        && meta.writes.resources.0 == 0
+        && !meta.writes.inventory
+        && !meta.writes.flags
+        && meta.writes.consumed_slots
+        && !meta.writes.shop_counts
+        && !meta.writes.topology
+        && meta.writes.monotone_structure_only
 }
 
 fn block_passability(block: &SolverBlock) -> BlockPassability {
@@ -4600,20 +4678,28 @@ fn materialize_pending_action(
     record_route: bool,
 ) -> Option<MaterializedCandidate> {
     let kind = if profiling_enabled() {
-        match &pending_action {
-            PendingAction::Block { index, .. } => blocks
-                .get(*index)
-                .map(|block| match block.kind.as_str() {
-                    "door" => MaterializeKind::Door,
-                    "resource" => MaterializeKind::Resource,
-                    "enemy" => MaterializeKind::Enemy,
-                    "transition" => MaterializeKind::Transition,
-                    "event" => MaterializeKind::Event,
-                    _ => MaterializeKind::Invalid,
-                })
-                .unwrap_or(MaterializeKind::Invalid),
-            PendingAction::Shop { .. } => MaterializeKind::Shop,
-        }
+        let (kind, closure_eligible) = match &pending_action {
+            PendingAction::Block { index, .. } => {
+                blocks
+                    .get(*index)
+                    .map_or((MaterializeKind::Invalid, false), |block| {
+                        (
+                            match block.kind.as_str() {
+                                "door" => MaterializeKind::Door,
+                                "resource" => MaterializeKind::Resource,
+                                "enemy" => MaterializeKind::Enemy,
+                                "transition" => MaterializeKind::Transition,
+                                "event" => MaterializeKind::Event,
+                                _ => MaterializeKind::Invalid,
+                            },
+                            resource_closure_eligible(block),
+                        )
+                    })
+            }
+            PendingAction::Shop { .. } => (MaterializeKind::Shop, false),
+        };
+        profile_resource_closure_observation(kind, closure_eligible);
+        kind
     } else {
         MaterializeKind::Invalid
     };
@@ -6582,6 +6668,232 @@ mod tests {
                 skipped[name].as_u64().unwrap() + unproven[name].as_u64().unwrap()
             );
             assert_eq!(stale[name].as_u64().unwrap(), (index as u64) + 3);
+        }
+    }
+
+    #[test]
+    fn profile_resource_closure_fields_are_stable_for_a_fixed_fixture() {
+        let mut stats = ProfileStats::default();
+        record_resource_closure_observation(&mut stats, MaterializeKind::Resource, true);
+        record_resource_closure_observation(&mut stats, MaterializeKind::Resource, false);
+        record_resource_closure_observation(&mut stats, MaterializeKind::Door, true);
+        let profile = profile_finish_json(&stats);
+        let contract = &profile["resource_closure_contract"];
+        assert_eq!(contract["observed_by_action_kind"]["resource"], 2);
+        assert_eq!(contract["eligible_by_action_kind"]["resource"], 1);
+        for kind in MaterializeKind::ALL {
+            if kind != MaterializeKind::Resource {
+                assert_eq!(contract["observed_by_action_kind"][kind.name()], 0);
+                assert_eq!(contract["eligible_by_action_kind"][kind.name()], 0);
+            }
+        }
+        assert!(contract["potential_merge_batches"].is_null());
+        assert_eq!(
+            contract["potential_merge_batches_reason"],
+            "Phase5A does not define a reachability-preserving batch boundary"
+        );
+    }
+
+    #[test]
+    fn profile_on_resource_closure_fixture_uses_production_materialization() {
+        // The ordinary full suite exercises the default-off path. The
+        // Phase 5A validation command reruns this test in a fresh process with
+        // MOTA_SHADOW_PROFILE=1 to cover the opt-in TLS/profile wrapper.
+        if !profiling_enabled() {
+            return;
+        }
+        let _guard = ProfileGuard::new();
+        let blocks = vec![
+            closure_fixture_block(0, json!({})),
+            closure_fixture_block(1, json!({"gold":1})),
+        ];
+        let mut source = terminal_node(1, 1, 1, "profile");
+        source.consumed = ConsumedBits::from_bools(&[false, false]);
+        for index in 0..2 {
+            assert!(
+                materialize_pending_action(
+                    &source,
+                    PendingAction::Block {
+                        index,
+                        adjacent: (0, 0),
+                    },
+                    &blocks,
+                    &[],
+                    false,
+                )
+                .is_some()
+            );
+        }
+        let profile = PROFILE_CONTEXT.with(|context| {
+            profile_finish_json(context.borrow().as_ref().expect("profile context exists"))
+        });
+        let contract = &profile["resource_closure_contract"];
+        assert_eq!(contract["observed_by_action_kind"]["resource"], 2);
+        assert_eq!(contract["eligible_by_action_kind"]["resource"], 1);
+    }
+
+    fn closure_fixture_block(index: usize, delta: Value) -> SolverBlock {
+        SolverBlock {
+            floor: "F".into(),
+            x: index as u64 + 1,
+            y: 1,
+            id: format!("resource-{index}"),
+            kind: "resource".into(),
+            data: json!({"delta":delta}),
+            state_slot: Some(index),
+            ..SolverBlock::fixture_defaults()
+        }
+    }
+
+    #[test]
+    fn resource_closure_qualification_is_conservative_and_fail_closed() {
+        let eligible = closure_fixture_block(0, json!({}));
+        assert!(resource_closure_eligible(&eligible));
+
+        for delta in [
+            json!({"gold":1}),
+            json!({"gold":1,"yellow":1}),
+            json!({"level":1}),
+            json!({"inventory":{"book":1}}),
+            json!({"hp":1.0}),
+            json!({"multiply":{"attack":2.0}}),
+        ] {
+            assert!(!resource_closure_eligible(&closure_fixture_block(0, delta)));
+        }
+        let mut inactive = closure_fixture_block(0, json!({}));
+        inactive.initial_active = false;
+        assert!(!resource_closure_eligible(&inactive));
+        let mut slotless = closure_fixture_block(0, json!({}));
+        slotless.state_slot = None;
+        assert!(!resource_closure_eligible(&slotless));
+
+        let non_resources = [
+            ("door", json!({"key_cost":{"yellow":0}})),
+            (
+                "enemy",
+                json!({"enemy":{"hp":1,"attack":1,"defense":0,"gold":0,"experience":0}}),
+            ),
+            ("event", json!({"event":{"id":"dialogue_once"}})),
+            ("shop", json!({"shop_id":"shop"})),
+            ("transition", json!({"target":{"floor_id":"G","x":0,"y":0}})),
+            ("opaque", json!({})),
+            ("unknown", json!({})),
+        ];
+        for (index, (kind, data)) in non_resources.into_iter().enumerate() {
+            let block = SolverBlock {
+                kind: kind.into(),
+                data,
+                state_slot: Some(index),
+                ..SolverBlock::fixture_defaults()
+            };
+            assert!(!resource_closure_eligible(&block), "{kind}");
+        }
+
+        // A real non-eligible materialization reaches the checked arithmetic
+        // path and retains its global fault semantics; classification never
+        // turns overflow into ordinary infeasibility.
+        let overflow = closure_fixture_block(0, json!({"gold":1}));
+        let mut source = terminal_node(1, 1, 1, "overflow");
+        source.gold = u64::MAX;
+        source.consumed = ConsumedBits::from_bools(&[false]);
+        clear_rule_fault();
+        assert!(
+            materialize_pending_action(
+                &source,
+                PendingAction::Block {
+                    index: 0,
+                    adjacent: (0, 0),
+                },
+                &[overflow],
+                &[],
+                false,
+            )
+            .is_none()
+        );
+        assert_eq!(rule_fault(), Some("rule_arithmetic_invalid"));
+    }
+
+    #[test]
+    fn resource_closure_oracle_exhausts_orders_and_small_states() {
+        let blocks: Vec<_> = (0..3)
+            .map(|index| closure_fixture_block(index, json!({})))
+            .collect();
+        let floors = HashMap::from([(
+            "F".to_owned(),
+            SolverFloor {
+                width: 4,
+                height: 2,
+                cells: (0..4).flat_map(|x| [(x, 0), (x, 1)]).collect(),
+                blocks: vec![0, 1, 2],
+            },
+        )]);
+        let connectivity = ConnectivityIndex::new(&floors, &blocks);
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for seed in 0_u64..=2 {
+            let mut source = terminal_node(seed + 1, seed + 2, seed + 3, "oracle");
+            source.level = seed;
+            source.gold = seed;
+            source.experience = seed + 1;
+            source.yellow = seed;
+            source.blue = seed + 1;
+            source.red = seed + 2;
+            source.inventory = Arc::new(vec![("book".into(), seed)]);
+            source.shop_counts = Arc::new(vec![seed]);
+            source.flags = Arc::new(vec![("flag".into(), seed)]);
+            source.consumed = ConsumedBits::from_bools(&[false, false, false]);
+
+            let mut expected = source.clone();
+            expected.consumed = ConsumedBits::from_bools(&[true, true, true]);
+            (expected.x, expected.y) = (0, 0);
+
+            for order in orders {
+                clear_rule_fault();
+                let mut actual = source.clone();
+                for (step, index) in order.into_iter().enumerate() {
+                    assert!(resource_closure_eligible(&blocks[index]));
+                    let before = connectivity.view_phase_a(&actual, &floors, &blocks, &[]);
+                    assert_eq!(before.boundaries.len(), 3 - step);
+                    let boundary = before
+                        .boundaries
+                        .iter()
+                        .find(|item| item.index == index)
+                        .expect("eligible action remains a production boundary");
+                    let action =
+                        PhaseAActionRef::block(boundary).expect("boundary fits compact action ref");
+                    assert_eq!(action.tagged_index, index as u32);
+                    assert_eq!(
+                        (u64::from(action.adjacent_x), u64::from(action.adjacent_y)),
+                        boundary.adjacent
+                    );
+                    assert_ne!(boundary.adjacent, (blocks[index].x, blocks[index].y));
+                    let pending_action = action
+                        .pending_action(&blocks, &[])
+                        .expect("production action ref resolves to a pending action");
+                    actual =
+                        materialize_pending_action(&actual, pending_action, &blocks, &[], false)
+                            .expect("eligible action stays feasible")
+                            .state;
+                    // Exercise the same production canonical representative
+                    // used after Phase A materialization, rather than erasing
+                    // the transient adjacent position in the oracle itself.
+                    let after = connectivity.view_phase_a(&actual, &floors, &blocks, &[]);
+                    (actual.floor, actual.x, actual.y) = after.representative;
+                }
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    NumericObjective::from_state(&actual)
+                        .cmp(NumericObjective::from_state(&source)),
+                    Ordering::Equal
+                );
+                assert_eq!(rule_fault(), None);
+            }
         }
     }
 

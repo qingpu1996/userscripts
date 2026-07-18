@@ -1,0 +1,24 @@
+{
+  "resource_closure_contract": {
+    "observed_by_action_kind": {
+      "door": 0,
+      "resource": 2,
+      "enemy": 0,
+      "transition": 0,
+      "event": 0,
+      "shop": 0,
+      "invalid": 0
+    },
+    "eligible_by_action_kind": {
+      "door": 0,
+      "resource": 1,
+      "enemy": 0,
+      "transition": 0,
+      "event": 0,
+      "shop": 0,
+      "invalid": 0
+    },
+    "potential_merge_batches": null,
+    "potential_merge_batches_reason": "Phase5A does not define a reachability-preserving batch boundary"
+  }
+}
