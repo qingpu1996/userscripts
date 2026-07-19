@@ -1,0 +1,65 @@
+{
+  "schema": "mota-phase25-profile-v1",
+  "request": {
+    "sha256": "508b4d25557b0c30b649d5e923a5ec9fa3470dc8555d8d49e3dcb9bad98ba55e",
+    "bytes": 2576604
+  },
+  "versions": {
+    "A": {
+      "binary": "/private/tmp/mota-phase6a-baseline.xRBYl9/target/release/mota-shadow-runtime",
+      "binary_sha256": "6b7579887e358c63f8f30f4b0dc70ce3852f405b3c1598f64307820c24c61f9e",
+      "source": "/private/tmp/mota-phase6a-baseline.xRBYl9/games/mota-planning-lab/rust/shadow-runtime/src/main.rs",
+      "source_sha256": "34e264869b4a7aa8475ff58b07c3485b5b8ff177357c1de7d0f7da7899fbb460"
+    },
+    "B": {
+      "binary": "/private/tmp/mota-phase5b-candidate-target/release/mota-shadow-runtime",
+      "binary_sha256": "106ea083b392ffae4173040d5ab199737c784d5bc771d5d01123b75306a02e60",
+      "source": "/Users/nihplod/Documents/codes/frontend/scripts/userscripts/games/mota-planning-lab/rust/shadow-runtime/src/main.rs",
+      "source_sha256": "9902e6fdf5af730e40029fd22e3bfce85eb85a52f04b5a598010887bcd6ba153"
+    }
+  },
+  "method": {
+    "warmups_per_version": 1,
+    "official_samples_per_version": 3,
+    "order": [
+      "A",
+      "B",
+      "A",
+      "B",
+      "A",
+      "B"
+    ],
+    "request": "pure POST /cycle",
+    "rss": "service PID sampled every 10 ms",
+    "canonical_response": "sorted JSON with shadow.cycle removed"
+  },
+  "results": {
+    "A": {
+      "median_post_ms": 1193.4321243315935,
+      "p95_post_ms": 1195.650811586529,
+      "max_post_ms": 1195.897332392633,
+      "median_rss_bytes": 49987584,
+      "p95_rss_bytes": 50017075.2,
+      "max_rss_bytes": 50020352,
+      "canonical_response_hashes": [
+        "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2"
+      ]
+    },
+    "B": {
+      "median_post_ms": 1306.0172908008099,
+      "p95_post_ms": 1309.5274415798485,
+      "max_post_ms": 1309.917458333075,
+      "median_rss_bytes": 42696704,
+      "p95_rss_bytes": 42755686.4,
+      "max_rss_bytes": 42762240,
+      "canonical_response_hashes": [
+        "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2"
+      ]
+    }
+  },
+  "profile_events": {
+    "A": [],
+    "B": []
+  },
+  "raw_samples_tsv": "/private/tmp/mota-phase5b-ab-clone/samples.tsv"
+}
