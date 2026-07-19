@@ -275,13 +275,15 @@
               "additionalProperties": false,
               "required": ["scope", "proof", "reason", "truncated", "explored_states", "blockers", "route", "first_suggestion"],
               "allOf": [
-                {"if": {"properties": {"proof": {"const": "proven"}}, "required": ["proof"]}, "then": {"required": ["terminal_hp", "terminal_attack", "terminal_defense"], "properties": {"truncated": {"const": false}, "route": {"type": "object"}, "first_suggestion": {"$ref": "#/$defs/globalShadowStep"}}}, "else": {"not": {"anyOf": [{"required": ["terminal_hp"]}, {"required": ["terminal_attack"]}, {"required": ["terminal_defense"]}]}, "properties": {"route": {"type": "null"}, "first_suggestion": {"type": "null"}}}},
+                {"if": {"properties": {"proof": {"const": "proven"}}, "required": ["proof"]}, "then": {"required": ["terminal_hp", "terminal_attack", "terminal_defense"], "properties": {"truncated": {"const": false}, "route": {"type": "object"}, "first_suggestion": {"$ref": "#/$defs/globalShadowStep"}}}, "else": {"not": {"anyOf": [{"required": ["terminal_hp"]}, {"required": ["terminal_attack"]}, {"required": ["terminal_defense"]}]}, "properties": {"route": {"type": "null"}}}},
+                {"if": {"properties": {"decision_mode": {"const": "certified_immediate_action"}}, "required": ["decision_mode"]}, "then": {"properties": {"proof": {"const": "unproven"}, "reason": {"const": "deferred_for_certified_immediate_combat_gem"}, "truncated": {"const": false}, "explored_states": {"const": 0}, "blockers": {"type": "array", "maxItems": 0}, "route": {"type": "null"}, "first_suggestion": {"allOf": [{"$ref": "#/$defs/globalShadowStep"}, {"type": "object", "required": ["step_kind", "block_id"], "properties": {"step_kind": {"const": "resource"}, "block_id": {"enum": ["redGem", "blueGem"]}}}]}}}, "else": {"if": {"properties": {"proof": {"const": "proven"}}, "required": ["proof"]}, "then": {}, "else": {"properties": {"first_suggestion": {"type": "null"}}}}},
                 {"if": {"properties": {"truncated": {"const": true}}, "required": ["truncated"]}, "then": {"properties": {"proof": {"const": "unproven"}, "reason": {"const": "search_budget_exhausted"}}}},
                 {"if": {"properties": {"reason": {"const": "search_budget_exhausted"}}, "required": ["reason"]}, "then": {"properties": {"proof": {"const": "unproven"}, "truncated": {"const": true}}}}
               ],
               "properties": {
                 "scope": {"const": "global_terminal_route"},
                 "proof": {"enum": ["proven", "unproven", "unsupported"]},
+                "decision_mode": {"const": "certified_immediate_action"},
                 "reason": {"type": "string", "minLength": 1, "maxLength": 512},
                 "truncated": {"type": "boolean"},
                 "explored_states": {"type": "integer", "minimum": 0, "maximum": 50000},

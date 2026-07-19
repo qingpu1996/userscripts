@@ -401,9 +401,11 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
       const global = value.analysis.global;
       MotaLab.assertProtocolShape(global, [
         "scope", "proof", "reason", "truncated", "explored_states", "blockers", "route", "first_suggestion",
-      ], ["terminal_hp", "terminal_attack", "terminal_defense"], "shadow.analysis.global");
+      ], ["terminal_hp", "terminal_attack", "terminal_defense", "decision_mode"], "shadow.analysis.global");
+      const immediate = global.decision_mode === "certified_immediate_action";
       if (global.scope !== "global_terminal_route"
         || !new Set(["proven", "unproven", "unsupported"]).has(global.proof)
+        || !(global.decision_mode === undefined || immediate)
         || typeof global.reason !== "string" || global.reason.length < 1 || global.reason.length > 512
         || typeof global.truncated !== "boolean"
         || !MotaLab.isFiniteInteger(global.explored_states) || global.explored_states < 0
@@ -489,7 +491,16 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
         }
       };
       if ((global.proof === "proven") !== (global.route !== null)
-        || (global.route === null) !== (global.first_suggestion === null)
+        || (!immediate && (global.route === null) !== (global.first_suggestion === null))
+        || (immediate && !(global.proof === "unproven"
+          && global.reason === "deferred_for_certified_immediate_combat_gem"
+          && global.truncated === false
+          && global.explored_states === 0
+          && global.blockers.length === 0
+          && global.route === null
+          && global.first_suggestion !== null
+          && global.first_suggestion.step_kind === "resource"
+          && new Set(["redGem", "blueGem"]).has(global.first_suggestion.block_id)))
         || (global.proof === "proven") !== (global.terminal_hp !== undefined)
         || (global.proof === "proven") !== (global.terminal_attack !== undefined)
         || (global.proof === "proven") !== (global.terminal_defense !== undefined)
@@ -506,6 +517,8 @@ MotaLab.validateShadowAdvice = function validateShadowAdvice(value) {
         validateStep(global.first_suggestion);
         if (MotaLab.canonicalize(global.first_suggestion)
           !== MotaLab.canonicalize(global.route.steps[0])) throw new TypeError("Invalid first suggestion");
+      } else if (immediate) {
+        validateStep(global.first_suggestion);
       }
     }
   }

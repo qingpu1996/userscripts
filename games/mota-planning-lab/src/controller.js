@@ -564,8 +564,10 @@ MotaLab.createController = function createController(dependencies, options = {})
         const terminal = global && global.proof === "proven"
           ? `，终局攻防 ${global.terminal_attack}/${global.terminal_defense}，HP ${global.terminal_hp}`
           : "";
-        lastReason = global
-          ? `Shadow（只读）${global.proof}${terminal}${first ? `：${first.step_kind}@${first.floor_id}` : `：${global.reason}`}`
+        lastReason = global && global.decision_mode === "certified_immediate_action"
+          ? "Shadow（只读）：发现当前可安全直接获取的攻防宝石。本轮完整全局路线证明已延期；获取后将在下一 cycle 重新观察并规划。"
+          : global
+            ? `Shadow（只读）${global.proof}${terminal}${first ? `：${first.step_kind}@${first.floor_id}` : `：${global.reason}`}`
           : `Shadow（只读）：${response.shadow.reason}`;
       } else lastReason = response.reason;
       refreshPanel({ connected: true });

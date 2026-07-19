@@ -725,6 +725,10 @@ struct ProfileStats {
     forced_successor_accepted: u64,
     forced_successor_pareto_rejected: u64,
     forced_successor_faults: u64,
+    immediate_safe_action_hits: u64,
+    global_search_skipped: u64,
+    initial_phase_a_view_calls: u64,
+    phase_a_store_creations: u64,
     accepted_depth_histogram: BTreeMap<u64, u64>,
     consumed_slots_histogram: BTreeMap<u64, u64>,
     boundary_count_histogram: BTreeMap<u64, u64>,
@@ -846,6 +850,17 @@ fn combat_gem_policy_enabled() -> bool {
     // Benchmark-only kill switch. Production defaults to the certified policy;
     // no observation/protocol field can alter it.
     env::var("MOTA_PHASE_A_COMBAT_GEM_POLICY").as_deref() != Ok("0")
+}
+
+#[inline(always)]
+fn immediate_combat_gem_policy_enabled() -> bool {
+    #[cfg(test)]
+    if DISABLE_IMMEDIATE_COMBAT_GEM.with(Cell::get) {
+        return false;
+    }
+    // Benchmark-only kill switch. No observation or response field can alter
+    // the production-default receding-horizon policy.
+    env::var("MOTA_IMMEDIATE_COMBAT_GEM_POLICY").as_deref() != Ok("0")
 }
 
 fn phase_a_benchmark_limits() -> (Option<u32>, Option<u64>) {
@@ -1115,6 +1130,10 @@ fn profile_finish_json(stats: &ProfileStats) -> Value {
         "forced_successor_accepted": stats.forced_successor_accepted,
         "forced_successor_pareto_rejected": stats.forced_successor_pareto_rejected,
         "forced_successor_faults": stats.forced_successor_faults,
+        "immediate_safe_action_hits": stats.immediate_safe_action_hits,
+        "global_search_skipped": stats.global_search_skipped,
+        "initial_phase_a_view_calls": stats.initial_phase_a_view_calls,
+        "phase_a_store_creations": stats.phase_a_store_creations,
     });
     result["search_quality"] = json!({
         "accepted_depth": distribution(&stats.accepted_depth_histogram),
@@ -1282,6 +1301,9 @@ impl Drop for ProfileGuard {
 #[cfg(test)]
 thread_local! {
     static PHASE2_CALLS: Cell<usize> = const { Cell::new(0) };
+    static PHASE_A_CALLS: Cell<usize> = const { Cell::new(0) };
+    static PHASE_A_STORE_CREATIONS: Cell<usize> = const { Cell::new(0) };
+    static INITIAL_PHASE_A_VIEW_CALLS: Cell<usize> = const { Cell::new(0) };
     static PHASE_A_DROPPED: Cell<bool> = const { Cell::new(false) };
     static PHASE2_SAW_PHASE_A_DROPPED: Cell<bool> = const { Cell::new(false) };
     static MATERIALIZE_SOURCE_CLONES: Cell<usize> = const { Cell::new(0) };
@@ -1297,6 +1319,8 @@ thread_local! {
     // ordinary infeasible result. This exercises the certificate-violation
     // fail-closed path without adding any release bypass.
     static FORCE_CERTIFIED_GEM_MATERIALIZER_NONE: Cell<bool> = const { Cell::new(false) };
+    static FORCE_CERTIFIED_GEM_MATERIALIZER_FAULT: Cell<bool> = const { Cell::new(false) };
+    static DISABLE_IMMEDIATE_COMBAT_GEM: Cell<bool> = const { Cell::new(false) };
 }
 
 #[derive(Default)]
@@ -4368,6 +4392,11 @@ struct ReachBoundary {
     index: usize,
     adjacent: (u64, u64),
     navigation: Vec<usize>,
+    // True only when this boundary is adjacent to the component containing
+    // the query origin without traversing a reversible transition. Phase A
+    // may use every boundary; the initial immediate-action policy uses only
+    // this subset because its RouteStep carries no navigation witness.
+    local_from_origin: bool,
 }
 
 #[derive(Clone)]
@@ -5091,7 +5120,7 @@ impl ConnectivityIndex {
         blocks: &[SolverBlock],
         terminals: &[(&str, (u64, u64))],
     ) -> ConnectivityView {
-        let mut queue = VecDeque::from([(state.floor.clone(), (state.x, state.y))]);
+        let mut queue = VecDeque::from([(state.floor.clone(), (state.x, state.y), true)]);
         let mut components = HashSet::<(String, usize)>::new();
         let mut boundary_seen = HashSet::new();
         let mut boundaries = Vec::new();
@@ -5099,7 +5128,7 @@ impl ConnectivityIndex {
         let mut terminal_seen = HashSet::new();
         let mut reachable_terminals = Vec::new();
         let mut representative = (state.floor.clone(), state.x, state.y);
-        while let Some((floor_id, entry)) = queue.pop_front() {
+        while let Some((floor_id, entry, local_from_origin)) = queue.pop_front() {
             let Some(indexed_floor) = self.floors.get(&floor_id) else {
                 continue;
             };
@@ -5161,7 +5190,7 @@ impl ConnectivityIndex {
                 };
                 if block.kind == "transition" && self.reversible[index].is_some() {
                     if let Some((target_floor, target_x, target_y)) = transition_target(block) {
-                        queue.push_back((target_floor, (target_x, target_y)));
+                        queue.push_back((target_floor, (target_x, target_y), false));
                     }
                     continue;
                 }
@@ -5181,6 +5210,7 @@ impl ConnectivityIndex {
                         index,
                         adjacent,
                         navigation: Vec::new(),
+                        local_from_origin,
                     });
                 }
             }
@@ -5226,7 +5256,8 @@ impl ConnectivityIndex {
         terminals: &[(&str, (u64, u64))],
         record_navigation: bool,
     ) -> ConnectivityView {
-        let mut queue = VecDeque::from([(state.floor.clone(), (state.x, state.y), Vec::new())]);
+        let mut queue =
+            VecDeque::from([(state.floor.clone(), (state.x, state.y), Vec::new(), true)]);
         let mut components = HashSet::<(String, usize)>::new();
         let mut boundary_seen = HashSet::new();
         let mut boundaries = Vec::new();
@@ -5234,7 +5265,7 @@ impl ConnectivityIndex {
         let mut terminal_seen = HashSet::new();
         let mut reachable_terminals = Vec::new();
         let mut representative = (state.floor.clone(), state.x, state.y);
-        while let Some((floor_id, entry, navigation)) = queue.pop_front() {
+        while let Some((floor_id, entry, navigation, local_from_origin)) = queue.pop_front() {
             let (reachable, Some(local_representative)) =
                 self.local_reachable(state, &floor_id, entry, blocks)
             else {
@@ -5302,6 +5333,7 @@ impl ConnectivityIndex {
                             target_floor.to_owned(),
                             (target_x, target_y),
                             next_navigation,
+                            false,
                         ));
                     }
                     continue;
@@ -5322,6 +5354,7 @@ impl ConnectivityIndex {
                         index,
                         adjacent,
                         navigation: navigation.clone(),
+                        local_from_origin,
                     });
                 }
             }
@@ -6032,6 +6065,16 @@ fn materialize_pending_action_inner(
                 }
                 CompiledBlockRule::Resource { delta, .. } => {
                     #[cfg(test)]
+                    if FORCE_CERTIFIED_GEM_MATERIALIZER_FAULT.with(Cell::get)
+                        && matches!(
+                            (block.id.as_str(), block.numeric_id),
+                            ("redGem", Some(27)) | ("blueGem", Some(28))
+                        )
+                    {
+                        record_rule_fault("rule_arithmetic_invalid");
+                        return None;
+                    }
+                    #[cfg(test)]
                     if FORCE_CERTIFIED_GEM_MATERIALIZER_NONE.with(Cell::get)
                         && matches!(
                             (block.id.as_str(), block.numeric_id),
@@ -6560,6 +6603,27 @@ struct PhaseAResult {
     explored: usize,
 }
 
+struct PreparedPhaseAInitial {
+    state: SolverState,
+    view: ConnectivityView,
+}
+
+fn prepare_phase_a_initial(
+    initial: &SolverState,
+    connectivity: &ConnectivityIndex,
+    floors: &HashMap<String, SolverFloor>,
+    blocks: &[SolverBlock],
+    terminals: &[(&str, (u64, u64))],
+) -> PreparedPhaseAInitial {
+    profile_with_stats(|stats| stats.initial_phase_a_view_calls += 1);
+    #[cfg(test)]
+    INITIAL_PHASE_A_VIEW_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let mut state = initial.clone();
+    let view = connectivity.view_phase_a(&state, floors, blocks, terminals);
+    (state.floor, state.x, state.y) = view.representative.clone();
+    PreparedPhaseAInitial { state, view }
+}
+
 #[cfg(test)]
 fn clear_phase_a_accepted_trace() {
     PHASE_A_ACCEPTED_TRACE.with(|trace| trace.borrow_mut().clear());
@@ -6620,6 +6684,7 @@ impl Drop for PhaseADropProbe {
 // before a caller can enter Phase 2. The result deliberately carries only a
 // scalar objective/status and count; it cannot retain a Phase A arena through
 // Arc.
+#[cfg(test)]
 fn run_numeric_proof(
     initial: &SolverState,
     max_states: usize,
@@ -6630,8 +6695,9 @@ fn run_numeric_proof(
     shops: &[CompiledShop],
 ) -> PhaseAResult {
     let combat_gems = compile_combat_gem_certificate(initial, blocks, shops);
+    let prepared = prepare_phase_a_initial(initial, connectivity, floors, blocks, terminals);
     run_numeric_proof_with_stale_skip(
-        initial,
+        prepared,
         max_states,
         connectivity,
         floors,
@@ -6655,8 +6721,9 @@ fn run_numeric_proof_without_stale_skip(
     shops: &[CompiledShop],
 ) -> PhaseAResult {
     let combat_gems = compile_combat_gem_certificate(initial, blocks, shops);
+    let prepared = prepare_phase_a_initial(initial, connectivity, floors, blocks, terminals);
     run_numeric_proof_with_stale_skip(
-        initial,
+        prepared,
         max_states,
         connectivity,
         floors,
@@ -6680,8 +6747,9 @@ fn run_numeric_proof_without_combat_gem_gate(
     shops: &[CompiledShop],
 ) -> PhaseAResult {
     let combat_gems = compile_combat_gem_certificate(initial, blocks, shops);
+    let prepared = prepare_phase_a_initial(initial, connectivity, floors, blocks, terminals);
     run_numeric_proof_with_stale_skip(
-        initial,
+        prepared,
         max_states,
         connectivity,
         floors,
@@ -6695,7 +6763,7 @@ fn run_numeric_proof_without_combat_gem_gate(
 }
 
 fn run_numeric_proof_with_stale_skip(
-    initial: &SolverState,
+    prepared: PreparedPhaseAInitial,
     max_states: usize,
     connectivity: &ConnectivityIndex,
     floors: &HashMap<String, SolverFloor>,
@@ -6708,11 +6776,17 @@ fn run_numeric_proof_with_stale_skip(
 ) -> PhaseAResult {
     profile_set_phase(ProfilePhase::PhaseA);
     #[cfg(test)]
-    let _drop_probe = PhaseADropProbe;
+    let _drop_probe = {
+        PHASE_A_CALLS.with(|calls| calls.set(calls.get() + 1));
+        PhaseADropProbe
+    };
     #[cfg(test)]
     clear_phase_a_accepted_trace();
     #[cfg(test)]
     clear_phase_a_stale_counts();
+    #[cfg(test)]
+    PHASE_A_STORE_CREATIONS.with(|count| count.set(count.get() + 1));
+    profile_with_stats(|stats| stats.phase_a_store_creations += 1);
     let mut store = PhaseALabelStore {
         structural_nodes: Vec::new(),
         structural_ids: HashMap::new(),
@@ -6733,12 +6807,13 @@ fn run_numeric_proof_with_stale_skip(
     let mut depth_cutoff = false;
     let mut work_items_seen = 0_u64;
 
-    // The initial connectivity scan both canonicalizes its accepted label and
-    // supplies the first FIFO actions. No second representative-only scan is
-    // needed anywhere in Phase A.
-    let mut initial = initial.clone();
-    let initial_view = connectivity.view_phase_a(&initial, floors, blocks, terminals);
-    (initial.floor, initial.x, initial.y) = initial_view.representative.clone();
+    // The prepared scan both canonicalizes the accepted label and supplies the
+    // first FIFO actions. Global analysis can inspect that same view for an
+    // immediate certified action without traversing connectivity twice.
+    let PreparedPhaseAInitial {
+        state: initial,
+        view: initial_view,
+    } = prepared;
     if let Some(initial_id) = store.accept(initial.clone()) {
         if let Some(depths) = label_depths.as_mut() {
             depths.push(0);
@@ -6957,6 +7032,62 @@ fn run_numeric_proof_with_stale_skip(
 
 fn global_analysis(observation: &serde_json::Map<String, Value>) -> Value {
     global_analysis_with_stats(observation).0
+}
+
+fn immediate_combat_gem_response(
+    initial: &SolverState,
+    initial_view: &ConnectivityView,
+    combat_gems: &CombatGemCertificate,
+    blocks: &[SolverBlock],
+    shops: &[CompiledShop],
+) -> Option<Value> {
+    if !immediate_combat_gem_policy_enabled() {
+        return None;
+    }
+    let boundary = initial_view.boundaries.iter().find(|boundary| {
+        boundary.local_from_origin
+            && blocks
+                .get(boundary.index)
+                .is_some_and(|_| combat_gems.runtime_safe(boundary.index, initial))
+    })?;
+    profile_with_stats(|stats| stats.immediate_safe_action_hits += 1);
+    let materialized = materialize_pending_action(
+        initial,
+        PendingAction::Block {
+            index: boundary.index,
+            adjacent: boundary.adjacent,
+        },
+        blocks,
+        shops,
+        true,
+    );
+    let Some(materialized) = materialized else {
+        let reason = rule_fault().unwrap_or("combat_gem_certificate_violation");
+        return Some(
+            json!({"scope":"global_terminal_route","proof":"unsupported","reason":reason,
+            "truncated":false,"explored_states":0,"blockers":[],"route":null,"first_suggestion":null}),
+        );
+    };
+    let Some(route_action) = materialized.route_action else {
+        return Some(
+            json!({"scope":"global_terminal_route","proof":"unsupported",
+            "reason":"combat_gem_certificate_violation","truncated":false,"explored_states":0,
+            "blockers":[],"route":null,"first_suggestion":null}),
+        );
+    };
+    let suggestion = route_action_step(&route_action, blocks).value;
+    profile_with_stats(|stats| stats.global_search_skipped += 1);
+    Some(json!({
+        "scope":"global_terminal_route",
+        "proof":"unproven",
+        "reason":"deferred_for_certified_immediate_combat_gem",
+        "decision_mode":"certified_immediate_action",
+        "truncated":false,
+        "explored_states":0,
+        "blockers":[],
+        "route":null,
+        "first_suggestion":suggestion,
+    }))
 }
 
 fn global_analysis_with_stats(
@@ -7212,14 +7343,24 @@ fn global_analysis_with_stats(
         PHASE2_SAW_PHASE_A_DROPPED.with(|seen| seen.set(false));
     }
     clear_rule_fault();
-    let proof = run_numeric_proof(
-        &initial,
+    let combat_gems = compile_combat_gem_certificate(&initial, &blocks, &shops);
+    let prepared = prepare_phase_a_initial(&initial, &connectivity, &floors, &blocks, &terminals);
+    if let Some(response) =
+        immediate_combat_gem_response(&initial, &prepared.view, &combat_gems, &blocks, &shops)
+    {
+        return (response, TwoPhaseStats::default());
+    }
+    let proof = run_numeric_proof_with_stale_skip(
+        prepared,
         max_states,
         &connectivity,
         &floors,
         &blocks,
         &terminals,
         &shops,
+        &combat_gems,
+        true,
+        combat_gem_policy_enabled(),
     );
     let mut stats = TwoPhaseStats {
         phase_a_explored: proof.explored,
@@ -7948,6 +8089,7 @@ mod tests {
             index: usize::MAX,
             adjacent: (u64::MAX, 0),
             navigation: Vec::new(),
+            local_from_origin: true,
         };
         assert!(PhaseAActionRef::block(&boundary).is_none());
         let shop = ReachShop {
@@ -8577,16 +8719,19 @@ mod tests {
                     index: 0,
                     adjacent: (0, 0),
                     navigation: vec![],
+                    local_from_origin: true,
                 },
                 ReachBoundary {
                     index: 1,
                     adjacent: (0, 0),
                     navigation: vec![],
+                    local_from_origin: true,
                 },
                 ReachBoundary {
                     index: 2,
                     adjacent: (0, 0),
                     navigation: vec![],
+                    local_from_origin: true,
                 },
             ],
             shops: HashMap::new(),
@@ -8674,6 +8819,7 @@ mod tests {
                     index,
                     adjacent: (0, 0),
                     navigation: vec![],
+                    local_from_origin: true,
                 })
                 .collect(),
             shops: HashMap::from([(
@@ -8736,6 +8882,7 @@ mod tests {
             view.boundaries.iter().map(|b| b.index).collect::<Vec<_>>(),
             vec![0]
         );
+        assert!(immediate_combat_gem_response(&state, &view, &certificate, &blocks, &[]).is_none());
         let mut queue = VecDeque::new();
         enqueue_phase_a_actions(
             &mut queue,
@@ -10214,11 +10361,13 @@ mod tests {
                     index: 7,
                     adjacent: (1, 0),
                     navigation: Vec::new(),
+                    local_from_origin: true,
                 },
                 ReachBoundary {
                     index: 3,
                     adjacent: (0, 1),
                     navigation: Vec::new(),
+                    local_from_origin: true,
                 },
             ],
             shops: HashMap::from([(
@@ -10554,12 +10703,26 @@ mod tests {
             actual
                 .boundaries
                 .iter()
-                .map(|item| (item.index, item.adjacent, item.navigation.clone()))
+                .map(|item| {
+                    (
+                        item.index,
+                        item.adjacent,
+                        item.navigation.clone(),
+                        item.local_from_origin,
+                    )
+                })
                 .collect::<Vec<_>>(),
             oracle
                 .boundaries
                 .iter()
-                .map(|item| (item.index, item.adjacent, item.navigation.clone()))
+                .map(|item| {
+                    (
+                        item.index,
+                        item.adjacent,
+                        item.navigation.clone(),
+                        item.local_from_origin,
+                    )
+                })
                 .collect::<Vec<_>>()
         );
         let shops = |view: &ConnectivityView| {
@@ -11669,6 +11832,255 @@ mod tests {
         .unwrap()
     }
 
+    fn certified_gem_five_root_observation() -> Value {
+        serde_json::from_str(r#"{
+          "session_id":"S","floor_id":"F","map_instance_id":"M",
+          "dimensions":{"width":6,"height":4},"topology":{"kind":"valid_cells","valid_cells":[
+            {"x":2,"y":2},{"x":3,"y":2},{"x":1,"y":2},{"x":2,"y":1},{"x":2,"y":3},
+            {"x":4,"y":2},{"x":5,"y":2},{"x":3,"y":1},{"x":3,"y":3}]},
+          "hero":{"hp":30,"attack":10,"defense":10,"gold":10,"experience":0,"loc":{"x":2,"y":2}},
+          "keys":{"yellow":1,"blue":0,"red":0},"blocks":[],
+          "engine_model":{"inventory":{"classes":{}},"solver_model":{
+            "protocol":1,"search_budget":64,"terminal":{"kind":"location","floor_id":"F","x":5,"y":2},
+            "blockers":[],"shops":[{"supported":true,"shop_id":"shop","repeatable":true,"choices":[
+              {"choice_id":"shop:0:hp:1:10","index":0,"text":"hp+1","cost":10,"currency":"gold",
+               "base_cost":10,"increment_per_purchase":0,"effect":{"field":"hp","amount":1},
+               "counter_flag":"shop_hp","purchase_count":0}]}],
+            "floors":[{"floor_id":"F","width":6,"height":4,
+              "topology":{"kind":"valid_cells","valid_cells":[
+                {"x":2,"y":2},{"x":3,"y":2},{"x":1,"y":2},{"x":2,"y":1},{"x":2,"y":3},
+                {"x":4,"y":2},{"x":5,"y":2},{"x":3,"y":1},{"x":3,"y":3}]},"blocks":[
+                {"floor_id":"F","x":4,"y":2,"block_id":"redGem","numeric_id":27,"kind":"resource",
+                 "delta":{"hp":0,"attack":3,"defense":0,"gold":0,"experience":0,"level":0,
+                          "keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}},
+                {"floor_id":"F","x":1,"y":2,"block_id":"yellowDoor","numeric_id":6,"kind":"door",
+                 "key_cost":{"yellow":1,"blue":0,"red":0}},
+                {"floor_id":"F","x":2,"y":1,"block_id":"slimeA","numeric_id":40,"kind":"enemy",
+                 "enemy":{"hp":5,"attack":1,"defense":0,"gold":0,"experience":0,"special":[]}},
+                {"floor_id":"F","x":2,"y":3,"block_id":"slimeB","numeric_id":41,"kind":"enemy",
+                 "enemy":{"hp":5,"attack":1,"defense":0,"gold":0,"experience":0,"special":[]}},
+                {"floor_id":"F","x":3,"y":1,"block_id":"redPotion","numeric_id":31,"kind":"resource",
+                 "delta":{"hp":10,"attack":0,"defense":0,"gold":0,"experience":0,"level":0,
+                          "keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}},
+                {"floor_id":"F","x":3,"y":3,"block_id":"shop","numeric_id":50,"kind":"shop","shop_id":"shop"}
+              ]}]
+          }}
+        }"#).unwrap()
+    }
+
+    fn remote_certified_gem_observation() -> Value {
+        serde_json::from_str(r#"{
+          "session_id":"S","floor_id":"A","map_instance_id":"M",
+          "dimensions":{"width":3,"height":1},"topology":{"kind":"rectangle"},
+          "hero":{"hp":30,"attack":10,"defense":10,"gold":0,"experience":0,"loc":{"x":0,"y":0}},
+          "keys":{"yellow":0,"blue":0,"red":0},"blocks":[],
+          "engine_model":{"inventory":{"classes":{}},"solver_model":{"protocol":1,"search_budget":32,
+            "terminal":{"kind":"location","floor_id":"B","x":2,"y":0},"blockers":[],"shops":[],"floors":[
+              {"floor_id":"A","width":3,"height":1,"topology":{"kind":"rectangle"},"blocks":[
+                {"floor_id":"A","x":2,"y":0,"block_id":"up","numeric_id":1,"kind":"transition","initial_active":true,
+                 "target":{"floor_id":"B","x":0,"y":0}}]},
+              {"floor_id":"B","width":3,"height":1,"topology":{"kind":"rectangle"},"blocks":[
+                {"floor_id":"B","x":0,"y":0,"block_id":"down","numeric_id":2,"kind":"transition","initial_active":true,
+                 "target":{"floor_id":"A","x":1,"y":0}},
+                {"floor_id":"B","x":1,"y":0,"block_id":"redGem","numeric_id":27,"kind":"resource",
+                 "delta":{"hp":0,"attack":3,"defense":0,"gold":0,"experience":0,"level":0,
+                          "keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}
+              ]}
+            ]}}
+        }"#).unwrap()
+    }
+
+    fn same_floor_gem_requiring_transition_detour_observation() -> Value {
+        serde_json::from_str(r#"{
+          "session_id":"S","floor_id":"A","map_instance_id":"M",
+          "dimensions":{"width":5,"height":1},"topology":{"kind":"rectangle"},
+          "hero":{"hp":30,"attack":10,"defense":10,"gold":0,"experience":0,"loc":{"x":0,"y":0}},
+          "keys":{"yellow":0,"blue":0,"red":0},"blocks":[],
+          "engine_model":{"inventory":{"classes":{}},"solver_model":{"protocol":1,"search_budget":64,
+            "terminal":{"kind":"location","floor_id":"A","x":4,"y":0},"blockers":[],"shops":[],"floors":[
+              {"floor_id":"A","width":5,"height":1,"topology":{"kind":"valid_cells","valid_cells":[
+                {"x":0,"y":0},{"x":1,"y":0},{"x":3,"y":0},{"x":4,"y":0}
+              ]},"blocks":[
+                {"floor_id":"A","x":1,"y":0,"block_id":"a_to_b_left","numeric_id":1,"kind":"transition","initial_active":true,
+                 "target":{"floor_id":"B","x":0,"y":0}},
+                {"floor_id":"A","x":3,"y":0,"block_id":"a_to_b_right","numeric_id":2,"kind":"transition","initial_active":true,
+                 "target":{"floor_id":"B","x":2,"y":0}},
+                {"floor_id":"A","x":4,"y":0,"block_id":"redGem","numeric_id":27,"kind":"resource",
+                 "delta":{"hp":0,"attack":3,"defense":0,"gold":0,"experience":0,"level":0,
+                          "keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}
+              ]},
+              {"floor_id":"B","width":3,"height":1,"topology":{"kind":"rectangle"},"blocks":[
+                {"floor_id":"B","x":0,"y":0,"block_id":"b_to_a_left","numeric_id":3,"kind":"transition","initial_active":true,
+                 "target":{"floor_id":"A","x":1,"y":0}},
+                {"floor_id":"B","x":2,"y":0,"block_id":"b_to_a_right","numeric_id":4,"kind":"transition","initial_active":true,
+                 "target":{"floor_id":"A","x":3,"y":0}}
+              ]}
+            ]}}
+        }"#).unwrap()
+    }
+
+    struct ImmediateTestReset;
+
+    impl Drop for ImmediateTestReset {
+        fn drop(&mut self) {
+            FORCE_CERTIFIED_GEM_MATERIALIZER_NONE.with(|enabled| enabled.set(false));
+            FORCE_CERTIFIED_GEM_MATERIALIZER_FAULT.with(|enabled| enabled.set(false));
+            DISABLE_IMMEDIATE_COMBAT_GEM.with(|disabled| disabled.set(false));
+        }
+    }
+
+    fn reset_immediate_test_counters() -> ImmediateTestReset {
+        PHASE_A_CALLS.with(|calls| calls.set(0));
+        PHASE_A_STORE_CREATIONS.with(|count| count.set(0));
+        INITIAL_PHASE_A_VIEW_CALLS.with(|calls| calls.set(0));
+        PHASE2_CALLS.with(|calls| calls.set(0));
+        ImmediateTestReset
+    }
+
+    #[test]
+    fn certified_initial_gem_is_one_read_only_step_and_skips_both_search_phases() {
+        let _reset = reset_immediate_test_counters();
+        let (response, stats) =
+            global_analysis_with_stats(certified_gem_five_root_observation().as_object().unwrap());
+        assert_eq!(response["proof"], "unproven");
+        assert_eq!(
+            response["reason"],
+            "deferred_for_certified_immediate_combat_gem"
+        );
+        assert_eq!(response["decision_mode"], "certified_immediate_action");
+        assert_eq!(response["truncated"], false);
+        assert_eq!(response["explored_states"], 0);
+        assert_eq!(response["route"], Value::Null);
+        assert_eq!(response["blockers"], json!([]));
+        assert_eq!(response["first_suggestion"]["step_kind"], "resource");
+        assert_eq!(response["first_suggestion"]["block_id"], "redGem");
+        assert_eq!(stats.phase_a_explored, 0);
+        assert_eq!(stats.phase_b_explored, 0);
+        INITIAL_PHASE_A_VIEW_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        PHASE_A_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        PHASE_A_STORE_CREATIONS.with(|count| assert_eq!(count.get(), 0));
+        PHASE2_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+    }
+
+    #[test]
+    fn initial_gem_selection_is_stable_and_normal_path_reuses_prepared_view() {
+        let _reset = reset_immediate_test_counters();
+        let mut observation = certified_gem_five_root_observation();
+        observation["engine_model"]["solver_model"]["floors"][0]["topology"]["valid_cells"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"x":4,"y":3}));
+        let blocks = observation["engine_model"]["solver_model"]["floors"][0]["blocks"]
+            .as_array_mut()
+            .unwrap();
+        blocks.insert(
+            1,
+            json!({"floor_id":"F","x":4,"y":3,"block_id":"blueGem","numeric_id":28,
+            "kind":"resource","delta":{"hp":0,"attack":0,"defense":3,"gold":0,"experience":0,
+            "level":0,"keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}),
+        );
+        let first = global_analysis(observation.as_object().unwrap());
+        let second = global_analysis(observation.as_object().unwrap());
+        assert_eq!(first["first_suggestion"]["block_id"], "redGem");
+        assert_eq!(first, second);
+
+        DISABLE_IMMEDIATE_COMBAT_GEM.with(|disabled| disabled.set(true));
+        INITIAL_PHASE_A_VIEW_CALLS.with(|calls| calls.set(0));
+        PHASE_A_CALLS.with(|calls| calls.set(0));
+        let ordinary = global_analysis(certified_gem_observation().as_object().unwrap());
+        assert_eq!(ordinary["proof"], "proven");
+        assert!(ordinary.get("decision_mode").is_none());
+        INITIAL_PHASE_A_VIEW_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        PHASE_A_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        PHASE2_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+    }
+
+    #[test]
+    fn remote_certified_gem_does_not_short_circuit_but_internal_gate_still_completes() {
+        let _reset = reset_immediate_test_counters();
+        let response = global_analysis(remote_certified_gem_observation().as_object().unwrap());
+        assert!(response.get("decision_mode").is_none());
+        assert_eq!(response["proof"], "proven");
+        PHASE_A_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        PHASE_A_STORE_CREATIONS.with(|count| assert_eq!(count.get(), 1));
+        INITIAL_PHASE_A_VIEW_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        PHASE2_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+    }
+
+    #[test]
+    fn same_floor_gem_reached_only_after_transition_detour_is_not_immediate() {
+        let _reset = reset_immediate_test_counters();
+        let observation = same_floor_gem_requiring_transition_detour_observation();
+        let (floors, blocks, state_slot_count, terminal, shops, blockers) =
+            parse_solver_world(observation.as_object().unwrap()).unwrap();
+        assert!(blockers.is_empty());
+        let initial = SolverState {
+            floor: "A".into(),
+            x: 0,
+            y: 0,
+            hp: F64Bits(30.0_f64.to_bits()),
+            attack: F64Bits(10.0_f64.to_bits()),
+            defense: F64Bits(10.0_f64.to_bits()),
+            gold: 0,
+            experience: 0,
+            level: 0,
+            yellow: 0,
+            blue: 0,
+            red: 0,
+            inventory: Arc::new(Vec::new()),
+            consumed: ConsumedBits::new(state_slot_count),
+            shop_counts: Arc::new(vec![0; shops.len()]),
+            flags: Arc::new(Vec::new()),
+        };
+        let connectivity = ConnectivityIndex::new(&floors, &blocks);
+        let terminal = terminal.as_object().unwrap();
+        let terminals = vec![(
+            terminal["floor_id"].as_str().unwrap(),
+            (
+                terminal["x"].as_u64().unwrap(),
+                terminal["y"].as_u64().unwrap(),
+            ),
+        )];
+        let prepared =
+            prepare_phase_a_initial(&initial, &connectivity, &floors, &blocks, &terminals);
+        let gem_index = blocks
+            .iter()
+            .position(|block| block.id == "redGem")
+            .unwrap();
+        let gem = prepared
+            .view
+            .boundaries
+            .iter()
+            .find(|boundary| boundary.index == gem_index)
+            .expect("detour makes same-floor gem globally reachable");
+        assert!(!gem.local_from_origin);
+        let certificate = compile_combat_gem_certificate(&initial, &blocks, &shops);
+        assert!(
+            immediate_combat_gem_response(&initial, &prepared.view, &certificate, &blocks, &shops)
+                .is_none()
+        );
+
+        INITIAL_PHASE_A_VIEW_CALLS.with(|calls| calls.set(0));
+        let response = global_analysis(observation.as_object().unwrap());
+        assert!(response.get("decision_mode").is_none());
+        assert_eq!(response["proof"], "proven");
+        INITIAL_PHASE_A_VIEW_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        PHASE_A_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        PHASE_A_STORE_CREATIONS.with(|count| assert_eq!(count.get(), 1));
+        PHASE2_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+    }
+
+    #[test]
+    fn immediate_materializer_fault_is_global_unsupported_without_search() {
+        let _reset = reset_immediate_test_counters();
+        FORCE_CERTIFIED_GEM_MATERIALIZER_FAULT.with(|enabled| enabled.set(true));
+        let response = global_analysis(certified_gem_observation().as_object().unwrap());
+        assert_eq!(response["proof"], "unsupported");
+        assert_eq!(response["reason"], "rule_arithmetic_invalid");
+        PHASE_A_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        PHASE2_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+    }
+
     #[test]
     fn certified_gem_materializer_contract_violation_is_globally_unsupported() {
         struct ResetMaterializerHook;
@@ -11685,6 +12097,8 @@ mod tests {
         assert_eq!(response["reason"], "combat_gem_certificate_violation");
         assert_eq!(response["route"], Value::Null);
         assert_eq!(response["first_suggestion"], Value::Null);
+        PHASE_A_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        PHASE2_CALLS.with(|calls| assert_eq!(calls.get(), 0));
     }
 
     fn two_terminal_routes(search_budget: u64) -> Value {
@@ -12616,6 +13030,128 @@ mod tests {
             validator.validate(&response).is_ok(),
             "actual idle + shadow response must satisfy the JSON Schema"
         );
+    }
+
+    #[test]
+    fn actual_ordinary_proven_response_matches_draft_2020_12_schema() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../../protocol/cycle-response.schema.json"))
+                .expect("response schema JSON");
+        let validator = jsonschema::validator_for(&schema).expect("Draft 2020-12 response schema");
+        let response = shadow_response(
+            &request_with(reversible_terminal_observation()),
+            &Mutex::new(ShadowState::default()),
+        )
+        .expect("ordinary proven Rust response");
+        let global = &response["shadow"]["analysis"]["global"];
+        assert_eq!(global["proof"], "proven");
+        assert!(global.get("decision_mode").is_none());
+        assert!(global["route"].is_object());
+        assert!(global["first_suggestion"].is_object());
+        assert!(
+            validator.validate(&response).is_ok(),
+            "ordinary proven response must satisfy the JSON Schema: {response}"
+        );
+    }
+
+    #[test]
+    fn ordinary_unproven_response_keeps_null_first_suggestion_in_draft_schema() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../../protocol/cycle-response.schema.json"))
+                .expect("response schema JSON");
+        let validator = jsonschema::validator_for(&schema).expect("Draft 2020-12 response schema");
+        let response = shadow_response(
+            &request_with(two_terminal_routes(2)),
+            &Mutex::new(ShadowState::default()),
+        )
+        .expect("ordinary unproven Rust response");
+        let global = &response["shadow"]["analysis"]["global"];
+        assert_eq!(global["proof"], "unproven");
+        assert!(global.get("decision_mode").is_none());
+        assert!(global["route"].is_null());
+        assert!(global["first_suggestion"].is_null());
+        assert!(
+            validator.validate(&response).is_ok(),
+            "ordinary unproven response must satisfy the JSON Schema: {response}"
+        );
+    }
+
+    #[test]
+    fn actual_certified_immediate_response_matches_draft_2020_12_schema() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../../protocol/cycle-response.schema.json"))
+                .expect("response schema JSON");
+        let validator = jsonschema::validator_for(&schema).expect("Draft 2020-12 response schema");
+        let response = shadow_response(
+            &request_with(certified_gem_five_root_observation()),
+            &Mutex::new(ShadowState::default()),
+        )
+        .expect("certified immediate Rust response");
+        assert_eq!(
+            response["shadow"]["analysis"]["global"]["decision_mode"],
+            "certified_immediate_action"
+        );
+        assert!(
+            validator.validate(&response).is_ok(),
+            "certified immediate response must satisfy the JSON Schema: {response}"
+        );
+    }
+
+    #[test]
+    fn certified_immediate_schema_rejects_inconsistent_contracts() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../../protocol/cycle-response.schema.json"))
+                .expect("response schema JSON");
+        let validator = jsonschema::validator_for(&schema).expect("Draft 2020-12 response schema");
+        let response = shadow_response(
+            &request_with(certified_gem_five_root_observation()),
+            &Mutex::new(ShadowState::default()),
+        )
+        .expect("certified immediate Rust response");
+        let suggestion = response["shadow"]["analysis"]["global"]["first_suggestion"].clone();
+        let mut invalid = Vec::<(&str, Value)>::new();
+
+        let mut changed = response.clone();
+        changed["shadow"]["analysis"]["global"]["proof"] = json!("proven");
+        invalid.push(("proof", changed));
+        let mut changed = response.clone();
+        changed["shadow"]["analysis"]["global"]["reason"] = json!("other");
+        invalid.push(("reason", changed));
+        let mut changed = response.clone();
+        changed["shadow"]["analysis"]["global"]["truncated"] = json!(true);
+        invalid.push(("truncated", changed));
+        let mut changed = response.clone();
+        changed["shadow"]["analysis"]["global"]["explored_states"] = json!(1);
+        invalid.push(("explored_states", changed));
+        let mut changed = response.clone();
+        changed["shadow"]["analysis"]["global"]["blockers"] =
+            json!([{"code":"unexpected","detail":"must be empty"}]);
+        invalid.push(("blockers", changed));
+        let mut changed = response.clone();
+        changed["shadow"]["analysis"]["global"]["route"] =
+            json!({"step_count":1,"steps":[suggestion.clone()]});
+        invalid.push(("route", changed));
+        let mut changed = response.clone();
+        changed["shadow"]["analysis"]["global"]["first_suggestion"] = Value::Null;
+        invalid.push(("null suggestion", changed));
+        let mut changed = response.clone();
+        changed["shadow"]["analysis"]["global"]["first_suggestion"] = json!({"step_kind":"transition","floor_id":"F","x":1,"y":0,
+                "block_id":"stairs","details":{}});
+        invalid.push(("non-resource suggestion", changed));
+        let mut changed = response.clone();
+        changed["shadow"]["analysis"]["global"]["first_suggestion"]["block_id"] =
+            json!("redPotion");
+        invalid.push(("uncertified resource id", changed));
+        let mut changed = response.clone();
+        changed["shadow"]["analysis"]["global"]["decision_mode"] = json!("unknown");
+        invalid.push(("unknown decision mode", changed));
+
+        for (name, value) in invalid {
+            assert!(
+                validator.validate(&value).is_err(),
+                "invalid immediate {name} must fail the JSON Schema"
+            );
+        }
     }
 
     #[test]

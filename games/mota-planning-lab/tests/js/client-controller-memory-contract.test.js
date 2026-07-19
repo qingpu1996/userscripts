@@ -210,6 +210,47 @@ test("browser protocol parser accepts fixtures and rejects nested shape drift", 
   global.blockers = [{ code: "opaque_event", detail: 1 }];
   assert.throws(() => lab.validateCycleResponse(shadowAnalysis));
   global.blockers = [];
+  const immediate = structuredClone(shadowAnalysis);
+  Object.assign(immediate.shadow.analysis.global, {
+    proof: "unproven",
+    reason: "deferred_for_certified_immediate_combat_gem",
+    decision_mode: "certified_immediate_action",
+    truncated: false,
+    explored_states: 0,
+    route: null,
+    first_suggestion: {
+      step_kind: "resource", floor_id: "F", x: 1, y: 0, block_id: "redGem",
+      details: {
+        hp: 0, attack: 3, defense: 0, gold: 0, experience: 0, level: 0,
+        keys: { yellow: 0, blue: 0, red: 0 }, inventory: {},
+      },
+    },
+  });
+  delete immediate.shadow.analysis.global.terminal_hp;
+  delete immediate.shadow.analysis.global.terminal_attack;
+  delete immediate.shadow.analysis.global.terminal_defense;
+  assert.doesNotThrow(() => lab.validateCycleResponse(immediate));
+  immediate.shadow.analysis.global.decision_mode = "unknown_immediate_mode";
+  assert.throws(() => lab.validateCycleResponse(immediate));
+  immediate.shadow.analysis.global.decision_mode = "certified_immediate_action";
+  immediate.shadow.analysis.global.proof = "proven";
+  assert.throws(() => lab.validateCycleResponse(immediate));
+  immediate.shadow.analysis.global.proof = "unproven";
+  immediate.shadow.analysis.global.blockers = [{ code: "unexpected", detail: "not empty" }];
+  assert.throws(() => lab.validateCycleResponse(immediate));
+  immediate.shadow.analysis.global.blockers = [];
+  immediate.shadow.analysis.global.first_suggestion.step_kind = "transition";
+  immediate.shadow.analysis.global.first_suggestion.details = {};
+  assert.throws(() => lab.validateCycleResponse(immediate));
+  immediate.shadow.analysis.global.first_suggestion = {
+    step_kind: "resource", floor_id: "F", x: 1, y: 0, block_id: "redPotion",
+    details: {
+      hp: 0, attack: 3, defense: 0, gold: 0, experience: 0, level: 0,
+      keys: { yellow: 0, blue: 0, red: 0 }, inventory: {},
+    },
+  };
+  assert.throws(() => lab.validateCycleResponse(immediate));
+
   global.route.steps[0] = {
     step_kind: "resource", floor_id: "F", x: 2, y: 0, block_id: "redPotion",
     details: {
@@ -248,6 +289,15 @@ test("JS and Draft schema agree on global shadow proof, limits, and non-executab
     { name: "unsupported budget reason", value: structuredClone(base), accepted: false },
     { name: "too many blockers", value: structuredClone(base), accepted: false },
     { name: "nested executable inventory field", value: structuredClone(base), accepted: false },
+    { name: "valid certified immediate action", value: structuredClone(base), accepted: true },
+    { name: "unknown immediate mode", value: structuredClone(base), accepted: false },
+    { name: "immediate action cannot claim proven", value: structuredClone(base), accepted: false },
+    { name: "immediate action requires empty blockers", value: structuredClone(base), accepted: false },
+    { name: "immediate action requires resource step", value: structuredClone(base), accepted: false },
+    { name: "immediate action requires certified gem id", value: structuredClone(base), accepted: false },
+    { name: "immediate action requires null route", value: structuredClone(base), accepted: false },
+    { name: "immediate action requires exact reason", value: structuredClone(base), accepted: false },
+    { name: "immediate action requires zero explored", value: structuredClone(base), accepted: false },
   ];
   cases[1].value.shadow.analysis.global.reason = "search_budget_exhausted";
   cases[2].value.shadow.analysis.global.blockers = Array.from(
@@ -270,6 +320,60 @@ test("JS and Draft schema agree on global shadow proof, limits, and non-executab
   cases[3].value.shadow.analysis.global.first_suggestion = structuredClone(
     cases[3].value.shadow.analysis.global.route.steps[0],
   );
+  const immediateStep = {
+    step_kind: "resource", floor_id: "F", x: 1, y: 0, block_id: "redGem",
+    details: {
+      hp: 0, attack: 3, defense: 0, gold: 0, experience: 0, level: 0,
+      keys: { yellow: 0, blue: 0, red: 0 }, inventory: {},
+    },
+  };
+  Object.assign(cases[4].value.shadow.analysis.global, {
+    proof: "unproven", reason: "deferred_for_certified_immediate_combat_gem",
+    decision_mode: "certified_immediate_action", truncated: false,
+    explored_states: 0, route: null, first_suggestion: immediateStep,
+  });
+  Object.assign(cases[5].value.shadow.analysis.global,
+    structuredClone(cases[4].value.shadow.analysis.global), { decision_mode: "unknown" });
+  Object.assign(cases[6].value.shadow.analysis.global,
+    structuredClone(cases[4].value.shadow.analysis.global), { proof: "proven" });
+  Object.assign(cases[7].value.shadow.analysis.global,
+    structuredClone(cases[4].value.shadow.analysis.global), {
+      blockers: [{ code: "unexpected", detail: "immediate must be blocker-free" }],
+    });
+  Object.assign(cases[8].value.shadow.analysis.global,
+    structuredClone(cases[4].value.shadow.analysis.global), {
+      first_suggestion: {
+        step_kind: "transition", floor_id: "F", x: 1, y: 0, block_id: "stairs", details: {},
+      },
+    });
+  Object.assign(cases[9].value.shadow.analysis.global,
+    structuredClone(cases[4].value.shadow.analysis.global), {
+      first_suggestion: { ...structuredClone(immediateStep), block_id: "redPotion" },
+    });
+  Object.assign(cases[10].value.shadow.analysis.global,
+    structuredClone(cases[4].value.shadow.analysis.global), {
+      route: { step_count: 1, steps: [structuredClone(immediateStep)] },
+    });
+  Object.assign(cases[11].value.shadow.analysis.global,
+    structuredClone(cases[4].value.shadow.analysis.global), { reason: "search_budget_exhausted" });
+  Object.assign(cases[12].value.shadow.analysis.global,
+    structuredClone(cases[4].value.shadow.analysis.global), { explored_states: 1 });
+
+  const ordinaryProven = structuredClone(base);
+  Object.assign(ordinaryProven.shadow.analysis.global, {
+    proof: "proven", reason: "complete terminal route found", truncated: false,
+    explored_states: 1, terminal_hp: 10, terminal_attack: 2, terminal_defense: 2,
+    route: { step_count: 1, steps: [{ step_kind: "terminal", floor_id: "F", x: 1, y: 0, details: {} }] },
+  });
+  ordinaryProven.shadow.analysis.global.first_suggestion =
+    structuredClone(ordinaryProven.shadow.analysis.global.route.steps[0]);
+  cases.push({ name: "ordinary proven response keeps its route suggestion", value: ordinaryProven, accepted: true });
+
+  const ordinaryUnproven = structuredClone(base);
+  Object.assign(ordinaryUnproven.shadow.analysis.global, {
+    proof: "unproven", reason: "search_budget_exhausted", truncated: true, explored_states: 4,
+  });
+  cases.push({ name: "ordinary unproven response keeps null suggestion", value: ordinaryUnproven, accepted: true });
 
   const schemaPath = path.join(projectDir, "protocol/cycle-response.schema.json");
   const python = childProcess.spawnSync("python3", ["-c", [
@@ -479,6 +583,49 @@ test("shadow advice is shown as the controller's visible reason", async () => {
 
   assert.equal(result.idle, true);
   assert.equal(panel.states.at(-1).reason, `Shadow（只读）：${shadowReason}`);
+});
+
+test("certified immediate gem is displayed as deferred read-only planning", async () => {
+  const current = { value: makeObservation() };
+  const journal = lab.createJournal();
+  establishTestSession(journal, current.value);
+  journal.setAutopilot(true);
+  const step = {
+    step_kind: "resource", floor_id: "F", x: 1, y: 0, block_id: "redGem",
+    details: {
+      hp: 0, attack: 3, defense: 0, gold: 0, experience: 0, level: 0,
+      keys: { yellow: 0, blue: 0, red: 0 }, inventory: {},
+    },
+  };
+  const { adapter, controller, panel } = makeController(current, journal, {
+    isConnected: () => true,
+    async postCycle() {
+      return {
+        status: "idle", reason: "shadow analysis only",
+        shadow: {
+          mode: "read_only", reason: "shadow analysis only", cycle: 1,
+          analysis: {
+            scope: "current_floor_immediate", reachable_cell_count: 1,
+            candidate_limit: 256, total_candidate_count: 0, truncated: false, candidates: [],
+            global: {
+              scope: "global_terminal_route", proof: "unproven",
+              reason: "deferred_for_certified_immediate_combat_gem",
+              decision_mode: "certified_immediate_action", truncated: false,
+              explored_states: 0, blockers: [], route: null, first_suggestion: step,
+            },
+          },
+        },
+      };
+    },
+  }, undefined, { shadowOnly: true });
+
+  const result = await controller.runSingleCycle();
+
+  assert.equal(result.idle, true);
+  assert.equal(panel.states.at(-1).reason,
+    "Shadow（只读）：发现当前可安全直接获取的攻防宝石。本轮完整全局路线证明已延期；获取后将在下一 cycle 重新观察并规划。");
+  assert.deepEqual(adapter.calls, { direct: 0, route: 0, stop: 0 });
+  assert.equal(journal.snapshot().pending_action, null);
 });
 
 test("completed delta is reported, ACKed, and followed by at most one new action", async () => {
