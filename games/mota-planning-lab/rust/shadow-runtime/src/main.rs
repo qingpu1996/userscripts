@@ -718,6 +718,20 @@ struct ProfileStats {
     phase_a_rejected: u64,
     phase_a_pending: u64,
     accepted_semantic_trace_hash: u64,
+    forced_root_sources: u64,
+    forced_pickups_enqueued: u64,
+    ordinary_boundary_actions_suppressed: u64,
+    shop_actions_suppressed: u64,
+    forced_successor_accepted: u64,
+    forced_successor_pareto_rejected: u64,
+    forced_successor_faults: u64,
+    accepted_depth_histogram: BTreeMap<u64, u64>,
+    consumed_slots_histogram: BTreeMap<u64, u64>,
+    boundary_count_histogram: BTreeMap<u64, u64>,
+    reachable_component_count_histogram: BTreeMap<u64, u64>,
+    first_terminal_depth: Option<u64>,
+    best_objective_seen: Option<NumericObjective>,
+    phase_a_limit_reason: Option<&'static str>,
     phase5a1: Phase5A1Census,
 }
 
@@ -728,6 +742,63 @@ struct SlotDependency {
     set_false: bool,
     replace: bool,
     unknown: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CombatGemKind {
+    Attack,
+    Defense,
+}
+
+// Request-local, immutable proof result. Search only performs an indexed
+// lookup plus a finite-add check; event/dependency/world scans stay here.
+struct CombatGemCertificate {
+    by_block: Vec<Option<CombatGemKind>>,
+    // A combat gem may only move ahead of a non-commuting combat-stat event
+    // after every such event has permanently left the action graph. The mask
+    // is compiled once; the search hot path performs one machine-word subset
+    // check and never scans blocks or events.
+    required_consumed_words: Vec<u64>,
+    exact_upper: [f64; 2],
+}
+
+impl CombatGemCertificate {
+    fn empty(blocks: &[SolverBlock]) -> Self {
+        Self {
+            by_block: vec![None; blocks.len()],
+            required_consumed_words: Vec::new(),
+            exact_upper: [0.0; 2],
+        }
+    }
+
+    fn kind(&self, block_index: usize) -> Option<CombatGemKind> {
+        self.by_block.get(block_index).copied().flatten()
+    }
+
+    fn runtime_safe(&self, block_index: usize, state: &SolverState) -> bool {
+        let (value, upper) = match self.kind(block_index) {
+            Some(CombatGemKind::Attack) => (state.attack.get(), self.exact_upper[0]),
+            Some(CombatGemKind::Defense) => (state.defense.get(), self.exact_upper[1]),
+            None => return false,
+        };
+        if !exact_nonnegative_f64_integer(value)
+            || value > upper
+            || !exact_nonnegative_f64_integer(value + 3.0)
+            || value + 3.0 > upper
+        {
+            return false;
+        }
+        self.required_consumed_words
+            .iter()
+            .enumerate()
+            .all(|(index, required)| {
+                state
+                    .consumed
+                    .words
+                    .get(index)
+                    .is_some_and(|actual| actual & required == *required)
+            })
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -768,6 +839,25 @@ struct Phase5A1Census {
 #[inline(always)]
 fn profiling_enabled() -> bool {
     *PROFILE_ENABLED.get_or_init(|| env::var("MOTA_SHADOW_PROFILE").as_deref() == Ok("1"))
+}
+
+#[inline(always)]
+fn combat_gem_policy_enabled() -> bool {
+    // Benchmark-only kill switch. Production defaults to the certified policy;
+    // no observation/protocol field can alter it.
+    env::var("MOTA_PHASE_A_COMBAT_GEM_POLICY").as_deref() != Ok("0")
+}
+
+fn phase_a_benchmark_limits() -> (Option<u32>, Option<u64>) {
+    // These process-only knobs exist solely for QA comparisons. They are not
+    // observation fields and never alter the default production limit.
+    let depth = env::var("MOTA_PHASE_A_MAX_STRATEGIC_DEPTH")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+    let work = env::var("MOTA_PHASE_A_MAX_WORK_ITEMS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    (depth, work)
 }
 
 #[inline]
@@ -1010,6 +1100,35 @@ fn profile_finish_json(stats: &ProfileStats) -> Value {
     result["phase_a_connectivity_view_calls"] = Value::from(stats.phase_a_connectivity_view_calls);
     result["accepted_semantic_trace_hash"] =
         Value::from(format!("{:016x}", stats.accepted_semantic_trace_hash));
+    let distribution = |histogram: &BTreeMap<u64, u64>| {
+        json!({
+            "p50": profile_histogram_quantile(histogram, 50),
+            "p95": profile_histogram_quantile(histogram, 95),
+            "max": histogram.keys().next_back().copied().unwrap_or(0),
+        })
+    };
+    result["combat_gem_policy"] = json!({
+        "forced_root_sources": stats.forced_root_sources,
+        "forced_pickups_enqueued": stats.forced_pickups_enqueued,
+        "ordinary_boundary_actions_suppressed": stats.ordinary_boundary_actions_suppressed,
+        "shop_actions_suppressed": stats.shop_actions_suppressed,
+        "forced_successor_accepted": stats.forced_successor_accepted,
+        "forced_successor_pareto_rejected": stats.forced_successor_pareto_rejected,
+        "forced_successor_faults": stats.forced_successor_faults,
+    });
+    result["search_quality"] = json!({
+        "accepted_depth": distribution(&stats.accepted_depth_histogram),
+        "consumed_slots": distribution(&stats.consumed_slots_histogram),
+        "boundary_count": distribution(&stats.boundary_count_histogram),
+        "reachable_component_count": distribution(&stats.reachable_component_count_histogram),
+        "first_terminal_depth": stats.first_terminal_depth,
+        "best_objective_seen": stats.best_objective_seen.map(|objective| json!({
+            "attack_and_defense": objective.attack_and_defense,
+            "balanced_stat": objective.balanced_stat,
+            "hp": objective.hp,
+        })),
+        "benchmark_limit_reason": stats.phase_a_limit_reason,
+    });
     result["resource_closure_contract"] = json!({
         "observed_by_action_kind": stale_by_kind(
             &stats.resource_closure_observed_by_action_kind
@@ -1174,6 +1293,10 @@ thread_local! {
     // search memory or scheduling.
     static PHASE_A_STALE_OBSERVED: Cell<usize> = const { Cell::new(0) };
     static PHASE_A_STALE_SKIPPED: Cell<usize> = const { Cell::new(0) };
+    // Forces the certified block's production resource branch to return an
+    // ordinary infeasible result. This exercises the certificate-violation
+    // fail-closed path without adding any release bypass.
+    static FORCE_CERTIFIED_GEM_MATERIALIZER_NONE: Cell<bool> = const { Cell::new(false) };
 }
 
 #[derive(Default)]
@@ -2234,7 +2357,15 @@ fn project_event_slot_dependencies(blocks: &[SolverBlock], dependencies: &mut [S
                     }
                 }
             }
-            _ => {}
+            CompiledAuditedEvent::BookReward
+            | CompiledAuditedEvent::Sword2Reward
+            | CompiledAuditedEvent::Shield2Reward
+            | CompiledAuditedEvent::FlyReward
+            | CompiledAuditedEvent::IcePickaxeReward
+            | CompiledAuditedEvent::ExpSwordTrade
+            | CompiledAuditedEvent::GoldShieldTrade
+            | CompiledAuditedEvent::IceWandReward
+            | CompiledAuditedEvent::DialogueOnce => {}
         }
         if !exact {
             // A failed coordinate/slot projection cannot identify which slot
@@ -2245,6 +2376,323 @@ fn project_event_slot_dependencies(blocks: &[SolverBlock], dependencies: &mut [S
             }
         }
     }
+}
+
+const MAX_EXACT_F64_INTEGER: u128 = 1_u128 << 53;
+const FAIRY_EXCHANGE_ENVELOPE: u128 = 1_u128 << 32;
+const FAIRY_ROUNDING_ERROR_DENOMINATOR: u128 = 1_u128 << 21;
+
+fn exact_nonnegative_f64_integer(value: f64) -> bool {
+    value.is_finite()
+        && value >= 0.0
+        && value <= MAX_EXACT_F64_INTEGER as f64
+        && value.fract() == 0.0
+}
+
+fn exact_f64_as_u128(value: f64) -> Option<u128> {
+    exact_nonnegative_f64_integer(value).then_some(value as u128)
+}
+
+fn slot_is_permanently_consumed_once(
+    slot: usize,
+    owners: &[u8],
+    dependencies: &[SlotDependency],
+) -> bool {
+    owners.get(slot) == Some(&1)
+        && dependencies.get(slot).is_some_and(|dependency| {
+            !dependency.set_false && !dependency.replace && !dependency.unknown
+        })
+}
+
+struct CombatGemWorldProof {
+    required_consumed_words: Vec<u64>,
+    exact_upper: [f64; 2],
+}
+
+// Count concrete binary64 additions, not Phase A labels or materializations.
+// A single shop purchase can execute several attack/defense effects in source
+// order, so its contribution is `purchases * matching_effect_count`.
+// Checked arithmetic is intentional: an unrepresentable operation bound means
+// the fairy exchange proof is unavailable, never that it is unbounded-safe.
+fn add_fairy_add_operations(
+    total: &mut u128,
+    materializations: u128,
+    additions_per_materialization: u128,
+) -> Option<()> {
+    let additions = materializations.checked_mul(additions_per_materialization)?;
+    *total = total.checked_add(additions)?;
+    Some(())
+}
+
+// At values <= 2^32, one round-to-nearest binary64 addition has absolute
+// error <= 2^-21. The two compared routes have at most N additions each, and
+// the delayed gem contributes the final +3 term, so strict preservation of
+// the fairy-created advantage requires (2*N + 3) * 2^-21 < 1.
+fn fairy_rounding_exchange_is_strictly_safe(add_operations: u128) -> bool {
+    add_operations
+        .checked_mul(2)
+        .and_then(|twice| twice.checked_add(3))
+        .is_some_and(|error_units| error_units < FAIRY_ROUNDING_ERROR_DENOMINATOR)
+}
+
+fn combat_gem_world_exchange_proof(
+    initial: &SolverState,
+    blocks: &[SolverBlock],
+    shops: &[CompiledShop],
+    dependencies: &[SlotDependency],
+    slot_owners: &[u8],
+) -> Option<CombatGemWorldProof> {
+    // Addition is exchange-safe only while IEEE-754 represents every value
+    // exactly. Build a deliberately conservative world envelope in u128;
+    // every reachable attack/defense value must stay in [0, 2^53]. Resources
+    // and audited combat rewards are one-shot. Every shop choice is charged
+    // MAX_GLOBAL_STATES purchases, which over-approximates any Phase A path.
+    // Count all concrete attack/defense `F64Bits::add` operations separately
+    // for the fairy rounding proof below. This includes every nonzero
+    // one-shot resource/event addition and every matching effect in a shop
+    // choice (not merely one operation per shop purchase).
+    let mut upper = [
+        exact_f64_as_u128(initial.attack.get())?,
+        exact_f64_as_u128(initial.defense.get())?,
+    ];
+    let mut add_operations = [0_u128; 2];
+    let mut noncommuting_slots = Vec::new();
+    for block in blocks {
+        match compiled_rule(block) {
+            CompiledBlockRule::Resource { delta, .. } => {
+                if resource_unknown_wire_fields(block)
+                    || delta.multiply_attack != 1.0
+                    || delta.multiply_defense != 1.0
+                {
+                    return None;
+                }
+                let additions = [
+                    exact_f64_as_u128(delta.attack)?,
+                    exact_f64_as_u128(delta.defense)?,
+                ];
+                if additions != [0, 0] {
+                    let slot = block.state_slot?;
+                    if !slot_is_permanently_consumed_once(slot, slot_owners, dependencies) {
+                        return None;
+                    }
+                }
+                for ((value, operations), addition) in upper
+                    .iter_mut()
+                    .zip(add_operations.iter_mut())
+                    .zip(additions)
+                {
+                    *value = value.checked_add(addition)?;
+                    if addition != 0 {
+                        add_fairy_add_operations(operations, 1, 1)?;
+                    }
+                }
+            }
+            CompiledBlockRule::Event { event, .. } => {
+                let additions = match event {
+                    CompiledAuditedEvent::Sword2Reward => [70, 0],
+                    CompiledAuditedEvent::Shield2Reward => [0, 30],
+                    CompiledAuditedEvent::ExpSwordTrade => [120, 0],
+                    CompiledAuditedEvent::GoldShieldTrade => [0, 120],
+                    CompiledAuditedEvent::FairyMt0 => {
+                        let slot = block.state_slot?;
+                        if !slot_is_permanently_consumed_once(slot, slot_owners, dependencies) {
+                            return None;
+                        }
+                        noncommuting_slots.push(slot);
+                        [0, 0]
+                    }
+                    CompiledAuditedEvent::BookReward
+                    | CompiledAuditedEvent::CrossReward
+                    | CompiledAuditedEvent::FlyReward
+                    | CompiledAuditedEvent::IcePickaxeReward
+                    | CompiledAuditedEvent::IceWandReward
+                    | CompiledAuditedEvent::DialogueOnce
+                    | CompiledAuditedEvent::ThiefQuest
+                    | CompiledAuditedEvent::PrincessQuest
+                    | CompiledAuditedEvent::WandGateRemoveOnFailure
+                    | CompiledAuditedEvent::WandGateRetry => [0, 0],
+                };
+                if additions != [0, 0] {
+                    let slot = block.state_slot?;
+                    if !slot_is_permanently_consumed_once(slot, slot_owners, dependencies) {
+                        return None;
+                    }
+                    for ((value, operations), addition) in upper
+                        .iter_mut()
+                        .zip(add_operations.iter_mut())
+                        .zip(additions)
+                    {
+                        *value = value.checked_add(addition)?;
+                        if addition != 0 {
+                            add_fairy_add_operations(operations, 1, 1)?;
+                        }
+                    }
+                }
+            }
+            CompiledBlockRule::Door { .. }
+            | CompiledBlockRule::Transition { .. }
+            | CompiledBlockRule::Shop { .. } => {}
+            // Enemies write HP, gold, and experience only; no supported enemy
+            // operation calls F64Bits::add for attack or defense.
+            CompiledBlockRule::Enemy { .. } => {}
+            CompiledBlockRule::Unsupported
+                if !matches!(block.kind.as_str(), "terrain" | "opaque") =>
+            {
+                return None;
+            }
+            CompiledBlockRule::Unsupported => {}
+        }
+    }
+    for choice in shops.iter().flat_map(|shop| &shop.choices) {
+        let mut choice_add_operations = [0_u128; 2];
+        for effect in &choice.effects {
+            let target = match effect.field.as_str() {
+                "attack" => Some(0),
+                "defense" => Some(1),
+                "hp" | "gold" | "experience" | "yellow" | "blue" | "red" | "level" => None,
+                _ => return None,
+            };
+            if let Some(target) = target {
+                let repeated = u128::from(effect.amount).checked_mul(MAX_GLOBAL_STATES as u128)?;
+                upper[target] = upper[target].checked_add(repeated)?;
+                choice_add_operations[target] = choice_add_operations[target].checked_add(1)?;
+            }
+        }
+        for (total, per_purchase) in add_operations.iter_mut().zip(choice_add_operations) {
+            add_fairy_add_operations(total, MAX_GLOBAL_STATES as u128, per_purchase)?;
+        }
+    }
+
+    // A fairy can scale every positive addition placed before it. Applying
+    // all additions before all fairies is an upper bound. The runtime gate is
+    // disabled until all fairy slots are consumed, so no exchange crosses the
+    // non-commuting transform itself.
+    for _ in &noncommuting_slots {
+        for value in &mut upper {
+            *value = value.checked_mul(4)?.checked_add(2)?.checked_div(3)?;
+        }
+    }
+    if upper.iter().any(|value| {
+        value
+            .checked_add(3)
+            .is_none_or(|v| v > MAX_EXACT_F64_INTEGER)
+    }) {
+        return None;
+    }
+    // Binary64 has p=53. At magnitudes <=2^32, every round-to-nearest error
+    // is at most half an ulp at the 2^32 binade, 2^(32-52-1)=2^-21. `N` is
+    // the per-field concrete-addition bound compiled above, not a 50k action
+    // count: one shop materialization may contribute several additions.
+    // With one fairy, early +3 creates an ideal +4 advantage. Across both
+    // trajectories, at most N additions per route plus the final delayed +3
+    // can erode it. Require the strict inequality (2*N+3)*2^-21 < 1. All
+    // relevant values are exact non-negative integers by the world envelope.
+    // Multiple fairies remain conditional rather than extending this proof.
+    let fairy_exchange_proven = noncommuting_slots.len() <= 1
+        && upper.iter().all(|value| *value <= FAIRY_EXCHANGE_ENVELOPE)
+        && add_operations
+            .into_iter()
+            .all(fairy_rounding_exchange_is_strictly_safe);
+    let word_len = slot_owners.len().div_ceil(64);
+    let mut required_consumed_words = vec![0_u64; word_len];
+    if !fairy_exchange_proven {
+        for slot in noncommuting_slots {
+            *required_consumed_words.get_mut(slot / 64)? |= 1_u64 << (slot % 64);
+        }
+    }
+    Some(CombatGemWorldProof {
+        required_consumed_words,
+        exact_upper: [upper[0] as f64, upper[1] as f64],
+    })
+}
+
+fn compile_combat_gem_certificate(
+    initial: &SolverState,
+    blocks: &[SolverBlock],
+    shops: &[CompiledShop],
+) -> CombatGemCertificate {
+    let mut certificate = CombatGemCertificate::empty(blocks);
+    let slot_count = blocks
+        .iter()
+        .filter_map(|block| block.state_slot)
+        .max()
+        .map_or(0, |slot| slot + 1);
+    let mut dependencies = vec![SlotDependency::default(); slot_count];
+    project_event_slot_dependencies(blocks, &mut dependencies);
+    let mut slot_owners = vec![0_u8; slot_count];
+    for block in blocks {
+        if let Some(slot) = block.state_slot
+            && let Some(count) = slot_owners.get_mut(slot)
+        {
+            *count = count.saturating_add(1);
+        }
+    }
+    let Some(world_proof) =
+        combat_gem_world_exchange_proof(initial, blocks, shops, &dependencies, &slot_owners)
+    else {
+        return certificate;
+    };
+    certificate.required_consumed_words = world_proof.required_consumed_words;
+    certificate.exact_upper = world_proof.exact_upper;
+
+    for (index, block) in blocks.iter().enumerate() {
+        let kind = match (block.id.as_str(), block.numeric_id) {
+            ("redGem", Some(27)) => CombatGemKind::Attack,
+            ("blueGem", Some(28)) => CombatGemKind::Defense,
+            _ => continue,
+        };
+        let Some(slot) = block.state_slot else {
+            continue;
+        };
+        let Some(dependency) = dependencies.get(slot) else {
+            continue;
+        };
+        let CompiledBlockRule::Resource { delta, meta } = compiled_rule(block) else {
+            continue;
+        };
+        if resource_unknown_wire_fields(block) {
+            continue;
+        }
+        let exact_delta = match kind {
+            CombatGemKind::Attack => delta.attack == 3.0 && delta.defense == 0.0,
+            CombatGemKind::Defense => delta.defense == 3.0 && delta.attack == 0.0,
+        } && delta.hp == 0.0
+            && delta.gold == 0
+            && delta.experience == 0
+            && delta.level == 0
+            && delta.yellow == 0
+            && delta.blue == 0
+            && delta.red == 0
+            && delta.multiply_hp == 1.0
+            && delta.multiply_attack == 1.0
+            && delta.multiply_defense == 1.0
+            && delta.inventory.is_empty();
+        let ordinary_consumption = meta.reads.consumed_slots
+            && meta.writes.consumed_slots
+            && meta.writes.monotone_structure_only;
+        let private_slot = slot_owners.get(slot) == Some(&1)
+            && !dependency.other_reads
+            && !dependency.other_set_true
+            && !dependency.set_false
+            && !dependency.replace
+            && !dependency.unknown;
+        let cell_isolated = blocks.iter().enumerate().all(|(other_index, other)| {
+            other_index == index
+                || other.floor != block.floor
+                || other.x != block.x
+                || other.y != block.y
+                || matches!(block_passability(other), BlockPassability::AlwaysFree)
+        });
+        if block.initial_active
+            && exact_delta
+            && ordinary_consumption
+            && private_slot
+            && cell_isolated
+        {
+            certificate.by_block[index] = Some(kind);
+        }
+    }
+    certificate
 }
 
 fn shop_cost_progression(choice: &CompiledShopChoice) -> Option<(u128, u128)> {
@@ -3283,6 +3731,42 @@ fn profile_record_accepted_semantic_trace(
     });
 }
 
+fn profile_record_search_quality(
+    state: &SolverState,
+    view: &ConnectivityView,
+    depth: u64,
+    terminal: bool,
+) {
+    profile_with_stats(|stats| {
+        *stats.accepted_depth_histogram.entry(depth).or_default() += 1;
+        let consumed = state
+            .consumed
+            .words
+            .iter()
+            .map(|word| u64::from(word.count_ones()))
+            .sum::<u64>();
+        *stats.consumed_slots_histogram.entry(consumed).or_default() += 1;
+        *stats
+            .boundary_count_histogram
+            .entry(view.boundaries.len() as u64)
+            .or_default() += 1;
+        *stats
+            .reachable_component_count_histogram
+            .entry(view.reachable_component_count as u64)
+            .or_default() += 1;
+        if terminal {
+            stats.first_terminal_depth.get_or_insert(depth);
+            let objective = NumericObjective::from_state(state);
+            if stats
+                .best_objective_seen
+                .is_none_or(|old| objective.cmp(old).is_gt())
+            {
+                stats.best_objective_seen = Some(objective);
+            }
+        }
+    });
+}
+
 impl PhaseAWorkItem {
     fn new(source_label: LabelId, action: PhaseAActionRef) -> Option<Self> {
         Some(Self {
@@ -3308,10 +3792,44 @@ fn phase_a_shop_choice_offset(shops: &[CompiledShop], shop_index: usize) -> Opti
 fn enqueue_phase_a_actions(
     queue: &mut VecDeque<PhaseAWorkItem>,
     source_label: LabelId,
+    source: &SolverState,
     view: &ConnectivityView,
     shops: &[CompiledShop],
+    combat_gems: &CombatGemCertificate,
+    combat_gem_gate_enabled: bool,
 ) {
     let started = profile_start();
+    if combat_gem_gate_enabled
+        && let Some(boundary) = view
+            .boundaries
+            .iter()
+            .find(|boundary| combat_gems.runtime_safe(boundary.index, source))
+    {
+        let Some(action) = PhaseAActionRef::block(boundary) else {
+            record_rule_fault("combat_gem_action_ref_invalid");
+            profile_with_stats(|stats| stats.forced_successor_faults += 1);
+            return;
+        };
+        let Some(item) = PhaseAWorkItem::new(source_label, action) else {
+            record_rule_fault("combat_gem_work_item_invalid");
+            profile_with_stats(|stats| stats.forced_successor_faults += 1);
+            return;
+        };
+        profile_with_stats(|stats| {
+            stats.forced_root_sources += 1;
+            stats.forced_pickups_enqueued += 1;
+            stats.ordinary_boundary_actions_suppressed +=
+                view.boundaries.len().saturating_sub(1) as u64;
+            stats.shop_actions_suppressed += shops
+                .iter()
+                .filter(|shop| view.shops.contains_key(&shop.shop_id))
+                .map(|shop| shop.choices.len() as u64)
+                .sum::<u64>();
+        });
+        queue.push_back(item);
+        profile_elapsed(started, |stats, nanos| stats.enqueue_actions_ns += nanos);
+        return;
+    }
     for boundary in &view.boundaries {
         if let Some(action) = PhaseAActionRef::block(boundary)
             && let Some(item) = PhaseAWorkItem::new(source_label, action)
@@ -3864,6 +4382,7 @@ struct ConnectivityView {
     boundaries: Vec<ReachBoundary>,
     shops: HashMap<String, ReachShop>,
     terminals: Vec<ReachTerminal>,
+    reachable_component_count: usize,
 }
 
 #[derive(Clone)]
@@ -4678,6 +5197,7 @@ impl ConnectivityIndex {
             boundaries,
             shops,
             terminals: reachable_terminals,
+            reachable_component_count: components.len(),
         }
     }
 
@@ -4818,6 +5338,7 @@ impl ConnectivityIndex {
             boundaries,
             shops,
             terminals: reachable_terminals,
+            reachable_component_count: components.len(),
         }
     }
 
@@ -5510,6 +6031,15 @@ fn materialize_pending_action_inner(
                     Some(next)
                 }
                 CompiledBlockRule::Resource { delta, .. } => {
+                    #[cfg(test)]
+                    if FORCE_CERTIFIED_GEM_MATERIALIZER_NONE.with(Cell::get)
+                        && matches!(
+                            (block.id.as_str(), block.numeric_id),
+                            ("redGem", Some(27)) | ("blueGem", Some(28))
+                        )
+                    {
+                        return None;
+                    }
                     let mut next = MaterializedCandidate {
                         state: clone_materialize_source(source),
                         route_action: None,
@@ -6099,6 +6629,7 @@ fn run_numeric_proof(
     terminals: &[(&str, (u64, u64))],
     shops: &[CompiledShop],
 ) -> PhaseAResult {
+    let combat_gems = compile_combat_gem_certificate(initial, blocks, shops);
     run_numeric_proof_with_stale_skip(
         initial,
         max_states,
@@ -6107,7 +6638,9 @@ fn run_numeric_proof(
         blocks,
         terminals,
         shops,
+        &combat_gems,
         true,
+        combat_gem_policy_enabled(),
     )
 }
 
@@ -6121,6 +6654,7 @@ fn run_numeric_proof_without_stale_skip(
     terminals: &[(&str, (u64, u64))],
     shops: &[CompiledShop],
 ) -> PhaseAResult {
+    let combat_gems = compile_combat_gem_certificate(initial, blocks, shops);
     run_numeric_proof_with_stale_skip(
         initial,
         max_states,
@@ -6129,6 +6663,33 @@ fn run_numeric_proof_without_stale_skip(
         blocks,
         terminals,
         shops,
+        &combat_gems,
+        false,
+        true,
+    )
+}
+
+#[cfg(test)]
+fn run_numeric_proof_without_combat_gem_gate(
+    initial: &SolverState,
+    max_states: usize,
+    connectivity: &ConnectivityIndex,
+    floors: &HashMap<String, SolverFloor>,
+    blocks: &[SolverBlock],
+    terminals: &[(&str, (u64, u64))],
+    shops: &[CompiledShop],
+) -> PhaseAResult {
+    let combat_gems = compile_combat_gem_certificate(initial, blocks, shops);
+    run_numeric_proof_with_stale_skip(
+        initial,
+        max_states,
+        connectivity,
+        floors,
+        blocks,
+        terminals,
+        shops,
+        &combat_gems,
+        true,
         false,
     )
 }
@@ -6141,7 +6702,9 @@ fn run_numeric_proof_with_stale_skip(
     blocks: &[SolverBlock],
     terminals: &[(&str, (u64, u64))],
     shops: &[CompiledShop],
+    combat_gems: &CombatGemCertificate,
     stale_skip_enabled: bool,
+    combat_gem_gate_enabled: bool,
 ) -> PhaseAResult {
     profile_set_phase(ProfilePhase::PhaseA);
     #[cfg(test)]
@@ -6164,6 +6727,11 @@ fn run_numeric_proof_with_stale_skip(
     }
     let mut queue = VecDeque::<PhaseAWorkItem>::new();
     let mut best: Option<NumericObjective> = None;
+    let (max_strategic_depth, max_work_items) = phase_a_benchmark_limits();
+    let mut label_depths =
+        (profiling_enabled() || max_strategic_depth.is_some()).then(Vec::<u32>::new);
+    let mut depth_cutoff = false;
+    let mut work_items_seen = 0_u64;
 
     // The initial connectivity scan both canonicalizes its accepted label and
     // supplies the first FIFO actions. No second representative-only scan is
@@ -6172,6 +6740,9 @@ fn run_numeric_proof_with_stale_skip(
     let initial_view = connectivity.view_phase_a(&initial, floors, blocks, terminals);
     (initial.floor, initial.x, initial.y) = initial_view.representative.clone();
     if let Some(initial_id) = store.accept(initial.clone()) {
+        if let Some(depths) = label_depths.as_mut() {
+            depths.push(0);
+        }
         profile_record_accepted_semantic_trace(&initial, None, blocks, shops);
         profile_phase5a1_accepted_state(
             &initial,
@@ -6187,11 +6758,38 @@ fn run_numeric_proof_with_stale_skip(
         if !initial_view.terminals.is_empty() {
             best = Some(NumericObjective::from_state(&initial));
         }
-        enqueue_phase_a_actions(&mut queue, initial_id, &initial_view, shops);
+        profile_record_search_quality(
+            &initial,
+            &initial_view,
+            0,
+            !initial_view.terminals.is_empty(),
+        );
+        if max_strategic_depth == Some(0) {
+            depth_cutoff = true;
+        } else {
+            enqueue_phase_a_actions(
+                &mut queue,
+                initial_id,
+                &initial,
+                &initial_view,
+                shops,
+                combat_gems,
+                combat_gem_gate_enabled,
+            );
+        }
         if store.labels.len() == max_states {
-            profile_with_stats(|stats| stats.phase_a_pending = queue.len() as u64);
+            profile_with_stats(|stats| {
+                stats.phase_a_pending = queue.len() as u64;
+                if depth_cutoff {
+                    // The depth harness may hit the ordinary 50k label cap
+                    // after it has already suppressed deeper successors. Its
+                    // original limiting condition remains depth, never a
+                    // fabricated Complete result based on an empty queue.
+                    stats.phase_a_limit_reason = Some("depth_budget_exhausted");
+                }
+            });
             return PhaseAResult {
-                outcome: if queue.is_empty() {
+                outcome: if queue.is_empty() && !depth_cutoff {
                     PhaseAOutcome::Complete(best)
                 } else {
                     PhaseAOutcome::BudgetExhausted
@@ -6202,6 +6800,17 @@ fn run_numeric_proof_with_stale_skip(
     }
 
     while let Some(work_item) = queue.pop_front() {
+        if max_work_items.is_some_and(|limit| work_items_seen >= limit) {
+            profile_with_stats(|stats| {
+                stats.phase_a_pending = queue.len().saturating_add(1) as u64;
+                stats.phase_a_limit_reason = Some("work_budget_exhausted");
+            });
+            return PhaseAResult {
+                outcome: PhaseAOutcome::BudgetExhausted,
+                explored: store.labels.len(),
+            };
+        }
+        work_items_seen += 1;
         profile_with_stats(|stats| stats.work_items_popped += 1);
         // Labels are append-only. A dominated source stays addressable, and
         // pop order remains FIFO even when a proved action is skipped.
@@ -6230,12 +6839,28 @@ fn run_numeric_proof_with_stale_skip(
             profile_materialize_attempt(MaterializeKind::Invalid, false, 0);
             continue;
         };
+        let source_depth = label_depths
+            .as_ref()
+            .and_then(|depths| depths.get(source_id.0))
+            .copied()
+            .unwrap_or(0);
+        let forced_combat_gem = combat_gem_gate_enabled
+            && combat_gems.runtime_safe(
+                usize::try_from(work_item.action.tagged_index).unwrap_or(usize::MAX),
+                &source,
+            );
         let Some(action) = work_item.action.pending_action(blocks, shops) else {
             profile_materialize_attempt(MaterializeKind::Invalid, false, 0);
             continue;
         };
         let Some(mut candidate) = materialize_pending_action(&source, action, blocks, shops, false)
         else {
+            if forced_combat_gem {
+                if rule_fault().is_none() {
+                    record_rule_fault("combat_gem_certificate_violation");
+                }
+                profile_with_stats(|stats| stats.forced_successor_faults += 1);
+            }
             continue;
         };
         // A successful candidate performs exactly one connectivity scan. Its
@@ -6244,6 +6869,13 @@ fn run_numeric_proof_with_stale_skip(
         let view = connectivity.view_phase_a(&candidate.state, floors, blocks, terminals);
         (candidate.state.floor, candidate.state.x, candidate.state.y) = view.representative.clone();
         if let Some(label_id) = store.accept(candidate.state.clone()) {
+            if let Some(depths) = label_depths.as_mut() {
+                debug_assert_eq!(depths.len(), label_id.0);
+                depths.push(source_depth.saturating_add(1));
+            }
+            if forced_combat_gem {
+                profile_with_stats(|stats| stats.forced_successor_accepted += 1);
+            }
             let node = candidate.state;
             profile_record_accepted_semantic_trace(&node, Some(work_item.action), blocks, shops);
             profile_phase5a1_accepted_state(
@@ -6264,11 +6896,38 @@ fn run_numeric_proof_with_stale_skip(
                     best = Some(objective);
                 }
             }
-            enqueue_phase_a_actions(&mut queue, label_id, &view, shops);
+            profile_record_search_quality(
+                &node,
+                &view,
+                u64::from(source_depth.saturating_add(1)),
+                !view.terminals.is_empty(),
+            );
+            let next_depth = source_depth.saturating_add(1);
+            if max_strategic_depth.is_some_and(|limit| next_depth >= limit) {
+                depth_cutoff = true;
+            } else {
+                enqueue_phase_a_actions(
+                    &mut queue,
+                    label_id,
+                    &node,
+                    &view,
+                    shops,
+                    combat_gems,
+                    combat_gem_gate_enabled,
+                );
+            }
             if store.labels.len() == max_states {
-                profile_with_stats(|stats| stats.phase_a_pending = queue.len() as u64);
+                profile_with_stats(|stats| {
+                    stats.phase_a_pending = queue.len() as u64;
+                    if depth_cutoff {
+                        // See the initial-label branch above: preserve the
+                        // harness's depth limit even when this label cap is
+                        // encountered in the same run.
+                        stats.phase_a_limit_reason = Some("depth_budget_exhausted");
+                    }
+                });
                 return PhaseAResult {
-                    outcome: if queue.is_empty() {
+                    outcome: if queue.is_empty() && !depth_cutoff {
                         PhaseAOutcome::Complete(best)
                     } else {
                         PhaseAOutcome::BudgetExhausted
@@ -6276,11 +6935,22 @@ fn run_numeric_proof_with_stale_skip(
                     explored: store.labels.len(),
                 };
             }
+        } else if forced_combat_gem {
+            profile_with_stats(|stats| stats.forced_successor_pareto_rejected += 1);
         }
     }
-    profile_with_stats(|stats| stats.phase_a_pending = 0);
+    profile_with_stats(|stats| {
+        stats.phase_a_pending = 0;
+        if depth_cutoff {
+            stats.phase_a_limit_reason = Some("depth_budget_exhausted");
+        }
+    });
     PhaseAResult {
-        outcome: PhaseAOutcome::Complete(best),
+        outcome: if depth_cutoff {
+            PhaseAOutcome::BudgetExhausted
+        } else {
+            PhaseAOutcome::Complete(best)
+        },
         explored: store.labels.len(),
     }
 }
@@ -7512,6 +8182,774 @@ mod tests {
             state_slot: Some(index),
             ..SolverBlock::fixture_defaults()
         }
+    }
+
+    fn combat_gem_fixture(index: usize, kind: CombatGemKind) -> SolverBlock {
+        let (id, numeric_id, delta) = match kind {
+            CombatGemKind::Attack => ("redGem", 27, json!({"attack":3.0})),
+            CombatGemKind::Defense => ("blueGem", 28, json!({"defense":3.0})),
+        };
+        SolverBlock {
+            floor: "F".into(),
+            x: index as u64 + 1,
+            y: 0,
+            id: id.into(),
+            kind: "resource".into(),
+            data: json!({"block_id":id,"floor_id":"F","x":index+1,"y":0,
+                "numeric_id":numeric_id,"kind":"resource","initial_active":true,"delta":delta}),
+            initial_active: true,
+            numeric_id: Some(numeric_id),
+            state_slot: Some(index),
+            rule: Arc::new(OnceLock::new()),
+        }
+    }
+
+    #[test]
+    fn combat_gem_certificate_is_exact_private_and_cell_isolated() {
+        let initial = terminal_node(10, 10, 10, "");
+        let red = combat_gem_fixture(0, CombatGemKind::Attack);
+        let blue = combat_gem_fixture(1, CombatGemKind::Defense);
+        let certificate =
+            compile_combat_gem_certificate(&initial, &[red.clone(), blue.clone()], &[]);
+        assert_eq!(certificate.kind(0), Some(CombatGemKind::Attack));
+        assert_eq!(certificate.kind(1), Some(CombatGemKind::Defense));
+
+        for (kind, data) in [
+            ("door", json!({"key_cost":{"yellow":1}})),
+            (
+                "enemy",
+                json!({"enemy":{"hp":1,"attack":1,"defense":0,"gold":0,"experience":0}}),
+            ),
+            ("event", json!({"event":{"id":"dialogue_once"}})),
+            ("transition", json!({"target":{"floor_id":"F","x":0,"y":0}})),
+            ("opaque", json!({})),
+            ("resource", json!({"delta":{"hp":1.0}})),
+        ] {
+            let mut blocker = SolverBlock {
+                floor: "F".into(),
+                x: 1,
+                y: 0,
+                id: "second".into(),
+                kind: kind.into(),
+                data,
+                state_slot: Some(1),
+                ..SolverBlock::fixture_defaults()
+            };
+            if kind == "opaque" {
+                blocker.state_slot = None;
+            }
+            assert_eq!(
+                compile_combat_gem_certificate(&initial, &[red.clone(), blocker], &[]).kind(0),
+                None,
+                "{kind}"
+            );
+        }
+        let terrain = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "ground".into(),
+            kind: "terrain".into(),
+            data: json!({}),
+            state_slot: None,
+            ..SolverBlock::fixture_defaults()
+        };
+        assert_eq!(
+            compile_combat_gem_certificate(&initial, &[red.clone(), terrain], &[]).kind(0),
+            Some(CombatGemKind::Attack)
+        );
+
+        let mut wrong = red.clone();
+        wrong.data = json!({"delta":{"attack":4.0}});
+        wrong.rule = Arc::new(OnceLock::new());
+        assert_eq!(
+            compile_combat_gem_certificate(&initial, &[wrong], &[]).kind(0),
+            None
+        );
+        let mut duplicate_slot = blue;
+        duplicate_slot.state_slot = Some(0);
+        assert_eq!(
+            compile_combat_gem_certificate(&initial, &[red, duplicate_slot], &[]).kind(0),
+            None
+        );
+    }
+
+    #[test]
+    fn combat_gem_certificate_rejects_event_dependency_and_unsafe_numeric_world() {
+        let initial = terminal_node(10, 10, 10, "");
+        let mut red = combat_gem_fixture(0, CombatGemKind::Attack);
+        red.floor = "MT23w".into();
+        red.x = 5;
+        red.y = 6;
+        let event = SolverBlock {
+            floor: "E".into(),
+            x: 0,
+            y: 0,
+            id: "gate".into(),
+            kind: "event".into(),
+            data: json!({"event":{"id":"wand_gate_retry"}}),
+            state_slot: Some(1),
+            ..SolverBlock::fixture_defaults()
+        };
+        assert_eq!(
+            compile_combat_gem_certificate(&initial, &[red.clone(), event], &[]).kind(0),
+            None
+        );
+
+        let mut shrinking = closure_fixture_block(1, json!({"multiply":{"attack":0.5}}));
+        shrinking.rule = Arc::new(OnceLock::new());
+        assert_eq!(
+            compile_combat_gem_certificate(&initial, &[red.clone(), shrinking], &[]).kind(0),
+            None
+        );
+        let mut state = terminal_node(10, 10, 10, "");
+        state.consumed = ConsumedBits::new(1);
+        let certificate = compile_combat_gem_certificate(&initial, &[red], &[]);
+        assert!(certificate.runtime_safe(0, &state));
+        state.attack = F64Bits(f64::INFINITY.to_bits());
+        assert!(!certificate.runtime_safe(0, &state));
+    }
+
+    #[test]
+    fn combat_gem_certificate_rejects_unknown_resource_wire_fields() {
+        let initial = terminal_node(10, 10, 10, "");
+        let mut unknown_top = combat_gem_fixture(0, CombatGemKind::Attack);
+        unknown_top.data["producer_extension"] = json!(true);
+        unknown_top.rule = Arc::new(OnceLock::new());
+        assert_eq!(
+            compile_combat_gem_certificate(&initial, &[unknown_top], &[]).kind(0),
+            None
+        );
+
+        let mut unknown_delta = combat_gem_fixture(0, CombatGemKind::Attack);
+        unknown_delta.data["delta"]["producer_extension"] = json!(1);
+        unknown_delta.rule = Arc::new(OnceLock::new());
+        assert_eq!(
+            compile_combat_gem_certificate(&initial, &[unknown_delta], &[]).kind(0),
+            None
+        );
+    }
+
+    fn audited_event_fixture(index: usize, id: &str) -> SolverBlock {
+        SolverBlock {
+            floor: "E".into(),
+            x: index as u64,
+            y: 0,
+            id: format!("event-{id}"),
+            kind: "event".into(),
+            data: json!({"event":{"id":id}}),
+            initial_active: true,
+            numeric_id: Some(10_000 + index as u64),
+            state_slot: Some(index),
+            rule: Arc::new(OnceLock::new()),
+        }
+    }
+
+    #[test]
+    fn combat_gem_slot_dependency_projection_is_fail_closed_for_every_effect() {
+        for (event_id, floor, x, y, expected) in [
+            ("wand_gate_retry", "MT23w", 5, 6, "read"),
+            ("cross_reward", "MT16", 5, 5, "true"),
+            ("princess_quest", "MT18", 11, 11, "false"),
+            ("fairy_mt0", "MT20", 6, 8, "reactivate"),
+            ("wand_gate_retry", "MT_1", 5, 2, "replace"),
+        ] {
+            let mut gem = combat_gem_fixture(0, CombatGemKind::Attack);
+            gem.floor = floor.into();
+            gem.x = x;
+            gem.y = y;
+            let event = audited_event_fixture(1, event_id);
+            let blocks = vec![gem, event];
+            let mut dependencies = vec![SlotDependency::default(); 2];
+            project_event_slot_dependencies(&blocks, &mut dependencies);
+            let dependency = &dependencies[0];
+            assert!(
+                match expected {
+                    "read" => dependency.other_reads,
+                    "true" => dependency.other_set_true,
+                    "false" | "reactivate" => dependency.set_false,
+                    "replace" => dependency.replace,
+                    _ => false,
+                },
+                "missing {expected} projection for {event_id}"
+            );
+            assert_eq!(
+                compile_combat_gem_certificate(&terminal_node(10, 10, 10, ""), &blocks, &[])
+                    .kind(0),
+                None,
+                "{expected} must reject the gem certificate"
+            );
+        }
+
+        let gem = combat_gem_fixture(0, CombatGemKind::Attack);
+        // Missing every audited coordinate makes the projection ambiguous;
+        // all slots must be invalidated rather than silently trusted.
+        let event = audited_event_fixture(1, "wand_gate_retry");
+        let blocks = vec![gem, event];
+        let mut dependencies = vec![SlotDependency::default(); 2];
+        project_event_slot_dependencies(&blocks, &mut dependencies);
+        assert!(dependencies.iter().all(|dependency| dependency.unknown));
+        assert_eq!(
+            compile_combat_gem_certificate(&terminal_node(10, 10, 10, ""), &blocks, &[]).kind(0),
+            None
+        );
+    }
+
+    #[test]
+    fn combat_gem_fairy_exchange_uses_proven_envelope_or_consumed_fallback() {
+        let gem = combat_gem_fixture(0, CombatGemKind::Attack);
+        let fairy = audited_event_fixture(1, "fairy_mt0");
+        let fairy_target = SolverBlock {
+            floor: "MT20".into(),
+            x: 6,
+            y: 8,
+            id: "fairy-target".into(),
+            kind: "opaque".into(),
+            data: json!({}),
+            initial_active: false,
+            numeric_id: Some(20_000),
+            state_slot: Some(2),
+            rule: Arc::new(OnceLock::new()),
+        };
+        let blocks = vec![gem, fairy, fairy_target];
+        let initial = terminal_node(10, 10, 10, "");
+        let certificate = compile_combat_gem_certificate(&initial, &blocks, &[]);
+        assert_eq!(certificate.kind(0), Some(CombatGemKind::Attack));
+        assert_eq!(certificate.required_consumed_words, vec![0]);
+
+        let mut state = initial;
+        state.consumed = ConsumedBits::new(3);
+        assert!(certificate.runtime_safe(0, &state));
+
+        // At the exact proven envelope, the worst-case pre-fairy sum is
+        // 3*2^30 and the post-fairy result is exactly 2^32.
+        let boundary_attack = 3_u64 * (1_u64 << 30) - 3;
+        let mut boundary = terminal_node(boundary_attack, 10, 10, "");
+        boundary.consumed = ConsumedBits::new(3);
+        let boundary_certificate = compile_combat_gem_certificate(&boundary, &blocks, &[]);
+        assert_eq!(boundary_certificate.required_consumed_words, vec![0]);
+        assert!(boundary_certificate.runtime_safe(0, &boundary));
+
+        // One integer above the sufficient domain does not weaken the
+        // certificate. It reverts to requiring the fairy's permanent bit.
+        let mut above = terminal_node(boundary_attack + 1, 10, 10, "");
+        above.consumed = ConsumedBits::new(3);
+        let above_certificate = compile_combat_gem_certificate(&above, &blocks, &[]);
+        assert_eq!(above_certificate.required_consumed_words, vec![0b10]);
+        assert!(!above_certificate.runtime_safe(0, &above));
+        above.consumed.set(1, true).unwrap();
+        assert!(above_certificate.runtime_safe(0, &above));
+
+        state.consumed.set(1, true).unwrap();
+        assert!(certificate.runtime_safe(0, &state));
+    }
+
+    fn fairy_shop_with_attack_effects(effect_count: usize) -> Vec<CompiledShop> {
+        let effects = (0..effect_count)
+            .map(|_| json!({"field":"attack","amount":1}))
+            .collect::<Vec<_>>();
+        vec![
+            compile_shop(&json!({
+                "shop_id":"fairy-boundary-shop",
+                "choices":[{
+                    "choice_id":"fairy-boundary-shop:attack",
+                    "currency":"gold",
+                    "base_cost":1,
+                    "increment_per_purchase":0,
+                    "purchase_count":0,
+                    "effects":effects,
+                }],
+            }))
+            .unwrap(),
+        ]
+    }
+
+    #[test]
+    fn combat_gem_fairy_exchange_counts_every_shop_effect_operation() {
+        let gem = combat_gem_fixture(0, CombatGemKind::Attack);
+        let fairy = audited_event_fixture(1, "fairy_mt0");
+        let fairy_target = SolverBlock {
+            floor: "MT20".into(),
+            x: 6,
+            y: 8,
+            id: "fairy-target".into(),
+            kind: "opaque".into(),
+            data: json!({}),
+            initial_active: false,
+            numeric_id: Some(20_000),
+            state_slot: Some(2),
+            rule: Arc::new(OnceLock::new()),
+        };
+        let blocks = vec![gem, fairy, fairy_target];
+        let initial = terminal_node(10, 10, 10, "");
+
+        // N = 1 gem addition + 20 * 50,000 shop effects. This is below the
+        // strict (2*N+3) < 2^21 bound, so a live fairy does not block it.
+        let inside =
+            compile_combat_gem_certificate(&initial, &blocks, &fairy_shop_with_attack_effects(20));
+        assert_eq!(inside.required_consumed_words, vec![0]);
+
+        // N = 1 + 21 * 50,000 exceeds the same strict bound. Counting only
+        // purchases (50k) would falsely accept this; the fairy must instead
+        // be permanently consumed before the gem can be forced.
+        let outside =
+            compile_combat_gem_certificate(&initial, &blocks, &fairy_shop_with_attack_effects(21));
+        assert_eq!(outside.required_consumed_words, vec![0b10]);
+    }
+
+    #[test]
+    fn combat_gem_fairy_operation_count_overflow_is_fail_closed() {
+        let mut count = u128::MAX;
+        assert!(add_fairy_add_operations(&mut count, 1, 1).is_none());
+        assert!(!fairy_rounding_exchange_is_strictly_safe(u128::MAX));
+        assert!(!fairy_rounding_exchange_is_strictly_safe(
+            (FAIRY_ROUNDING_ERROR_DENOMINATOR - 3) / 2 + 1
+        ));
+    }
+
+    #[test]
+    fn combat_gem_two_pow_53_rounding_counterexample_is_not_forced() {
+        let gem = combat_gem_fixture(0, CombatGemKind::Attack);
+        let mut plus_one = closure_fixture_block(1, json!({"attack":1.0}));
+        plus_one.x = 0;
+        plus_one.y = 1;
+        let blocks = vec![gem, plus_one];
+        let floors = HashMap::from([(
+            "F".into(),
+            SolverFloor {
+                width: 3,
+                height: 2,
+                cells: [(0, 0), (1, 0), (2, 0), (0, 1)].into_iter().collect(),
+                blocks: vec![0, 1],
+            },
+        )]);
+        let connectivity = ConnectivityIndex::new(&floors, &blocks);
+        let mut initial = terminal_node((1_u64 << 53) - 2, 10, 100, "");
+        initial.consumed = ConsumedBits::new(2);
+        let certificate = compile_combat_gem_certificate(&initial, &blocks, &[]);
+        assert_eq!(certificate.kind(0), None);
+        let terminals = [("F", (2, 0))];
+        let gated = run_numeric_proof(
+            &initial,
+            64,
+            &connectivity,
+            &floors,
+            &blocks,
+            &terminals,
+            &[],
+        );
+        let oracle = run_numeric_proof_without_combat_gem_gate(
+            &initial,
+            64,
+            &connectivity,
+            &floors,
+            &blocks,
+            &terminals,
+            &[],
+        );
+        let (
+            PhaseAOutcome::Complete(Some(gated_target)),
+            PhaseAOutcome::Complete(Some(oracle_target)),
+        ) = (gated.outcome, oracle.outcome)
+        else {
+            panic!("both searches must complete")
+        };
+        assert!(gated_target.matches(oracle_target));
+        assert_eq!(
+            gated_target.attack_and_defense,
+            ((1_u64 << 53) + 2) as f64 + 10.0
+        );
+    }
+
+    #[test]
+    fn combat_gem_gate_enqueues_only_first_stable_gem_and_uses_normal_materializer() {
+        let red = combat_gem_fixture(0, CombatGemKind::Attack);
+        let blue = combat_gem_fixture(1, CombatGemKind::Defense);
+        let ordinary = closure_fixture_block(2, json!({"hp":10.0}));
+        let blocks = vec![red, blue, ordinary];
+        let mut state = terminal_node(10, 10, 100, "");
+        state.consumed = ConsumedBits::new(3);
+        let certificate = compile_combat_gem_certificate(&state, &blocks, &[]);
+        let view = ConnectivityView {
+            representative: ("F".into(), 0, 0),
+            boundaries: vec![
+                ReachBoundary {
+                    index: 0,
+                    adjacent: (0, 0),
+                    navigation: vec![],
+                },
+                ReachBoundary {
+                    index: 1,
+                    adjacent: (0, 0),
+                    navigation: vec![],
+                },
+                ReachBoundary {
+                    index: 2,
+                    adjacent: (0, 0),
+                    navigation: vec![],
+                },
+            ],
+            shops: HashMap::new(),
+            terminals: vec![],
+            reachable_component_count: 1,
+        };
+        let mut queue = VecDeque::new();
+        enqueue_phase_a_actions(
+            &mut queue,
+            LabelId(0),
+            &state,
+            &view,
+            &[],
+            &certificate,
+            true,
+        );
+        assert_eq!(queue.len(), 1);
+        let action = queue
+            .pop_front()
+            .unwrap()
+            .action
+            .pending_action(&blocks, &[])
+            .unwrap();
+        let candidate = materialize_pending_action(&state, action, &blocks, &[], false).unwrap();
+        assert_eq!(candidate.state.attack.get(), 13.0);
+        assert_eq!(candidate.state.consumed.read(0), Some(true));
+
+        let mut ordinary_queue = VecDeque::new();
+        enqueue_phase_a_actions(
+            &mut ordinary_queue,
+            LabelId(0),
+            &state,
+            &view,
+            &[],
+            &certificate,
+            false,
+        );
+        assert_eq!(ordinary_queue.len(), 3);
+    }
+
+    #[test]
+    fn combat_gem_gate_five_root_suppresses_door_enemies_potion_and_shop() {
+        let gem = combat_gem_fixture(0, CombatGemKind::Attack);
+        let mut blocks = vec![gem];
+        for (index, (kind, data)) in [
+            ("door", json!({"key_cost":{"yellow":1}})),
+            (
+                "enemy",
+                json!({"enemy":{"hp":1,"attack":1,"defense":0,"gold":0,"experience":0}}),
+            ),
+            (
+                "enemy",
+                json!({"enemy":{"hp":2,"attack":1,"defense":0,"gold":0,"experience":0}}),
+            ),
+            ("resource", json!({"delta":{"hp":10.0}})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            blocks.push(SolverBlock {
+                floor: "F".into(),
+                x: index as u64 + 2,
+                y: 0,
+                id: format!("root-{index}"),
+                kind: kind.into(),
+                data,
+                state_slot: Some(index + 1),
+                ..SolverBlock::fixture_defaults()
+            });
+        }
+        let shops = vec![
+            compile_shop(&json!({"shop_id":"s","choices":[{
+            "choice_id":"c","currency":"gold","base_cost":1,"increment_per_purchase":0,
+            "purchase_count":0,"effect":{"field":"attack","amount":1}}]}))
+            .unwrap(),
+        ];
+        let mut state = terminal_node(10, 10, 100, "");
+        state.consumed = ConsumedBits::new(5);
+        state.shop_counts = Arc::new(vec![0]);
+        let certificate = compile_combat_gem_certificate(&state, &blocks, &shops);
+        let view = ConnectivityView {
+            representative: ("F".into(), 0, 0),
+            boundaries: (0..5)
+                .map(|index| ReachBoundary {
+                    index,
+                    adjacent: (0, 0),
+                    navigation: vec![],
+                })
+                .collect(),
+            shops: HashMap::from([(
+                "s".into(),
+                ReachShop {
+                    block_index: 0,
+                    floor: "F".into(),
+                    adjacent: (0, 0),
+                    navigation: vec![],
+                },
+            )]),
+            terminals: vec![],
+            reachable_component_count: 1,
+        };
+        let mut queue = VecDeque::new();
+        enqueue_phase_a_actions(
+            &mut queue,
+            LabelId(0),
+            &state,
+            &view,
+            &shops,
+            &certificate,
+            true,
+        );
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].action.tagged_index, 0);
+    }
+
+    #[test]
+    fn event_boundary_hides_gem_and_does_not_trigger_root_gate() {
+        let event = SolverBlock {
+            floor: "F".into(),
+            x: 1,
+            y: 0,
+            id: "event".into(),
+            kind: "event".into(),
+            data: json!({"event":{"id":"dialogue_once"}}),
+            state_slot: Some(0),
+            ..SolverBlock::fixture_defaults()
+        };
+        let mut gem = combat_gem_fixture(1, CombatGemKind::Attack);
+        gem.x = 2;
+        let blocks = vec![event, gem];
+        let floors = HashMap::from([(
+            "F".into(),
+            SolverFloor {
+                width: 3,
+                height: 1,
+                cells: [(0, 0), (1, 0), (2, 0)].into_iter().collect(),
+                blocks: vec![0, 1],
+            },
+        )]);
+        let connectivity = ConnectivityIndex::new(&floors, &blocks);
+        let mut state = terminal_node(10, 10, 100, "");
+        state.consumed = ConsumedBits::new(2);
+        let certificate = compile_combat_gem_certificate(&state, &blocks, &[]);
+        assert_eq!(certificate.kind(1), Some(CombatGemKind::Attack));
+        let view = connectivity.view_phase_a(&state, &floors, &blocks, &[]);
+        assert_eq!(
+            view.boundaries.iter().map(|b| b.index).collect::<Vec<_>>(),
+            vec![0]
+        );
+        let mut queue = VecDeque::new();
+        enqueue_phase_a_actions(
+            &mut queue,
+            LabelId(0),
+            &state,
+            &view,
+            &[],
+            &certificate,
+            true,
+        );
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].action.tagged_index, 0);
+    }
+
+    #[test]
+    fn combat_gem_gate_complete_oracle_preserves_objective_and_phase_b_route() {
+        let gem = combat_gem_fixture(0, CombatGemKind::Attack);
+        let blocks = vec![gem];
+        let floors = HashMap::from([(
+            "F".into(),
+            SolverFloor {
+                width: 3,
+                height: 1,
+                cells: [(0, 0), (1, 0), (2, 0)].into_iter().collect(),
+                blocks: vec![0],
+            },
+        )]);
+        let connectivity = ConnectivityIndex::new(&floors, &blocks);
+        let mut initial = terminal_node(10, 10, 100, "");
+        initial.consumed = ConsumedBits::new(1);
+        let terminals = [("F", (2, 0))];
+        clear_rule_fault();
+        let gated = run_numeric_proof(
+            &initial,
+            32,
+            &connectivity,
+            &floors,
+            &blocks,
+            &terminals,
+            &[],
+        );
+        clear_rule_fault();
+        let oracle = run_numeric_proof_without_combat_gem_gate(
+            &initial,
+            32,
+            &connectivity,
+            &floors,
+            &blocks,
+            &terminals,
+            &[],
+        );
+        let (
+            PhaseAOutcome::Complete(Some(gated_target)),
+            PhaseAOutcome::Complete(Some(oracle_target)),
+        ) = (gated.outcome, oracle.outcome)
+        else {
+            panic!("both searches must complete")
+        };
+        assert!(gated_target.matches(oracle_target));
+        let gated_route = extract_route_witness(
+            &initial,
+            gated_target,
+            32,
+            &connectivity,
+            &floors,
+            &blocks,
+            &terminals,
+            &[],
+        );
+        let oracle_route = extract_route_witness(
+            &initial,
+            oracle_target,
+            32,
+            &connectivity,
+            &floors,
+            &blocks,
+            &terminals,
+            &[],
+        );
+        let (
+            Phase2Outcome::Found {
+                route: gated_route, ..
+            },
+            Phase2Outcome::Found {
+                route: oracle_route,
+                ..
+            },
+        ) = (gated_route, oracle_route)
+        else {
+            panic!("both routes must be witnessed")
+        };
+        assert_eq!(gated_route.steps, oracle_route.steps);
+        assert_eq!(
+            NumericObjective::from_state(
+                &replay_phase2_route(&initial, &gated_route, &blocks, &[]).unwrap()
+            )
+            .cmp(oracle_target),
+            Ordering::Equal
+        );
+
+        let gated_budget = run_numeric_proof(
+            &initial,
+            1,
+            &connectivity,
+            &floors,
+            &blocks,
+            &terminals,
+            &[],
+        );
+        let oracle_budget = run_numeric_proof_without_combat_gem_gate(
+            &initial,
+            1,
+            &connectivity,
+            &floors,
+            &blocks,
+            &terminals,
+            &[],
+        );
+        assert!(matches!(
+            gated_budget.outcome,
+            PhaseAOutcome::BudgetExhausted
+        ));
+        assert!(matches!(
+            oracle_budget.outcome,
+            PhaseAOutcome::BudgetExhausted
+        ));
+    }
+
+    #[test]
+    fn combat_gem_gate_fairy_exchange_oracle_keeps_the_strictly_better_route() {
+        let gem = combat_gem_fixture(0, CombatGemKind::Attack);
+        let mut fairy = audited_event_fixture(1, "fairy_mt0");
+        fairy.floor = "F".into();
+        fairy.x = 0;
+        fairy.y = 1;
+        let fairy_target = SolverBlock {
+            floor: "MT20".into(),
+            x: 6,
+            y: 8,
+            id: "fairy-target".into(),
+            kind: "opaque".into(),
+            data: json!({}),
+            initial_active: false,
+            numeric_id: Some(20_000),
+            state_slot: Some(2),
+            rule: Arc::new(OnceLock::new()),
+        };
+        let blocks = vec![gem, fairy, fairy_target];
+        let floors = HashMap::from([(
+            "F".into(),
+            SolverFloor {
+                width: 3,
+                height: 2,
+                cells: [(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)]
+                    .into_iter()
+                    .collect(),
+                blocks: vec![0, 1],
+            },
+        )]);
+        let connectivity = ConnectivityIndex::new(&floors, &blocks);
+        let mut initial = terminal_node(30, 30, 30, "");
+        initial.inventory = Arc::new(vec![("cross".into(), 1)]);
+        initial.consumed = ConsumedBits::from_bools(&[false, false, true]);
+        let terminals = [("F", (2, 0))];
+        clear_rule_fault();
+        let gated = run_numeric_proof(
+            &initial,
+            64,
+            &connectivity,
+            &floors,
+            &blocks,
+            &terminals,
+            &[],
+        );
+        clear_rule_fault();
+        let oracle = run_numeric_proof_without_combat_gem_gate(
+            &initial,
+            64,
+            &connectivity,
+            &floors,
+            &blocks,
+            &terminals,
+            &[],
+        );
+        let (
+            PhaseAOutcome::Complete(Some(gated_target)),
+            PhaseAOutcome::Complete(Some(oracle_target)),
+        ) = (gated.outcome, oracle.outcome)
+        else {
+            panic!("both fairy searches must complete")
+        };
+        assert!(gated_target.matches(oracle_target));
+        assert_eq!(gated_target.attack_and_defense, 84.0);
+        let gated_route = extract_route_witness(
+            &initial,
+            gated_target,
+            64,
+            &connectivity,
+            &floors,
+            &blocks,
+            &terminals,
+            &[],
+        );
+        let Phase2Outcome::Found { route, .. } = gated_route else {
+            panic!("better fairy route must be witnessed")
+        };
+        assert_eq!(route.steps[0]["block_id"], "redGem");
+        assert_eq!(
+            NumericObjective::from_state(
+                &replay_phase2_route(&initial, &route, &blocks, &[]).unwrap()
+            )
+            .cmp(oracle_target),
+            Ordering::Equal
+        );
     }
 
     #[test]
@@ -8793,6 +10231,7 @@ mod tests {
                 },
             )]),
             terminals: Vec::new(),
+            reachable_component_count: 1,
         };
         let shops = vec![
             compile_shop(&json!({"shop_id":"first","choices":[
@@ -8804,7 +10243,21 @@ mod tests {
             ]})).unwrap(),
         ];
         let mut queue = VecDeque::new();
-        enqueue_phase_a_actions(&mut queue, LabelId(4), &view, &shops);
+        let state = terminal_node(1, 1, 1, "");
+        let certificate = CombatGemCertificate {
+            by_block: vec![],
+            required_consumed_words: vec![],
+            exact_upper: [0.0; 2],
+        };
+        enqueue_phase_a_actions(
+            &mut queue,
+            LabelId(4),
+            &state,
+            &view,
+            &shops,
+            &certificate,
+            false,
+        );
         let trace: Vec<_> = queue
             .into_iter()
             .map(|item| {
@@ -10192,6 +11645,46 @@ mod tests {
             "keys":{"yellow":0,"blue":0,"red":0},"blocks":[],
             "engine_model":{"inventory":{"classes":{},"key_slots":{"yellow":"yellowKey","blue":"blueKey","red":"redKey"}},"solver_model":solver}
         })
+    }
+
+    fn certified_gem_observation() -> Value {
+        serde_json::from_str(
+            r#"{
+              "session_id":"S","floor_id":"F","map_instance_id":"M",
+              "dimensions":{"width":3,"height":1},"topology":{"kind":"rectangle"},
+              "hero":{"hp":30,"attack":10,"defense":10,"gold":0,"experience":0,"loc":{"x":0,"y":0}},
+              "keys":{"yellow":0,"blue":0,"red":0},"blocks":[],
+              "engine_model":{"inventory":{"classes":{}},"solver_model":{
+                "protocol":1,"search_budget":16,
+                "terminal":{"kind":"location","floor_id":"F","x":2,"y":0},
+                "blockers":[],"shops":[],
+                "floors":[{"floor_id":"F","width":3,"height":1,"topology":{"kind":"rectangle"},"blocks":[
+                  {"floor_id":"F","x":1,"y":0,"block_id":"redGem","numeric_id":27,"kind":"resource",
+                   "delta":{"hp":0,"attack":3,"defense":0,"gold":0,"experience":0,
+                            "keys":{"yellow":0,"blue":0,"red":0},"inventory":{}}}
+                ]}]
+              }}
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn certified_gem_materializer_contract_violation_is_globally_unsupported() {
+        struct ResetMaterializerHook;
+        impl Drop for ResetMaterializerHook {
+            fn drop(&mut self) {
+                FORCE_CERTIFIED_GEM_MATERIALIZER_NONE.with(|enabled| enabled.set(false));
+            }
+        }
+        let _reset = ResetMaterializerHook;
+        FORCE_CERTIFIED_GEM_MATERIALIZER_NONE.with(|enabled| enabled.set(true));
+        clear_rule_fault();
+        let response = global_analysis(certified_gem_observation().as_object().unwrap());
+        assert_eq!(response["proof"], "unsupported");
+        assert_eq!(response["reason"], "combat_gem_certificate_violation");
+        assert_eq!(response["route"], Value::Null);
+        assert_eq!(response["first_suggestion"], Value::Null);
     }
 
     fn two_terminal_routes(search_budget: u64) -> Value {
