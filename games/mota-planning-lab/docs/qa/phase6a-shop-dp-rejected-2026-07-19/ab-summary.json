@@ -1,0 +1,73 @@
+{
+  "schema": "mota-phase25-profile-v1",
+  "request": {
+    "sha256": "508b4d25557b0c30b649d5e923a5ec9fa3470dc8555d8d49e3dcb9bad98ba55e",
+    "bytes": 2576604
+  },
+  "versions": {
+    "baseline": {
+      "binary": "/private/tmp/mota-phase6a-baseline.xRBYl9/target/release/mota-shadow-runtime",
+      "binary_sha256": "6b7579887e358c63f8f30f4b0dc70ce3852f405b3c1598f64307820c24c61f9e",
+      "source": "/private/tmp/mota-phase6a-baseline.xRBYl9/games/mota-planning-lab/rust/shadow-runtime/src/main.rs",
+      "source_sha256": "34e264869b4a7aa8475ff58b07c3485b5b8ff177357c1de7d0f7da7899fbb460"
+    },
+    "candidate": {
+      "binary": "/private/tmp/mota-phase6a-candidate-target/release/mota-shadow-runtime",
+      "binary_sha256": "74f3fe16b9d21069e6dd6c709ce55096435f6a1b1fef88f0cd8c90856da8a3c5",
+      "source": "/Users/nihplod/Documents/codes/frontend/scripts/userscripts/games/mota-planning-lab/rust/shadow-runtime/src/main.rs",
+      "source_sha256": "88d67f07fd64790e39657e1f75bc77d60ca3b777c3fded3f43c38a3748edd941"
+    }
+  },
+  "method": {
+    "warmups_per_version": 1,
+    "official_samples_per_version": 7,
+    "order": [
+      "baseline",
+      "candidate",
+      "baseline",
+      "candidate",
+      "baseline",
+      "candidate",
+      "baseline",
+      "candidate",
+      "baseline",
+      "candidate",
+      "baseline",
+      "candidate",
+      "baseline",
+      "candidate"
+    ],
+    "request": "pure POST /cycle",
+    "rss": "service PID sampled every 10 ms",
+    "canonical_response": "sorted JSON with shadow.cycle removed"
+  },
+  "results": {
+    "baseline": {
+      "median_post_ms": 1230.3189588710666,
+      "p95_post_ms": 1244.641983229667,
+      "max_post_ms": 1245.4013330861926,
+      "median_rss_bytes": 50069504,
+      "p95_rss_bytes": 50244812.8,
+      "max_rss_bytes": 50249728,
+      "canonical_response_hashes": [
+        "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2"
+      ]
+    },
+    "candidate": {
+      "median_post_ms": 1267.0860830694437,
+      "p95_post_ms": 1280.2929079160094,
+      "max_post_ms": 1282.459832727909,
+      "median_rss_bytes": 46546944,
+      "p95_rss_bytes": 46691123.2,
+      "max_rss_bytes": 46710784,
+      "canonical_response_hashes": [
+        "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2"
+      ]
+    }
+  },
+  "profile_events": {
+    "baseline": [],
+    "candidate": []
+  },
+  "raw_samples_tsv": "/private/tmp/mota-phase6a-ab/samples.tsv"
+}
