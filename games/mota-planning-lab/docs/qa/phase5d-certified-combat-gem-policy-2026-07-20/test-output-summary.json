@@ -1,0 +1,57 @@
+[
+  {
+    "file": "cargo-fmt-check.txt",
+    "bytes": 0,
+    "tail": []
+  },
+  {
+    "file": "cargo-test-debug.txt",
+    "bytes": 12263,
+    "tail": [
+      "",
+      "test result: ok. 113 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s",
+      ""
+    ]
+  },
+  {
+    "file": "cargo-test-release.txt",
+    "bytes": 21882,
+    "tail": [
+      "",
+      "test result: ok. 113 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s",
+      ""
+    ]
+  },
+  {
+    "file": "git-diff-check.txt",
+    "bytes": 0,
+    "tail": []
+  },
+  {
+    "file": "js-loopback.txt",
+    "bytes": 539,
+    "tail": [
+      "\u2139 skipped 0",
+      "\u2139 todo 0",
+      "\u2139 duration_ms 13425.247167"
+    ]
+  },
+  {
+    "file": "js-targeted.txt",
+    "bytes": 362,
+    "tail": [
+      "\u2139 skipped 0",
+      "\u2139 todo 0",
+      "\u2139 duration_ms 75.679583"
+    ]
+  },
+  {
+    "file": "python-jsonschema.txt",
+    "bytes": 124,
+    "tail": [
+      "Traceback (most recent call last):",
+      "  File \"<string>\", line 1, in <module>",
+      "ModuleNotFoundError: No module named 'jsonschema'"
+    ]
+  }
+]

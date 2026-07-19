@@ -1,0 +1,2 @@
+lane	sample	status	post_ms	max_rss_bytes	canonical_sha256	proof	reason	explored_states
+D_final_gate_on_immediate_default_miss	warmup	200	1336.033834	46350336	af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2	unproven	search_budget_exhausted	50000

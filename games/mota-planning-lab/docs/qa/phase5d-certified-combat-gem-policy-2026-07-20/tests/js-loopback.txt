@@ -1,0 +1,12 @@
+✔ Rust Stage2B shadow runtime returns current-floor candidates without executable fields (3557.258209ms)
+✔ Rust shadow runtime accepts the direct-mount CORS preflight and CORS POST (3259.159333ms)
+✔ Rust shadow runtime rejects invalid actual POSTs before they advance the shadow cycle (3253.056084ms)
+✔ Rust shadow runtime accepts bounded multi-megabyte contract requests and rejects larger bodies (3286.496208ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 13425.247167

@@ -1,0 +1,546 @@
+{
+  "depth8": {
+    "B_final_gate_off": {
+      "sample": {
+        "status": 200,
+        "post_ms": 30.138499999999624,
+        "max_rss_bytes": 21872640,
+        "canonical_sha256": "ab5a62697e66b07dadc413797983ea2b715752e3004d50692f56946e0512723c",
+        "proof": "unproven",
+        "reason": "search_budget_exhausted",
+        "explored_states": 868,
+        "decision_mode": null,
+        "route_is_null": true,
+        "suggestion_kind": null,
+        "suggestion_block_id": null,
+        "sample": 1
+      },
+      "profile": {
+        "accepted_semantic_trace_hash": "925ebb6c076785d2",
+        "accepted": 868,
+        "rejected": 1618,
+        "pending": 0,
+        "popped": 6008,
+        "materialize_calls": 5612,
+        "connectivity_views": 2486,
+        "stale_source_work_items": 1174,
+        "region_traversals": 41380,
+        "portal_traversals": 44660,
+        "combat_gem_policy": {
+          "forced_pickups_enqueued": 0,
+          "forced_root_sources": 0,
+          "forced_successor_accepted": 0,
+          "forced_successor_faults": 0,
+          "forced_successor_pareto_rejected": 0,
+          "global_search_skipped": 0,
+          "immediate_safe_action_hits": 0,
+          "initial_phase_a_view_calls": 1,
+          "ordinary_boundary_actions_suppressed": 0,
+          "phase_a_store_creations": 1,
+          "shop_actions_suppressed": 0
+        },
+        "search_quality": {
+          "accepted_depth": {
+            "max": 8,
+            "p50": 7,
+            "p95": 8
+          },
+          "benchmark_limit_reason": "depth_budget_exhausted",
+          "best_objective_seen": null,
+          "boundary_count": {
+            "max": 11,
+            "p50": 8,
+            "p95": 10
+          },
+          "consumed_slots": {
+            "max": 20,
+            "p50": 19,
+            "p95": 20
+          },
+          "first_terminal_depth": null,
+          "reachable_component_count": {
+            "max": 5,
+            "p50": 5,
+            "p95": 5
+          }
+        },
+        "phase_b_explored": 0
+      }
+    },
+    "C_final_gate_on": {
+      "sample": {
+        "status": 200,
+        "post_ms": 20.440084000000525,
+        "max_rss_bytes": 21790720,
+        "canonical_sha256": "7480c769bf53ed26fd4419643765771c5900e0e2b5c8e6c69a86a22aba4788b4",
+        "proof": "unproven",
+        "reason": "search_budget_exhausted",
+        "explored_states": 446,
+        "decision_mode": null,
+        "route_is_null": true,
+        "suggestion_kind": null,
+        "suggestion_block_id": null,
+        "sample": 1
+      },
+      "profile": {
+        "accepted_semantic_trace_hash": "2b73093d8d358b0f",
+        "accepted": 446,
+        "rejected": 668,
+        "pending": 0,
+        "popped": 2659,
+        "materialize_calls": 2568,
+        "connectivity_views": 1114,
+        "stale_source_work_items": 284,
+        "region_traversals": 18316,
+        "portal_traversals": 18881,
+        "combat_gem_policy": {
+          "forced_pickups_enqueued": 37,
+          "forced_root_sources": 37,
+          "forced_successor_accepted": 15,
+          "forced_successor_faults": 0,
+          "forced_successor_pareto_rejected": 22,
+          "global_search_skipped": 0,
+          "immediate_safe_action_hits": 0,
+          "initial_phase_a_view_calls": 1,
+          "ordinary_boundary_actions_suppressed": 282,
+          "phase_a_store_creations": 1,
+          "shop_actions_suppressed": 111
+        },
+        "search_quality": {
+          "accepted_depth": {
+            "max": 8,
+            "p50": 7,
+            "p95": 8
+          },
+          "benchmark_limit_reason": "depth_budget_exhausted",
+          "best_objective_seen": null,
+          "boundary_count": {
+            "max": 11,
+            "p50": 8,
+            "p95": 9
+          },
+          "consumed_slots": {
+            "max": 20,
+            "p50": 19,
+            "p95": 20
+          },
+          "first_terminal_depth": null,
+          "reachable_component_count": {
+            "max": 5,
+            "p50": 5,
+            "p95": 5
+          }
+        },
+        "phase_b_explored": 0
+      }
+    }
+  },
+  "depth12": {
+    "B_final_gate_off": {
+      "sample": {
+        "status": 200,
+        "post_ms": 132.22608299999905,
+        "max_rss_bytes": 24248320,
+        "canonical_sha256": "de8f9e975b6c42876e84e9a947c350dc5bcebbdf67e22233ae0c6547cfba223f",
+        "proof": "unproven",
+        "reason": "search_budget_exhausted",
+        "explored_states": 5448,
+        "decision_mode": null,
+        "route_is_null": true,
+        "suggestion_kind": null,
+        "suggestion_block_id": null,
+        "sample": 1
+      },
+      "profile": {
+        "accepted_semantic_trace_hash": "24c6097998863e8b",
+        "accepted": 5448,
+        "rejected": 11411,
+        "pending": 0,
+        "popped": 37611,
+        "materialize_calls": 33764,
+        "connectivity_views": 16859,
+        "stale_source_work_items": 13242,
+        "region_traversals": 324737,
+        "portal_traversals": 382775,
+        "combat_gem_policy": {
+          "forced_pickups_enqueued": 0,
+          "forced_root_sources": 0,
+          "forced_successor_accepted": 0,
+          "forced_successor_faults": 0,
+          "forced_successor_pareto_rejected": 0,
+          "global_search_skipped": 0,
+          "immediate_safe_action_hits": 0,
+          "initial_phase_a_view_calls": 1,
+          "ordinary_boundary_actions_suppressed": 0,
+          "phase_a_store_creations": 1,
+          "shop_actions_suppressed": 0
+        },
+        "search_quality": {
+          "accepted_depth": {
+            "max": 12,
+            "p50": 11,
+            "p95": 12
+          },
+          "benchmark_limit_reason": "depth_budget_exhausted",
+          "best_objective_seen": null,
+          "boundary_count": {
+            "max": 13,
+            "p50": 8,
+            "p95": 12
+          },
+          "consumed_slots": {
+            "max": 24,
+            "p50": 23,
+            "p95": 24
+          },
+          "first_terminal_depth": null,
+          "reachable_component_count": {
+            "max": 5,
+            "p50": 5,
+            "p95": 5
+          }
+        },
+        "phase_b_explored": 0
+      }
+    },
+    "C_final_gate_on": {
+      "sample": {
+        "status": 200,
+        "post_ms": 71.49354199999891,
+        "max_rss_bytes": 23216128,
+        "canonical_sha256": "50c70b49f120235fee205a8260d85f8d56a7e3691d69f7255a03b98ea128fe09",
+        "proof": "unproven",
+        "reason": "search_budget_exhausted",
+        "explored_states": 2910,
+        "decision_mode": null,
+        "route_is_null": true,
+        "suggestion_kind": null,
+        "suggestion_block_id": null,
+        "sample": 1
+      },
+      "profile": {
+        "accepted_semantic_trace_hash": "ea3ad3c96af44c03",
+        "accepted": 2910,
+        "rejected": 5364,
+        "pending": 0,
+        "popped": 17758,
+        "materialize_calls": 16240,
+        "connectivity_views": 8274,
+        "stale_source_work_items": 5393,
+        "region_traversals": 159201,
+        "portal_traversals": 179999,
+        "combat_gem_policy": {
+          "forced_pickups_enqueued": 121,
+          "forced_root_sources": 121,
+          "forced_successor_accepted": 52,
+          "forced_successor_faults": 0,
+          "forced_successor_pareto_rejected": 69,
+          "global_search_skipped": 0,
+          "immediate_safe_action_hits": 0,
+          "initial_phase_a_view_calls": 1,
+          "ordinary_boundary_actions_suppressed": 1053,
+          "phase_a_store_creations": 1,
+          "shop_actions_suppressed": 363
+        },
+        "search_quality": {
+          "accepted_depth": {
+            "max": 12,
+            "p50": 11,
+            "p95": 12
+          },
+          "benchmark_limit_reason": "depth_budget_exhausted",
+          "best_objective_seen": null,
+          "boundary_count": {
+            "max": 12,
+            "p50": 8,
+            "p95": 11
+          },
+          "consumed_slots": {
+            "max": 24,
+            "p50": 23,
+            "p95": 24
+          },
+          "first_terminal_depth": null,
+          "reachable_component_count": {
+            "max": 5,
+            "p50": 5,
+            "p95": 5
+          }
+        },
+        "phase_b_explored": 0
+      }
+    }
+  },
+  "depth16": {
+    "B_final_gate_off": {
+      "sample": {
+        "status": 200,
+        "post_ms": 1335.4701660000003,
+        "max_rss_bytes": 49315840,
+        "canonical_sha256": "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2",
+        "proof": "unproven",
+        "reason": "search_budget_exhausted",
+        "explored_states": 50000,
+        "decision_mode": null,
+        "route_is_null": true,
+        "suggestion_kind": null,
+        "suggestion_block_id": null,
+        "sample": 1
+      },
+      "profile": {
+        "accepted_semantic_trace_hash": "7f0aeb674cd6f09f",
+        "accepted": 50000,
+        "rejected": 126119,
+        "pending": 41613,
+        "popped": 371918,
+        "materialize_calls": 312096,
+        "connectivity_views": 176119,
+        "stale_source_work_items": 219918,
+        "region_traversals": 3943594,
+        "portal_traversals": 4847678,
+        "combat_gem_policy": {
+          "forced_pickups_enqueued": 0,
+          "forced_root_sources": 0,
+          "forced_successor_accepted": 0,
+          "forced_successor_faults": 0,
+          "forced_successor_pareto_rejected": 0,
+          "global_search_skipped": 0,
+          "immediate_safe_action_hits": 0,
+          "initial_phase_a_view_calls": 1,
+          "ordinary_boundary_actions_suppressed": 0,
+          "phase_a_store_creations": 1,
+          "shop_actions_suppressed": 0
+        },
+        "search_quality": {
+          "accepted_depth": {
+            "max": 16,
+            "p50": 15,
+            "p95": 16
+          },
+          "benchmark_limit_reason": "depth_budget_exhausted",
+          "best_objective_seen": null,
+          "boundary_count": {
+            "max": 16,
+            "p50": 10,
+            "p95": 13
+          },
+          "consumed_slots": {
+            "max": 28,
+            "p50": 26,
+            "p95": 28
+          },
+          "first_terminal_depth": null,
+          "reachable_component_count": {
+            "max": 5,
+            "p50": 5,
+            "p95": 5
+          }
+        },
+        "phase_b_explored": 0
+      }
+    },
+    "C_final_gate_on": {
+      "sample": {
+        "status": 200,
+        "post_ms": 653.5172919999966,
+        "max_rss_bytes": 36241408,
+        "canonical_sha256": "30bbf6d20e2dad43c14d5b3050ef52429c0bcf6d8352d81e93e854c5c23e0640",
+        "proof": "unproven",
+        "reason": "search_budget_exhausted",
+        "explored_states": 26351,
+        "decision_mode": null,
+        "route_is_null": true,
+        "suggestion_kind": null,
+        "suggestion_block_id": null,
+        "sample": 1
+      },
+      "profile": {
+        "accepted_semantic_trace_hash": "c3032af8738b0d40",
+        "accepted": 26351,
+        "rejected": 61625,
+        "pending": 0,
+        "popped": 184306,
+        "materialize_calls": 156220,
+        "connectivity_views": 87976,
+        "stale_source_work_items": 101239,
+        "region_traversals": 1955096,
+        "portal_traversals": 2405608,
+        "combat_gem_policy": {
+          "forced_pickups_enqueued": 1035,
+          "forced_root_sources": 1035,
+          "forced_successor_accepted": 653,
+          "forced_successor_faults": 0,
+          "forced_successor_pareto_rejected": 382,
+          "global_search_skipped": 0,
+          "immediate_safe_action_hits": 0,
+          "initial_phase_a_view_calls": 1,
+          "ordinary_boundary_actions_suppressed": 10175,
+          "phase_a_store_creations": 1,
+          "shop_actions_suppressed": 3105
+        },
+        "search_quality": {
+          "accepted_depth": {
+            "max": 16,
+            "p50": 15,
+            "p95": 16
+          },
+          "benchmark_limit_reason": "depth_budget_exhausted",
+          "best_objective_seen": null,
+          "boundary_count": {
+            "max": 15,
+            "p50": 10,
+            "p95": 12
+          },
+          "consumed_slots": {
+            "max": 28,
+            "p50": 26,
+            "p95": 28
+          },
+          "first_terminal_depth": null,
+          "reachable_component_count": {
+            "max": 5,
+            "p50": 5,
+            "p95": 5
+          }
+        },
+        "phase_b_explored": 0
+      }
+    }
+  },
+  "work200k": {
+    "B_final_gate_off": {
+      "sample": {
+        "status": 200,
+        "post_ms": 737.7349169999974,
+        "max_rss_bytes": 42221568,
+        "canonical_sha256": "cb904380b8a4002e097f549fd8e2ebe7c9aa06754e95c1b9bff9f23a1e95c519",
+        "proof": "unproven",
+        "reason": "search_budget_exhausted",
+        "explored_states": 29037,
+        "decision_mode": null,
+        "route_is_null": true,
+        "suggestion_kind": null,
+        "suggestion_block_id": null,
+        "sample": 1
+      },
+      "profile": {
+        "accepted_semantic_trace_hash": "47aa3a070af61b08",
+        "accepted": 29037,
+        "rejected": 67710,
+        "pending": 175541,
+        "popped": 200000,
+        "materialize_calls": 170814,
+        "connectivity_views": 96747,
+        "stale_source_work_items": 106091,
+        "region_traversals": 2099934,
+        "portal_traversals": 2506329,
+        "combat_gem_policy": {
+          "forced_pickups_enqueued": 0,
+          "forced_root_sources": 0,
+          "forced_successor_accepted": 0,
+          "forced_successor_faults": 0,
+          "forced_successor_pareto_rejected": 0,
+          "global_search_skipped": 0,
+          "immediate_safe_action_hits": 0,
+          "initial_phase_a_view_calls": 1,
+          "ordinary_boundary_actions_suppressed": 0,
+          "phase_a_store_creations": 1,
+          "shop_actions_suppressed": 0
+        },
+        "search_quality": {
+          "accepted_depth": {
+            "max": 15,
+            "p50": 14,
+            "p95": 15
+          },
+          "benchmark_limit_reason": "work_budget_exhausted",
+          "best_objective_seen": null,
+          "boundary_count": {
+            "max": 16,
+            "p50": 10,
+            "p95": 12
+          },
+          "consumed_slots": {
+            "max": 27,
+            "p50": 25,
+            "p95": 27
+          },
+          "first_terminal_depth": null,
+          "reachable_component_count": {
+            "max": 5,
+            "p50": 5,
+            "p95": 5
+          }
+        },
+        "phase_b_explored": 0
+      }
+    },
+    "C_final_gate_on": {
+      "sample": {
+        "status": 200,
+        "post_ms": 723.4116670000005,
+        "max_rss_bytes": 38010880,
+        "canonical_sha256": "a6662e38c7b420e9db61c40ece72cbd870f4373f217506f4500962efeb44d1e6",
+        "proof": "unproven",
+        "reason": "search_budget_exhausted",
+        "explored_states": 28546,
+        "decision_mode": null,
+        "route_is_null": true,
+        "suggestion_kind": null,
+        "suggestion_block_id": null,
+        "sample": 1
+      },
+      "profile": {
+        "accepted_semantic_trace_hash": "cf3c8f472cc35285",
+        "accepted": 28546,
+        "rejected": 65687,
+        "pending": 136092,
+        "popped": 200000,
+        "materialize_calls": 168954,
+        "connectivity_views": 94233,
+        "stale_source_work_items": 114095,
+        "region_traversals": 2098497,
+        "portal_traversals": 2585624,
+        "combat_gem_policy": {
+          "forced_pickups_enqueued": 1774,
+          "forced_root_sources": 1774,
+          "forced_successor_accepted": 739,
+          "forced_successor_faults": 0,
+          "forced_successor_pareto_rejected": 428,
+          "global_search_skipped": 0,
+          "immediate_safe_action_hits": 0,
+          "initial_phase_a_view_calls": 1,
+          "ordinary_boundary_actions_suppressed": 17972,
+          "phase_a_store_creations": 1,
+          "shop_actions_suppressed": 5322
+        },
+        "search_quality": {
+          "accepted_depth": {
+            "max": 17,
+            "p50": 15,
+            "p95": 17
+          },
+          "benchmark_limit_reason": "work_budget_exhausted",
+          "best_objective_seen": null,
+          "boundary_count": {
+            "max": 15,
+            "p50": 10,
+            "p95": 12
+          },
+          "consumed_slots": {
+            "max": 29,
+            "p50": 27,
+            "p95": 28
+          },
+          "first_terminal_depth": null,
+          "reachable_component_count": {
+            "max": 5,
+            "p50": 5,
+            "p95": 5
+          }
+        },
+        "phase_b_explored": 0
+      }
+    }
+  }
+}

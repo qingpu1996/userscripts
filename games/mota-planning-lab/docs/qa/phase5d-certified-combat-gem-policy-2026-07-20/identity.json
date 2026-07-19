@@ -1,0 +1,24 @@
+{
+  "baseline_commit": "6fa0f193878b343a0f3dc925e53bda78e3c68a07",
+  "commit1": "e04c5b00ed6d4471513d19a133e4550078167c4d",
+  "final_commit": "9969126b6e6702709693298b19193f54e6747002",
+  "baseline_source_sha256": "34e264869b4a7aa8475ff58b07c3485b5b8ff177357c1de7d0f7da7899fbb460",
+  "commit1_source_sha256": "0d0291b4c31eb007c8613a4bc9a9d1382290ab77f94fa4236ed6aaabaedd9302",
+  "final_source_sha256": "8ccb6a1ffda454c0a3964dc7c7a5972a08137c72095898e4f08747cbe39cfbe2",
+  "baseline_binary_sha256": "4a0fbc3abcab103689500cb0fb7360c89cb81e9b0b33ee719e32e2714d73843f",
+  "commit1_binary_sha256": "a2ee50ab74875b008fa4f446d79307829b056a26171beedad0b304a7d712c749",
+  "final_binary_sha256": "ffa2a6969b42fb50f2b65cd4d457d958de6dbb73aa43f57e1716db300ec88fe0",
+  "official_request_sha256": "508b4d25557b0c30b649d5e923a5ec9fa3470dc8555d8d49e3dcb9bad98ba55e",
+  "immediate_request_sha256": "3353594d7a10a74f36ebce9a6aed4fcd39289bde176af8c2cf604625fad01031",
+  "baseline_to_final_patch_sha256": "621561aa6364938325e5f776bc8787f44c8528f6724cac75c35c11446babe5fe",
+  "default_miss_profile": {
+    "source_commit": "9969126b6e6702709693298b19193f54e6747002",
+    "source_sha256": "8ccb6a1ffda454c0a3964dc7c7a5972a08137c72095898e4f08747cbe39cfbe2",
+    "binary_sha256": "ffa2a6969b42fb50f2b65cd4d457d958de6dbb73aa43f57e1716db300ec88fe0",
+    "official_request_sha256": "508b4d25557b0c30b649d5e923a5ec9fa3470dc8555d8d49e3dcb9bad98ba55e",
+    "MOTA_PHASE_A_COMBAT_GEM_POLICY": "1",
+    "MOTA_IMMEDIATE_COMBAT_GEM_POLICY": "<unset> (production default)",
+    "MOTA_SHADOW_PROFILE": "1",
+    "profile_event_sha256": "d376eef5fb16b4bfb623e76261c92cc4291eca9feac45534c251920aa8c0a436"
+  }
+}

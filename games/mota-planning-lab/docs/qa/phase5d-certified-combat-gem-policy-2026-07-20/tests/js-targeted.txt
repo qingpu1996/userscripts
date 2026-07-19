@@ -1,0 +1,11 @@
+✔ browser protocol parser accepts fixtures and rejects nested shape drift (5.284708ms)
+✔ shadow advice is shown as the controller's visible reason (1.57225ms)
+✔ certified immediate gem is displayed as deferred read-only planning (1.187042ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 75.679583

@@ -1,0 +1,2 @@
+lane	sample	status	post_ms	max_rss_bytes	canonical_sha256	proof	reason	explored_states	decision_mode	route_is_null	suggestion_kind	suggestion_block_id
+D_final_gate_on_immediate_default_miss	1	200	1303.2861249999999	48414720	af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2	unproven	search_budget_exhausted	50000	None	True	None	None

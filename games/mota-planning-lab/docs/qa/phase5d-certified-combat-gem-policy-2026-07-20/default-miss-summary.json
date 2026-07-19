@@ -1,0 +1,66 @@
+{
+  "lane": "D_final_gate_on_immediate_default_miss",
+  "warmup": {
+    "requests": 1,
+    "post_ms": 1336.033834,
+    "max_rss_bytes": 46350336,
+    "canonical_sha256": "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2",
+    "proof": "unproven",
+    "reason": "search_budget_exhausted",
+    "explored_states": 50000
+  },
+  "formal_sample": {
+    "status": 200,
+    "post_ms": 1303.2861249999999,
+    "max_rss_bytes": 48414720,
+    "canonical_sha256": "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2",
+    "proof": "unproven",
+    "reason": "search_budget_exhausted",
+    "explored_states": 50000,
+    "decision_mode": null,
+    "route_is_null": true,
+    "suggestion_kind": null,
+    "suggestion_block_id": null
+  },
+  "profile_event": {
+    "event_name": "mota_shadow_profile_v1",
+    "event_sha256": "d376eef5fb16b4bfb623e76261c92cc4291eca9feac45534c251920aa8c0a436",
+    "event_count_in_process": 2,
+    "formal_event_index": 1,
+    "accepted_semantic_trace_hash": "26bda7fdd33330f3",
+    "accepted": 50000,
+    "rejected": 127868,
+    "pending": 183675,
+    "work_items_popped": 408244,
+    "materialize_calls": 331890,
+    "connectivity_view_calls": 177868,
+    "combat_gem_policy": {
+      "initial_phase_a_view_calls": 1,
+      "phase_a_store_creations": 1,
+      "immediate_safe_action_hits": 0,
+      "global_search_skipped": 0
+    }
+  },
+  "identity": {
+    "source_commit": "9969126b6e6702709693298b19193f54e6747002",
+    "source_sha256": "8ccb6a1ffda454c0a3964dc7c7a5972a08137c72095898e4f08747cbe39cfbe2",
+    "binary_sha256": "ffa2a6969b42fb50f2b65cd4d457d958de6dbb73aa43f57e1716db300ec88fe0",
+    "official_request_sha256": "508b4d25557b0c30b649d5e923a5ec9fa3470dc8555d8d49e3dcb9bad98ba55e",
+    "environment": {
+      "MOTA_PHASE_A_COMBAT_GEM_POLICY": "1",
+      "MOTA_IMMEDIATE_COMBAT_GEM_POLICY": "<unset> (production default)",
+      "MOTA_SHADOW_PROFILE": "1"
+    }
+  },
+  "parity": {
+    "matches_C_gate_on_immediate_off": {
+      "accepted_semantic_trace_hash": true,
+      "accepted": true,
+      "work_items_popped": true,
+      "materialize_calls": true,
+      "connectivity_view_calls": true,
+      "canonical_response_sha256": true
+    },
+    "note": "Timing fields are a separate single request and are not merged into the 7+7 latency summary."
+  }
+}
