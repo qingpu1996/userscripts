@@ -1,0 +1,817 @@
+{
+  "schema": "mota-phase25-profile-v1",
+  "request": {
+    "sha256": "508b4d25557b0c30b649d5e923a5ec9fa3470dc8555d8d49e3dcb9bad98ba55e",
+    "bytes": 2576604
+  },
+  "versions": {
+    "B": {
+      "binary": "/private/tmp/mota-combat-gem-probe-candidate-target/release/mota-shadow-runtime",
+      "binary_sha256": "b53345b7fc2ff33fd928943048ac58e4847cb1df78987cb05f7471e4539244b7",
+      "source": "/Users/nihplod/Documents/codes/frontend/scripts/userscripts/games/mota-planning-lab/rust/shadow-runtime/src/main.rs",
+      "source_sha256": "34e264869b4a7aa8475ff58b07c3485b5b8ff177357c1de7d0f7da7899fbb460"
+    }
+  },
+  "method": {
+    "warmups_per_version": 1,
+    "official_samples_per_version": 1,
+    "order": [
+      "B"
+    ],
+    "request": "pure POST /cycle",
+    "rss": "service PID sampled every 10 ms",
+    "canonical_response": "sorted JSON with shadow.cycle removed"
+  },
+  "results": {
+    "B": {
+      "median_post_ms": 1297.9878755286336,
+      "p95_post_ms": 1297.9878755286336,
+      "max_post_ms": 1297.9878755286336,
+      "median_rss_bytes": 50020352,
+      "p95_rss_bytes": 50020352.0,
+      "max_rss_bytes": 50020352,
+      "canonical_response_hashes": [
+        "af9d3ceabca4a57c6c0f3713defac7f9038970050260076ac626a0df4ace96f2"
+      ]
+    }
+  },
+  "profile_events": {
+    "B": [
+      {
+        "accepted_semantic_trace_hash": "7f0aeb674cd6f09f",
+        "combat_gem_root_probe": {
+          "forced_root_sources": 0,
+          "ordinary_boundary_actions_suppressed": 0,
+          "pickups_enqueued": 0,
+          "shop_actions_suppressed": 0
+        },
+        "connectivity_view": {
+          "calls": 176119,
+          "ns": 1091419352
+        },
+        "connectivity_view_calls": 176119,
+        "connectivity_view_ns": 1091419352,
+        "enqueue_actions_ns": 6068063,
+        "event": "mota_shadow_profile_v1",
+        "frontier": {
+          "comparisons": 154857,
+          "ns": 3694968
+        },
+        "frontier_comparisons": 154857,
+        "frontier_ns": 3694968,
+        "local_reachable": {
+          "calls": 0,
+          "ns": 0
+        },
+        "local_reachable_calls": 0,
+        "local_reachable_ns": 0,
+        "materialize": {
+          "phase_a": {
+            "by_action_kind": {
+              "door": {
+                "calls": 37988,
+                "ns": 2622836
+              },
+              "enemy": {
+                "calls": 50668,
+                "ns": 2509556
+              },
+              "event": {
+                "calls": 28768,
+                "ns": 1433942
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 108374,
+                "ns": 9566508
+              },
+              "shop": {
+                "calls": 86298,
+                "ns": 4053231
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 312096,
+            "feasible": 176118,
+            "infeasible": 135978,
+            "ns": 20186073
+          },
+          "phase_b": {
+            "by_action_kind": {
+              "door": {
+                "calls": 0,
+                "ns": 0
+              },
+              "enemy": {
+                "calls": 0,
+                "ns": 0
+              },
+              "event": {
+                "calls": 0,
+                "ns": 0
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 0,
+                "ns": 0
+              },
+              "shop": {
+                "calls": 0,
+                "ns": 0
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 0,
+            "feasible": 0,
+            "infeasible": 0,
+            "ns": 0
+          }
+        },
+        "materialize_calls": 312096,
+        "materialize_feasible": 176118,
+        "materialize_infeasible": 135978,
+        "passability_signature": {
+          "key": "exact passability signature + exact floor id + start cell id",
+          "potential_hit_rate": 0.0,
+          "repeated_keys": 0,
+          "request_total": 0,
+          "unique_keys": 0
+        },
+        "passability_signature_repeated_keys": 0,
+        "passability_signature_request_total": 0,
+        "passability_signature_unique_keys": 0,
+        "phase5a1_census": {
+          "arithmetic_envelope": {
+            "blue": {
+              "reason": "cross_resource_shop_conversion",
+              "safe": false,
+              "upper_bound": "50029"
+            },
+            "experience": {
+              "reason": "cross_resource_shop_conversion",
+              "safe": false,
+              "upper_bound": "13344"
+            },
+            "gold": {
+              "reason": "cross_resource_shop_conversion",
+              "safe": false,
+              "upper_bound": "5618195"
+            },
+            "red": {
+              "reason": "cross_resource_shop_conversion",
+              "safe": false,
+              "upper_bound": "50014"
+            },
+            "yellow": {
+              "reason": "cross_resource_shop_conversion",
+              "safe": false,
+              "upper_bound": "50072"
+            }
+          },
+          "closure_dry_run": {
+            "accepted_states_with_eligible": 0,
+            "batch_size": {
+              "max": 0,
+              "p50": 0,
+              "p95": 0
+            },
+            "eligible_attempts": 0,
+            "projected_accepted_states_removed": null,
+            "projected_accepted_states_removed_reason": "dry-run does not construct the quotient search needed to prove accepted-state removal",
+            "projected_resource_work_items_removed": 0,
+            "projected_resource_work_items_removed_denominator": {
+              "field": "phase_a_connectivity_view_calls",
+              "scope": "production Phase A connectivity views only; Phase B, replay, and dry-run views excluded",
+              "value": 176119
+            },
+            "unsafe_states": 0,
+            "wave_count": {
+              "max": 0,
+              "p50": 0,
+              "p95": 0
+            }
+          },
+          "compiled": true,
+          "consumed_slot_dependency": {
+            "other_rule_reads": 2,
+            "other_set_true": 4,
+            "replace_same_coordinate_or_slot": 18,
+            "set_false_or_reactivate": 2,
+            "slots": 754,
+            "unknown_non_private": 0
+          },
+          "decision": {
+            "accepted_reduction_ratio": null,
+            "final_eligible_attempt_ratio": 0.0,
+            "phase5b_recommended": false,
+            "projected_workitems_denominator_field": "phase_a_connectivity_view_calls",
+            "projected_workitems_per_connectivity": 0.0,
+            "recommendation": "Phase6",
+            "thresholds": {
+              "accepted_reduction_ratio": 0.05,
+              "resource_attempt_ratio": 0.15,
+              "workitems_per_connectivity": 0.1
+            }
+          },
+          "integral_gain": {
+            "arithmetic_envelope_safe": 213,
+            "closure_private_slot": 320,
+            "final_eligible": 0,
+            "final_eligible_attempts": 0,
+            "resource_attempts": 108374,
+            "statically_eligible": 104,
+            "statically_eligible_attempts": 66288
+          },
+          "mode": "profile_only_dry_run",
+          "resource_observed": 322,
+          "resource_taxonomy": {
+            "float_additive": 203,
+            "identity": 2,
+            "integer_multi_field": 5,
+            "integer_single_field": 104,
+            "mixed/unknown": 7,
+            "multiplier": 1
+          },
+          "shop_local_dp_opportunity": {
+            "accepted_states_with_reachable_candidate_shop": 50000,
+            "choice_cost_upper_bounds": [
+              {
+                "choice_id": "moneyShop1:0:hp:800:25",
+                "cost_upper_bound": "25",
+                "shop_id": "moneyShop1"
+              },
+              {
+                "choice_id": "moneyShop1:1:attack:4:25",
+                "cost_upper_bound": "25",
+                "shop_id": "moneyShop1"
+              },
+              {
+                "choice_id": "moneyShop1:2:defense:4:25",
+                "cost_upper_bound": "25",
+                "shop_id": "moneyShop1"
+              },
+              {
+                "choice_id": "moneyShop2:0:hp:4000:100",
+                "cost_upper_bound": "100",
+                "shop_id": "moneyShop2"
+              },
+              {
+                "choice_id": "moneyShop2:1:attack:20:100",
+                "cost_upper_bound": "100",
+                "shop_id": "moneyShop2"
+              },
+              {
+                "choice_id": "moneyShop2:2:defense:20:100",
+                "cost_upper_bound": "100",
+                "shop_id": "moneyShop2"
+              },
+              {
+                "choice_id": "expShop1:0:experience:100",
+                "cost_upper_bound": "100",
+                "shop_id": "expShop1"
+              },
+              {
+                "choice_id": "expShop1:1:experience:30",
+                "cost_upper_bound": "30",
+                "shop_id": "expShop1"
+              },
+              {
+                "choice_id": "expShop1:2:experience:30",
+                "cost_upper_bound": "30",
+                "shop_id": "expShop1"
+              },
+              {
+                "choice_id": "expShop2:0:experience:270",
+                "cost_upper_bound": "270",
+                "shop_id": "expShop2"
+              },
+              {
+                "choice_id": "expShop2:1:experience:95",
+                "cost_upper_bound": "95",
+                "shop_id": "expShop2"
+              },
+              {
+                "choice_id": "expShop2:2:experience:95",
+                "cost_upper_bound": "95",
+                "shop_id": "expShop2"
+              },
+              {
+                "choice_id": "keyShop1:0:gold:10",
+                "cost_upper_bound": "10",
+                "shop_id": "keyShop1"
+              },
+              {
+                "choice_id": "keyShop1:1:gold:50",
+                "cost_upper_bound": "50",
+                "shop_id": "keyShop1"
+              },
+              {
+                "choice_id": "keyShop1:2:gold:100",
+                "cost_upper_bound": "100",
+                "shop_id": "keyShop1"
+              },
+              {
+                "choice_id": "keyShop2:0:yellow:1",
+                "cost_upper_bound": "1",
+                "shop_id": "keyShop2"
+              },
+              {
+                "choice_id": "keyShop2:1:blue:1",
+                "cost_upper_bound": "1",
+                "shop_id": "keyShop2"
+              },
+              {
+                "choice_id": "keyShop2:2:red:1",
+                "cost_upper_bound": "1",
+                "shop_id": "keyShop2"
+              }
+            ],
+            "observed_shop_materializations": 86298,
+            "static_candidate_choices": 18,
+            "static_candidate_shops": 6
+          }
+        },
+        "phase_a_accepted": 50000,
+        "phase_a_connectivity_view_calls": 176119,
+        "phase_a_explored": 50000,
+        "phase_a_pending": 281991,
+        "phase_a_rejected": 126119,
+        "phase_b_explored": 0,
+        "region_graph": {
+          "bfs_fallback_calls": 0,
+          "portal_traversals": 4847678,
+          "region_traversals": 3943594,
+          "view_calls": 176119
+        },
+        "resource_closure_contract": {
+          "eligible_by_action_kind": {
+            "door": 0,
+            "enemy": 0,
+            "event": 0,
+            "invalid": 0,
+            "resource": 0,
+            "shop": 0,
+            "transition": 0
+          },
+          "observed_by_action_kind": {
+            "door": 0,
+            "enemy": 0,
+            "event": 0,
+            "invalid": 0,
+            "resource": 108374,
+            "shop": 0,
+            "transition": 0
+          },
+          "potential_merge_batches": null,
+          "potential_merge_batches_reason": "Phase5A does not define a reachability-preserving batch boundary"
+        },
+        "skipped_stale_by_action_kind": {
+          "door": 59822,
+          "enemy": 0,
+          "event": 0,
+          "invalid": 0,
+          "resource": 0,
+          "shop": 0,
+          "transition": 0
+        },
+        "skipped_stale_source_work_items": 59822,
+        "stale_source_by_action_kind": {
+          "door": 59822,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "stale_source_work_items": 219918,
+        "structural_equality_checks": 154857,
+        "structural_hash": {
+          "calls": 176119,
+          "ns": 22712903
+        },
+        "structural_hash_calls": 176119,
+        "structural_hash_ns": 22712903,
+        "topology": {
+          "key": "interned exact floor topology id + raw start x/y",
+          "query_total": 0,
+          "repeated_keys": 0,
+          "unique_keys": 0
+        },
+        "topology_query_total": 0,
+        "topology_repeated_keys": 0,
+        "topology_unique_keys": 0,
+        "unproven_stale_by_action_kind": {
+          "door": 0,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "work_items_popped": 371918
+      },
+      {
+        "accepted_semantic_trace_hash": "7f0aeb674cd6f09f",
+        "combat_gem_root_probe": {
+          "forced_root_sources": 0,
+          "ordinary_boundary_actions_suppressed": 0,
+          "pickups_enqueued": 0,
+          "shop_actions_suppressed": 0
+        },
+        "connectivity_view": {
+          "calls": 176119,
+          "ns": 1083776391
+        },
+        "connectivity_view_calls": 176119,
+        "connectivity_view_ns": 1083776391,
+        "enqueue_actions_ns": 5883298,
+        "event": "mota_shadow_profile_v1",
+        "frontier": {
+          "comparisons": 154857,
+          "ns": 3521547
+        },
+        "frontier_comparisons": 154857,
+        "frontier_ns": 3521547,
+        "local_reachable": {
+          "calls": 0,
+          "ns": 0
+        },
+        "local_reachable_calls": 0,
+        "local_reachable_ns": 0,
+        "materialize": {
+          "phase_a": {
+            "by_action_kind": {
+              "door": {
+                "calls": 37988,
+                "ns": 2581873
+              },
+              "enemy": {
+                "calls": 50668,
+                "ns": 2519341
+              },
+              "event": {
+                "calls": 28768,
+                "ns": 1481011
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 108374,
+                "ns": 9233889
+              },
+              "shop": {
+                "calls": 86298,
+                "ns": 3922542
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 312096,
+            "feasible": 176118,
+            "infeasible": 135978,
+            "ns": 19738656
+          },
+          "phase_b": {
+            "by_action_kind": {
+              "door": {
+                "calls": 0,
+                "ns": 0
+              },
+              "enemy": {
+                "calls": 0,
+                "ns": 0
+              },
+              "event": {
+                "calls": 0,
+                "ns": 0
+              },
+              "invalid": {
+                "calls": 0,
+                "ns": 0
+              },
+              "resource": {
+                "calls": 0,
+                "ns": 0
+              },
+              "shop": {
+                "calls": 0,
+                "ns": 0
+              },
+              "transition": {
+                "calls": 0,
+                "ns": 0
+              }
+            },
+            "calls": 0,
+            "feasible": 0,
+            "infeasible": 0,
+            "ns": 0
+          }
+        },
+        "materialize_calls": 312096,
+        "materialize_feasible": 176118,
+        "materialize_infeasible": 135978,
+        "passability_signature": {
+          "key": "exact passability signature + exact floor id + start cell id",
+          "potential_hit_rate": 0.0,
+          "repeated_keys": 0,
+          "request_total": 0,
+          "unique_keys": 0
+        },
+        "passability_signature_repeated_keys": 0,
+        "passability_signature_request_total": 0,
+        "passability_signature_unique_keys": 0,
+        "phase5a1_census": {
+          "arithmetic_envelope": {
+            "blue": {
+              "reason": "cross_resource_shop_conversion",
+              "safe": false,
+              "upper_bound": "50029"
+            },
+            "experience": {
+              "reason": "cross_resource_shop_conversion",
+              "safe": false,
+              "upper_bound": "13344"
+            },
+            "gold": {
+              "reason": "cross_resource_shop_conversion",
+              "safe": false,
+              "upper_bound": "5618195"
+            },
+            "red": {
+              "reason": "cross_resource_shop_conversion",
+              "safe": false,
+              "upper_bound": "50014"
+            },
+            "yellow": {
+              "reason": "cross_resource_shop_conversion",
+              "safe": false,
+              "upper_bound": "50072"
+            }
+          },
+          "closure_dry_run": {
+            "accepted_states_with_eligible": 0,
+            "batch_size": {
+              "max": 0,
+              "p50": 0,
+              "p95": 0
+            },
+            "eligible_attempts": 0,
+            "projected_accepted_states_removed": null,
+            "projected_accepted_states_removed_reason": "dry-run does not construct the quotient search needed to prove accepted-state removal",
+            "projected_resource_work_items_removed": 0,
+            "projected_resource_work_items_removed_denominator": {
+              "field": "phase_a_connectivity_view_calls",
+              "scope": "production Phase A connectivity views only; Phase B, replay, and dry-run views excluded",
+              "value": 176119
+            },
+            "unsafe_states": 0,
+            "wave_count": {
+              "max": 0,
+              "p50": 0,
+              "p95": 0
+            }
+          },
+          "compiled": true,
+          "consumed_slot_dependency": {
+            "other_rule_reads": 2,
+            "other_set_true": 4,
+            "replace_same_coordinate_or_slot": 18,
+            "set_false_or_reactivate": 2,
+            "slots": 754,
+            "unknown_non_private": 0
+          },
+          "decision": {
+            "accepted_reduction_ratio": null,
+            "final_eligible_attempt_ratio": 0.0,
+            "phase5b_recommended": false,
+            "projected_workitems_denominator_field": "phase_a_connectivity_view_calls",
+            "projected_workitems_per_connectivity": 0.0,
+            "recommendation": "Phase6",
+            "thresholds": {
+              "accepted_reduction_ratio": 0.05,
+              "resource_attempt_ratio": 0.15,
+              "workitems_per_connectivity": 0.1
+            }
+          },
+          "integral_gain": {
+            "arithmetic_envelope_safe": 213,
+            "closure_private_slot": 320,
+            "final_eligible": 0,
+            "final_eligible_attempts": 0,
+            "resource_attempts": 108374,
+            "statically_eligible": 104,
+            "statically_eligible_attempts": 66288
+          },
+          "mode": "profile_only_dry_run",
+          "resource_observed": 322,
+          "resource_taxonomy": {
+            "float_additive": 203,
+            "identity": 2,
+            "integer_multi_field": 5,
+            "integer_single_field": 104,
+            "mixed/unknown": 7,
+            "multiplier": 1
+          },
+          "shop_local_dp_opportunity": {
+            "accepted_states_with_reachable_candidate_shop": 50000,
+            "choice_cost_upper_bounds": [
+              {
+                "choice_id": "moneyShop1:0:hp:800:25",
+                "cost_upper_bound": "25",
+                "shop_id": "moneyShop1"
+              },
+              {
+                "choice_id": "moneyShop1:1:attack:4:25",
+                "cost_upper_bound": "25",
+                "shop_id": "moneyShop1"
+              },
+              {
+                "choice_id": "moneyShop1:2:defense:4:25",
+                "cost_upper_bound": "25",
+                "shop_id": "moneyShop1"
+              },
+              {
+                "choice_id": "moneyShop2:0:hp:4000:100",
+                "cost_upper_bound": "100",
+                "shop_id": "moneyShop2"
+              },
+              {
+                "choice_id": "moneyShop2:1:attack:20:100",
+                "cost_upper_bound": "100",
+                "shop_id": "moneyShop2"
+              },
+              {
+                "choice_id": "moneyShop2:2:defense:20:100",
+                "cost_upper_bound": "100",
+                "shop_id": "moneyShop2"
+              },
+              {
+                "choice_id": "expShop1:0:experience:100",
+                "cost_upper_bound": "100",
+                "shop_id": "expShop1"
+              },
+              {
+                "choice_id": "expShop1:1:experience:30",
+                "cost_upper_bound": "30",
+                "shop_id": "expShop1"
+              },
+              {
+                "choice_id": "expShop1:2:experience:30",
+                "cost_upper_bound": "30",
+                "shop_id": "expShop1"
+              },
+              {
+                "choice_id": "expShop2:0:experience:270",
+                "cost_upper_bound": "270",
+                "shop_id": "expShop2"
+              },
+              {
+                "choice_id": "expShop2:1:experience:95",
+                "cost_upper_bound": "95",
+                "shop_id": "expShop2"
+              },
+              {
+                "choice_id": "expShop2:2:experience:95",
+                "cost_upper_bound": "95",
+                "shop_id": "expShop2"
+              },
+              {
+                "choice_id": "keyShop1:0:gold:10",
+                "cost_upper_bound": "10",
+                "shop_id": "keyShop1"
+              },
+              {
+                "choice_id": "keyShop1:1:gold:50",
+                "cost_upper_bound": "50",
+                "shop_id": "keyShop1"
+              },
+              {
+                "choice_id": "keyShop1:2:gold:100",
+                "cost_upper_bound": "100",
+                "shop_id": "keyShop1"
+              },
+              {
+                "choice_id": "keyShop2:0:yellow:1",
+                "cost_upper_bound": "1",
+                "shop_id": "keyShop2"
+              },
+              {
+                "choice_id": "keyShop2:1:blue:1",
+                "cost_upper_bound": "1",
+                "shop_id": "keyShop2"
+              },
+              {
+                "choice_id": "keyShop2:2:red:1",
+                "cost_upper_bound": "1",
+                "shop_id": "keyShop2"
+              }
+            ],
+            "observed_shop_materializations": 86298,
+            "static_candidate_choices": 18,
+            "static_candidate_shops": 6
+          }
+        },
+        "phase_a_accepted": 50000,
+        "phase_a_connectivity_view_calls": 176119,
+        "phase_a_explored": 50000,
+        "phase_a_pending": 281991,
+        "phase_a_rejected": 126119,
+        "phase_b_explored": 0,
+        "region_graph": {
+          "bfs_fallback_calls": 0,
+          "portal_traversals": 4847678,
+          "region_traversals": 3943594,
+          "view_calls": 176119
+        },
+        "resource_closure_contract": {
+          "eligible_by_action_kind": {
+            "door": 0,
+            "enemy": 0,
+            "event": 0,
+            "invalid": 0,
+            "resource": 0,
+            "shop": 0,
+            "transition": 0
+          },
+          "observed_by_action_kind": {
+            "door": 0,
+            "enemy": 0,
+            "event": 0,
+            "invalid": 0,
+            "resource": 108374,
+            "shop": 0,
+            "transition": 0
+          },
+          "potential_merge_batches": null,
+          "potential_merge_batches_reason": "Phase5A does not define a reachability-preserving batch boundary"
+        },
+        "skipped_stale_by_action_kind": {
+          "door": 59822,
+          "enemy": 0,
+          "event": 0,
+          "invalid": 0,
+          "resource": 0,
+          "shop": 0,
+          "transition": 0
+        },
+        "skipped_stale_source_work_items": 59822,
+        "stale_source_by_action_kind": {
+          "door": 59822,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "stale_source_work_items": 219918,
+        "structural_equality_checks": 154857,
+        "structural_hash": {
+          "calls": 176119,
+          "ns": 22610334
+        },
+        "structural_hash_calls": 176119,
+        "structural_hash_ns": 22610334,
+        "topology": {
+          "key": "interned exact floor topology id + raw start x/y",
+          "query_total": 0,
+          "repeated_keys": 0,
+          "unique_keys": 0
+        },
+        "topology_query_total": 0,
+        "topology_repeated_keys": 0,
+        "topology_unique_keys": 0,
+        "unproven_stale_by_action_kind": {
+          "door": 0,
+          "enemy": 27419,
+          "event": 16855,
+          "invalid": 0,
+          "resource": 65257,
+          "shop": 50565,
+          "transition": 0
+        },
+        "work_items_popped": 371918
+      }
+    ]
+  },
+  "raw_samples_tsv": "/private/tmp/mota-combat-gem-probe-evidence/profile-off/samples.tsv"
+}
